@@ -55,8 +55,12 @@ def test_authenticated_features_separate_from_base():
 def test_auth_constants():
     assert ytm.AUTH_TYPE_NONE == "none"
     assert ytm.AUTH_TYPE_COOKIE == "cookie"
+    assert ytm.AUTH_TYPE_OAUTH == "oauth"
     assert ytm.CONF_AUTH_TYPE == "auth_type"
     assert ytm.CONF_COOKIE == "cookie_header"
+    assert ytm.CONF_OAUTH_JSON == "oauth_json"
+    assert ytm.CONF_OAUTH_CLIENT_ID == "oauth_client_id"
+    assert ytm.CONF_OAUTH_CLIENT_SECRET == "oauth_client_secret"
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +162,96 @@ def test_build_auth_file_falls_back_to_secure_3papisid_when_sapisid_missing(
     # The hash uses the extracted SAPISID — we can't see the secret, but we can
     # confirm the same input produces a stable-shape header.
     assert headers["authorization"].startswith("SAPISIDHASH ")
+
+
+# ---------------------------------------------------------------------------
+# OAuth auth file / client building (issue #15)
+# ---------------------------------------------------------------------------
+
+
+def _capture_open(monkeypatch):
+    """Patch builtins.open with a dummy writer and return the captured buffer dict."""
+    captured = {}
+
+    class _DummyFile:
+        def __init__(self, path):
+            captured["path"] = path
+            captured["buffer"] = []
+
+        def write(self, data):
+            captured["buffer"].append(data)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("builtins.open", lambda path, *a, **kw: _DummyFile(path))
+    return captured
+
+
+def test_build_oauth_file_rejects_invalid_json(provider, monkeypatch):
+    monkeypatch.setattr(
+        "builtins.open", lambda *a, **kw: pytest.fail("must not write file")
+    )
+    with pytest.raises(ValueError, match="valid JSON"):
+        provider._build_oauth_file("not json {")
+
+
+def test_build_oauth_file_rejects_missing_refresh_token(provider, monkeypatch):
+    monkeypatch.setattr(
+        "builtins.open", lambda *a, **kw: pytest.fail("must not write file")
+    )
+    with pytest.raises(ValueError, match="refresh_token"):
+        provider._build_oauth_file(json.dumps({"access_token": "abc"}))
+
+
+def test_build_oauth_file_rejects_non_object_json(provider, monkeypatch):
+    monkeypatch.setattr(
+        "builtins.open", lambda *a, **kw: pytest.fail("must not write file")
+    )
+    with pytest.raises(ValueError, match="refresh_token"):
+        provider._build_oauth_file(json.dumps(["not", "an", "object"]))
+
+
+def test_build_oauth_file_writes_token_and_returns_path(provider, monkeypatch):
+    captured = _capture_open(monkeypatch)
+    token = {"refresh_token": "1//refresh", "access_token": "ya29.abc", "expires_in": 3599}
+    path = provider._build_oauth_file(json.dumps(token))
+
+    assert path == ytm.OAUTH_FILE_PATH
+    assert captured["path"] == ytm.OAUTH_FILE_PATH
+    written = json.loads("".join(captured["buffer"]))
+    assert written == token
+
+
+def test_create_ytmusic_oauth_client_wires_credentials(provider, monkeypatch):
+    """OAuth client must pass client id/secret to OAuthCredentials and auth to YTMusic."""
+    seen = {}
+
+    class _FakeOAuthCredentials:
+        def __init__(self, client_id, client_secret):
+            seen["client_id"] = client_id
+            seen["client_secret"] = client_secret
+
+    class _FakeYTMusic:
+        def __init__(self, auth, oauth_credentials=None):
+            seen["auth"] = auth
+            seen["oauth_credentials"] = oauth_credentials
+
+    fake_module = MagicMock()
+    fake_module.OAuthCredentials = _FakeOAuthCredentials
+    fake_module.YTMusic = _FakeYTMusic
+    monkeypatch.setattr(ytm.importlib, "import_module", lambda name: fake_module)
+
+    client = provider._create_ytmusic_oauth_client("/data/ytmusic_oauth.json", "cid", "csecret")
+
+    assert isinstance(client, _FakeYTMusic)
+    assert seen["auth"] == "/data/ytmusic_oauth.json"
+    assert seen["client_id"] == "cid"
+    assert seen["client_secret"] == "csecret"
+    assert isinstance(seen["oauth_credentials"], _FakeOAuthCredentials)
 
 
 # ---------------------------------------------------------------------------
@@ -457,11 +551,42 @@ def test_get_config_entries_returns_expected_keys():
         ytm.CONF_AUTH_TYPE,
         ytm.CONF_COOKIE,
         ytm.CONF_BRAND_ACCOUNT,
+        ytm.CONF_OAUTH_JSON,
+        ytm.CONF_OAUTH_CLIENT_ID,
+        ytm.CONF_OAUTH_CLIENT_SECRET,
         ytm.CONF_PREFER_AUDIO_QUALITY,
     ]
     cookie_entry = next(e for e in entries if e.key == ytm.CONF_COOKIE)
     assert cookie_entry.depends_on == ytm.CONF_AUTH_TYPE
     assert cookie_entry.depends_on_value == [ytm.AUTH_TYPE_COOKIE]
+
+
+def test_get_config_entries_auth_type_offers_oauth_option():
+    entries = asyncio.run(ytm.get_config_entries(mass=None))
+    auth_entry = next(e for e in entries if e.key == ytm.CONF_AUTH_TYPE)
+    option_values = [o.value for o in auth_entry.options]
+    assert option_values == [
+        ytm.AUTH_TYPE_NONE,
+        ytm.AUTH_TYPE_COOKIE,
+        ytm.AUTH_TYPE_OAUTH,
+    ]
+
+
+def test_get_config_entries_oauth_fields_depend_on_oauth_auth_type():
+    entries = asyncio.run(ytm.get_config_entries(mass=None))
+    for key in (ytm.CONF_OAUTH_JSON, ytm.CONF_OAUTH_CLIENT_ID, ytm.CONF_OAUTH_CLIENT_SECRET):
+        entry = next(e for e in entries if e.key == key)
+        assert entry.depends_on == ytm.CONF_AUTH_TYPE
+        assert entry.depends_on_value == [ytm.AUTH_TYPE_OAUTH]
+    # Secrets must be stored as secure strings; the client ID is a plain string.
+    secure = {ytm.CONF_OAUTH_JSON, ytm.CONF_OAUTH_CLIENT_SECRET}
+    from music_assistant_models.enums import ConfigEntryType
+
+    for key in secure:
+        entry = next(e for e in entries if e.key == key)
+        assert entry.type == ConfigEntryType.SECURE_STRING
+    client_id_entry = next(e for e in entries if e.key == ytm.CONF_OAUTH_CLIENT_ID)
+    assert client_id_entry.type == ConfigEntryType.STRING
 
 
 # ---------------------------------------------------------------------------

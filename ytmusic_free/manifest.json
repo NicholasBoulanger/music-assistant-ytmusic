@@ -3,7 +3,7 @@
   "domain": "ytmusic_free",
   "stage": "experimental",
   "name": "YouTube Music (Free)",
-  "description": "Stream YouTube Music without a premium subscription. Uses yt-dlp for audio extraction. Optional browser cookie auth unlocks library sync and recommendations.",
+  "description": "Stream YouTube Music without a premium subscription. Uses yt-dlp for audio extraction. Optional browser cookie or OAuth auth unlocks library sync and recommendations (OAuth self-refreshes and survives restarts).",
   "codeowners": ["sproft"],
   "documentation": "https://github.com/sproft/music-assistant-ytmusic/blob/main/README.md",
   "requirements": [

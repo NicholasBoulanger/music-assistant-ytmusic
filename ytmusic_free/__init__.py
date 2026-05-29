@@ -5,7 +5,9 @@ Streams YouTube Music without a premium subscription by:
 - Using yt-dlp with the iOS client to extract stream URLs (no PO token needed)
 
 Authentication is optional. Without it, search/browse/playback work fine.
-With browser cookie authentication, library sync and recommendations unlock.
+With browser cookie or OAuth authentication, library sync and recommendations
+unlock. OAuth is the durable option: it self-refreshes and survives restarts,
+whereas a browser cookie is a static snapshot that goes stale over time.
 
 Note: This uses YouTube's internal APIs in an unofficial manner, similar to how
 apps like SimpMusic work. This may break if YouTube changes their API.
@@ -95,8 +97,18 @@ CONF_AUTH_TYPE = "auth_type"
 CONF_COOKIE = "cookie_header"
 CONF_BRAND_ACCOUNT = "brand_account"
 CONF_PREFER_AUDIO_QUALITY = "prefer_audio_quality"
+CONF_OAUTH_JSON = "oauth_json"
+CONF_OAUTH_CLIENT_ID = "oauth_client_id"
+CONF_OAUTH_CLIENT_SECRET = "oauth_client_secret"
 AUTH_TYPE_NONE = "none"
 AUTH_TYPE_COOKIE = "cookie"
+AUTH_TYPE_OAUTH = "oauth"
+
+# Where the OAuth token is staged so ytmusicapi can refresh it in place during
+# the process lifetime. The durable credential (the refresh token) is re-read
+# from MA's provider config on every init, so losing this file on container
+# recreation is harmless. See issue #15.
+OAUTH_FILE_PATH = "/data/ytmusic_oauth.json"
 
 # Cookie names that __Secure-3PAPISID alone cannot replace. A cookie capture
 # that passes the hard check but is missing these often validates at init
@@ -135,9 +147,13 @@ async def get_config_entries(
             options=(
                 ConfigValueOption(title="None (anonymous)", value=AUTH_TYPE_NONE),
                 ConfigValueOption(title="Browser cookie", value=AUTH_TYPE_COOKIE),
+                ConfigValueOption(title="OAuth (recommended)", value=AUTH_TYPE_OAUTH),
             ),
-            description="Optional: authenticate with a browser cookie to unlock "
-            "library sync and recommendations. Leave as 'None' for anonymous access.",
+            description="Optional: authenticate to unlock library sync and "
+            "recommendations. 'Browser cookie' is quick to set up but the session "
+            "goes stale and must be re-pasted periodically. 'OAuth' is more steps "
+            "up front but self-refreshes and survives restarts. Leave as 'None' "
+            "for anonymous access.",
         ),
         ConfigEntry(
             key=CONF_COOKIE,
@@ -162,6 +178,40 @@ async def get_config_entries(
             description="Leave empty for personal account. For brand accounts, "
             "find your ID at myaccount.google.com/brandaccounts or check the "
             "X-Goog-PageId header in browser DevTools on music.youtube.com.",
+        ),
+        ConfigEntry(
+            key=CONF_OAUTH_JSON,
+            type=ConfigEntryType.SECURE_STRING,
+            label="OAuth token (JSON)",
+            default_value="",
+            required=False,
+            depends_on=CONF_AUTH_TYPE,
+            depends_on_value=[AUTH_TYPE_OAUTH],
+            description="Paste the full contents of the oauth.json produced by "
+            "running `ytmusicapi oauth` with your own client ID and secret. Must "
+            "contain a 'refresh_token'. See the README OAuth walkthrough.",
+        ),
+        ConfigEntry(
+            key=CONF_OAUTH_CLIENT_ID,
+            type=ConfigEntryType.STRING,
+            label="OAuth client ID",
+            default_value="",
+            required=False,
+            depends_on=CONF_AUTH_TYPE,
+            depends_on_value=[AUTH_TYPE_OAUTH],
+            description="The client ID of your Google Cloud 'TVs and Limited Input "
+            "devices' OAuth client. Required so the refresh token can mint new "
+            "access tokens.",
+        ),
+        ConfigEntry(
+            key=CONF_OAUTH_CLIENT_SECRET,
+            type=ConfigEntryType.SECURE_STRING,
+            label="OAuth client secret",
+            default_value="",
+            required=False,
+            depends_on=CONF_AUTH_TYPE,
+            depends_on_value=[AUTH_TYPE_OAUTH],
+            description="The client secret paired with the OAuth client ID above.",
         ),
         ConfigEntry(
             key=CONF_PREFER_AUDIO_QUALITY,
@@ -196,44 +246,118 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
         auth_type = self.config.get_value(CONF_AUTH_TYPE) or AUTH_TYPE_NONE
         if auth_type == AUTH_TYPE_COOKIE:
-            cookie = self.config.get_value(CONF_COOKIE) or ""
-            if cookie:
-                try:
-                    brand_account = self.config.get_value(CONF_BRAND_ACCOUNT) or None
-                    auth_file = self._build_auth_file(cookie)
-                    self._ytmusic = await asyncio.to_thread(
-                        self._create_ytmusic_client, auth=auth_file, user=brand_account
-                    )
-                    # Validate auth by making a lightweight library call
-                    await asyncio.to_thread(self._ytmusic.get_library_songs, limit=1)
-                    self._authenticated = True
-                    self._auth_lapse_warned = False
-                    self.logger.info(
-                        "YouTube Music (Free) initialized with cookie authentication — "
-                        "library sync enabled"
-                    )
-                except Exception as err:
-                    self.logger.warning(
-                        "Cookie authentication failed (%s), falling back to anonymous mode. "
-                        "You may need to refresh your cookie.",
-                        err,
-                    )
-                    self._authenticated = False
-                    self._ytmusic = await asyncio.to_thread(self._create_ytmusic_client)
-            else:
-                self._ytmusic = await asyncio.to_thread(self._create_ytmusic_client)
-        else:
+            await self._init_cookie_auth()
+        elif auth_type == AUTH_TYPE_OAUTH:
+            await self._init_oauth_auth()
+
+        # Any path that did not authenticate (anonymous, empty config, or a
+        # failed auth attempt) falls back to an unauthenticated client.
+        if self._ytmusic is None:
             self._ytmusic = await asyncio.to_thread(self._create_ytmusic_client)
 
         if not self._authenticated:
             self.logger.info("YouTube Music (Free) initialized — anonymous mode")
 
+    async def _init_cookie_auth(self) -> None:
+        """Authenticate with a browser cookie; leave _ytmusic None to fall back."""
+        cookie = self.config.get_value(CONF_COOKIE) or ""
+        if not cookie:
+            return
+        try:
+            brand_account = self.config.get_value(CONF_BRAND_ACCOUNT) or None
+            auth_file = self._build_auth_file(cookie)
+            self._ytmusic = await asyncio.to_thread(
+                self._create_ytmusic_client, auth=auth_file, user=brand_account
+            )
+            # Validate auth by making a lightweight library call
+            await asyncio.to_thread(self._ytmusic.get_library_songs, limit=1)
+            self._authenticated = True
+            self._auth_lapse_warned = False
+            self.logger.info(
+                "YouTube Music (Free) initialized with cookie authentication — "
+                "library sync enabled"
+            )
+        except Exception as err:
+            self.logger.warning(
+                "Cookie authentication failed (%s), falling back to anonymous mode. "
+                "You may need to refresh your cookie.",
+                err,
+            )
+            self._authenticated = False
+            self._ytmusic = None
+
+    async def _init_oauth_auth(self) -> None:
+        """Authenticate with an OAuth refresh token; leave _ytmusic None to fall back.
+
+        OAuth self-refreshes and survives idle periods and restarts, so it is the
+        durable alternative to the browser cookie. See issue #15.
+        """
+        oauth_json = self.config.get_value(CONF_OAUTH_JSON) or ""
+        client_id = self.config.get_value(CONF_OAUTH_CLIENT_ID) or ""
+        client_secret = self.config.get_value(CONF_OAUTH_CLIENT_SECRET) or ""
+        if not (oauth_json and client_id and client_secret):
+            self.logger.warning(
+                "OAuth authentication selected but the token JSON, client ID, or "
+                "client secret is missing — falling back to anonymous mode."
+            )
+            return
+        try:
+            auth_file = self._build_oauth_file(oauth_json)
+            self._ytmusic = await asyncio.to_thread(
+                self._create_ytmusic_oauth_client, auth_file, client_id, client_secret
+            )
+            # Validate auth by making a lightweight library call
+            await asyncio.to_thread(self._ytmusic.get_library_songs, limit=1)
+            self._authenticated = True
+            self._auth_lapse_warned = False
+            self.logger.info(
+                "YouTube Music (Free) initialized with OAuth authentication — "
+                "library sync enabled (token auto-refreshes)"
+            )
+        except Exception as err:
+            self.logger.warning(
+                "OAuth authentication failed (%s), falling back to anonymous mode. "
+                "Check the client ID/secret and that the token is from a 'TVs and "
+                "Limited Input devices' OAuth client.",
+                err,
+            )
+            self._authenticated = False
+            self._ytmusic = None
+
     def _create_ytmusic_client(self, auth: str | None = None, user: str | None = None):
-        """Create a YTMusic client, optionally with authentication."""
+        """Create a YTMusic client, optionally with browser-cookie authentication."""
         ytmusicapi = importlib.import_module("ytmusicapi")
         if auth:
             return ytmusicapi.YTMusic(auth=auth, user=user)
         return ytmusicapi.YTMusic()
+
+    def _create_ytmusic_oauth_client(self, auth: str, client_id: str, client_secret: str):
+        """Create a YTMusic client authenticated with an OAuth refresh token.
+
+        ytmusicapi needs the client ID/secret (via OAuthCredentials) to refresh
+        the access token; the refresh token itself lives in the auth file.
+        """
+        ytmusicapi = importlib.import_module("ytmusicapi")
+        oauth_credentials = ytmusicapi.OAuthCredentials(
+            client_id=client_id, client_secret=client_secret
+        )
+        return ytmusicapi.YTMusic(auth, oauth_credentials=oauth_credentials)
+
+    def _build_oauth_file(self, oauth_json: str) -> str:
+        """Validate the pasted OAuth token JSON, stage it to a file, return the path."""
+        import json
+
+        try:
+            data = json.loads(oauth_json)
+        except (TypeError, ValueError) as err:
+            raise ValueError(
+                "OAuth token must be valid JSON (the contents of oauth.json)"
+            ) from err
+        if not isinstance(data, dict) or not data.get("refresh_token"):
+            raise ValueError("OAuth token JSON must contain a 'refresh_token' field")
+        with open(OAUTH_FILE_PATH, "w") as f:
+            json.dump(data, f)
+        return OAUTH_FILE_PATH
 
     def _build_auth_file(self, cookie: str) -> str:
         """Create a browser auth file and return the path."""

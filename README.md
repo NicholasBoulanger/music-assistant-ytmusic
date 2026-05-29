@@ -98,13 +98,42 @@ See **[WATCHER_ADDON.md](WATCHER_ADDON.md)** for the manual procedure, troublesh
 
 ## Authentication (optional)
 
-Authentication is **not required** for search, browse, and playback. However, adding a browser cookie unlocks:
+Authentication is **not required** for search, browse, and playback. However, authenticating unlocks:
 
 - Library sync (liked songs, saved albums, playlists, subscribed artists)
 - Personalized recommendations (home feed)
 - Library editing (add/remove items)
 
-### Setup
+There are two options:
+
+| Option | Setup effort | Durability |
+|--------|--------------|------------|
+| **OAuth** (recommended) | A few one-time steps in Google Cloud Console | Self-refreshes; survives idle periods and restarts |
+| **Browser cookie** | Paste one header | Goes stale over time and must be re-pasted |
+
+> **Which should I use?** A browser cookie is a static snapshot of a Google session. On a headless Music Assistant box the session rotates server-side and the snapshot stops matching, so library/playlists/home feed quietly stop working and the cookie has to be re-pasted (see [#11](https://github.com/sproft/music-assistant-ytmusic/issues/11)). OAuth issues a long-lived refresh token that mints fresh access tokens on demand, so it does not have this problem. Use the cookie for a quick try, OAuth for set-and-forget.
+
+### Option 1: OAuth (recommended)
+
+OAuth needs your own Google OAuth client. Since 2024 Google requires the **"TVs and Limited Input devices"** client type for `ytmusicapi`.
+
+1. **Create an OAuth client:**
+   - Go to the [Google Cloud Console](https://console.cloud.google.com/), create (or pick) a project.
+   - **APIs & Services → Library →** enable the **YouTube Data API v3**.
+   - **APIs & Services → Credentials → Create Credentials → OAuth client ID**.
+   - For **Application type**, choose **TVs and Limited Input devices**.
+   - Note the generated **Client ID** and **Client secret**.
+2. **Generate the token** on any machine that has Python and `ytmusicapi` installed:
+   ```bash
+   pip install ytmusicapi
+   ytmusicapi oauth --client-id YOUR_CLIENT_ID --client-secret YOUR_CLIENT_SECRET
+   ```
+   Follow the prompt (visit the URL, enter the code, approve). This writes an `oauth.json` file in the current directory containing a `refresh_token`.
+3. **In the MA UI**, go to **Settings → Music sources → YouTube Music (Free)** and set **Authentication** to **OAuth (recommended)**.
+4. Paste the **entire contents of `oauth.json`** into the **OAuth token (JSON)** field, and fill in the **OAuth client ID** and **OAuth client secret** with the same values from step 1.
+5. Click **Save**. The provider validates the token on startup and refreshes it automatically from then on, including across Home Assistant restarts.
+
+### Option 2: Browser cookie (quick start)
 
 1. In the MA UI, go to **Settings → Music sources → YouTube Music (Free)**
 2. Set **Authentication** to **Browser cookie**
@@ -116,7 +145,7 @@ Authentication is **not required** for search, browse, and playback. However, ad
 5. **Brand accounts:** If your YouTube Music library is on a brand account, enter your brand account ID in the **Brand account ID** field. Find it at [myaccount.google.com/brandaccounts](https://myaccount.google.com/brandaccounts) or check the `X-Goog-PageId` header in DevTools. After logging into your Google account and selecting the correct Brand account you will find it here: ```https://myaccount.google.com/brandaccounts/THISISYOURIDRIGHTHERE/view```.
 6. Click **Save**
 
-The cookie must contain `__Secure-3PAPISID`, `SID`, `HSID`, and `SSID`. Cookies are valid for approximately 2 years unless you log out.
+The cookie must contain `__Secure-3PAPISID`, `SID`, `HSID`, and `SSID`. Cookies are valid for approximately 2 years unless you log out, but in practice the session is often invalidated much sooner on a headless server. If library sync stops working, re-paste a fresh cookie or switch to OAuth.
 
 ---
 
@@ -160,6 +189,11 @@ The cookie must contain `__Secure-3PAPISID`, `SID`, `HSID`, and `SSID`. Cookies 
 - Make sure you copied the **entire** cookie string from the Network tab (2000+ characters).
 - The cookie must contain `__Secure-3PAPISID`, `SID`, `HSID`, and `SSID`.
 - If you use a brand account, enter the brand account ID (21-digit number from [myaccount.google.com/brandaccounts](https://myaccount.google.com/brandaccounts)).
+
+**OAuth authentication failed**
+- The OAuth token field must contain the **full JSON** from `oauth.json`, including the `refresh_token` field, not just the access token.
+- The client ID and client secret must match the ones you generated the token with, and must be from a **"TVs and Limited Input devices"** OAuth client.
+- Make sure the **YouTube Data API v3** is enabled for the project the client belongs to.
 
 **Library is empty after auth**
 - Your YouTube Music library only shows content you've explicitly liked, saved, or subscribed to.
