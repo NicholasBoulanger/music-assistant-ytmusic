@@ -503,49 +503,79 @@ def test_search_track_dispatches_with_songs_filter(provider):
     assert captured["filter"] == "songs"
 
 
-def test_search_multi_type_uses_no_filter(provider):
-    captured = {}
+def test_search_multi_type_runs_filtered_call_per_type(provider):
+    """Multi-type search issues one filtered call per type, not one unfiltered
+    call. An unfiltered YTM search skews to songs/videos, so artists and
+    playlists rarely surface (issue #18)."""
+    captured = []
 
     def _search(query, filter, limit):
-        captured["filter"] = filter
+        captured.append(filter)
         return []
 
     mock = MagicMock()
     mock.search = _search
     provider._ytmusic = mock
-    asyncio.run(provider.search("foo", [MediaType.TRACK, MediaType.ALBUM], limit=3))
-    assert captured["filter"] is None
+    asyncio.run(
+        provider.search(
+            "foo",
+            [MediaType.ARTIST, MediaType.ALBUM, MediaType.TRACK, MediaType.PLAYLIST],
+            limit=3,
+        )
+    )
+    assert captured == ["artists", "albums", "songs", "playlists"]
+    assert None not in captured
+
+
+def test_search_one_failing_filter_does_not_sink_others(provider):
+    """A filter that raises is logged and skipped; the rest still return."""
+
+    def _search(query, filter, limit):
+        if filter == "artists":
+            raise RuntimeError("boom")
+        return [
+            {
+                "resultType": "song",
+                "videoId": "vid1",
+                "title": "Song",
+                "artists": [{"id": "UCart", "name": "A"}],
+            }
+        ]
+
+    mock = MagicMock()
+    mock.search = _search
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("foo", [MediaType.ARTIST, MediaType.TRACK]))
+    assert len(results.artists) == 0
+    assert len(results.tracks) == 1
 
 
 def test_search_parses_returned_items_by_result_type(provider):
-    mock = MagicMock()
-    mock.search = MagicMock(
-        return_value=[
-            {
-                "resultType": "artist",
-                "channelId": "UCart",
-                "name": "Some Artist",
-            },
+    # Each filtered call returns only its own category, as real YTM does. The
+    # provider runs one call per type and merges them (issue #18).
+    by_filter = {
+        "artists": [{"resultType": "artist", "channelId": "UCart", "name": "Some Artist"}],
+        "songs": [
             {
                 "resultType": "song",
                 "videoId": "vid1",
                 "title": "Song",
                 "artists": [{"id": "UCart", "name": "Some Artist"}],
-            },
+            }
+        ],
+        "albums": [
             {
                 "resultType": "album",
                 "browseId": "MPREb_x",
                 "title": "Album",
                 "artists": [{"id": "UCart", "name": "Some Artist"}],
                 "type": "Album",
-            },
-            {
-                "resultType": "playlist",
-                "browseId": "VLPLx",
-                "title": "Playlist",
-            },
-        ]
-    )
+            }
+        ],
+        "playlists": [{"resultType": "playlist", "browseId": "VLPLx", "title": "Playlist"}],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
     provider._ytmusic = mock
     results = asyncio.run(
         provider.search(
@@ -657,6 +687,59 @@ def test_get_artist_unknown_prefix_returns_stub(provider):
     artist = asyncio.run(provider.get_artist("unknown_Foo Bar"))
     assert artist.name == "Foo Bar"
     assert artist.item_id == "unknown_Foo Bar"
+
+
+def test_get_artist_non_channel_id_not_found_without_ytm_call(provider):
+    """A non-channel id (e.g. one pulled from track metadata) must not be
+    handed to YTM — it would return HTTP 400. We raise MediaNotFoundError
+    without ever calling get_artist (issue #18)."""
+    from music_assistant_models.errors import MediaNotFoundError
+
+    mock = MagicMock()
+    mock.get_artist = MagicMock(side_effect=AssertionError("must not be called"))
+    provider._ytmusic = mock
+    with pytest.raises(MediaNotFoundError):
+        asyncio.run(provider.get_artist("MPLA_not_a_channel"))
+    mock.get_artist.assert_not_called()
+
+
+def test_get_artist_albums_non_channel_id_returns_empty(provider):
+    """A non-channel id degrades to an empty album list instead of raising the
+    raw HTTP 400 it would previously surface (issue #18)."""
+    mock = MagicMock()
+    mock.get_artist = MagicMock(side_effect=AssertionError("must not be called"))
+    provider._ytmusic = mock
+    assert asyncio.run(provider.get_artist_albums("not_a_channel")) == []
+    mock.get_artist.assert_not_called()
+
+
+def test_get_artist_albums_ytm_error_returns_empty(provider):
+    """A YTM 400 on a channel-shaped id is caught and degrades to []."""
+    mock = MagicMock()
+    mock.get_artist = MagicMock(
+        side_effect=RuntimeError("Server returned HTTP 400: Bad Request")
+    )
+    provider._ytmusic = mock
+    assert asyncio.run(provider.get_artist_albums("UCbroken")) == []
+
+
+def test_get_artist_toptracks_non_channel_id_returns_empty(provider):
+    """A non-channel id degrades to an empty track list (issue #18)."""
+    mock = MagicMock()
+    mock.get_artist = MagicMock(side_effect=AssertionError("must not be called"))
+    provider._ytmusic = mock
+    assert asyncio.run(provider.get_artist_toptracks("not_a_channel")) == []
+    mock.get_artist.assert_not_called()
+
+
+def test_get_artist_toptracks_ytm_error_returns_empty(provider):
+    """A YTM 400 on a channel-shaped id is caught and degrades to []."""
+    mock = MagicMock()
+    mock.get_artist = MagicMock(
+        side_effect=RuntimeError("Server returned HTTP 400: Bad Request")
+    )
+    provider._ytmusic = mock
+    assert asyncio.run(provider.get_artist_toptracks("UCbroken")) == []
 
 
 def test_library_methods_no_op_when_not_authenticated(provider):
