@@ -91,6 +91,15 @@ AUTHENTICATED_FEATURES = {
     ProviderFeature.LIBRARY_PLAYLISTS_EDIT,
 }
 
+# YTM search filter per media type. YTM has no multi-type search, so a search
+# spanning several types runs one filtered call per type and merges the results.
+SEARCH_FILTER_BY_TYPE = {
+    MediaType.ARTIST: "artists",
+    MediaType.ALBUM: "albums",
+    MediaType.TRACK: "songs",
+    MediaType.PLAYLIST: "playlists",
+}
+
 CONF_AUTH_TYPE = "auth_type"
 CONF_COOKIE = "cookie_header"
 CONF_BRAND_ACCOUNT = "brand_account"
@@ -310,20 +319,23 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 limit=limit,
             )
 
-        # YTM doesn't support multi-type search in a single call
-        if len(media_types) == 1:
-            if media_types[0] == MediaType.ARTIST:
-                results = await _search_type("artists")
-            elif media_types[0] == MediaType.ALBUM:
-                results = await _search_type("albums")
-            elif media_types[0] == MediaType.TRACK:
-                results = await _search_type("songs")
-            elif media_types[0] == MediaType.PLAYLIST:
-                results = await _search_type("playlists")
-            else:
-                return parsed_results
-        else:
-            results = await _search_type(None)
+        # YTM has no multi-type search, and an unfiltered search skews heavily
+        # to songs and videos so artists and playlists rarely surface
+        # (issue #18). Run one filtered call per requested type and merge.
+        filters = [
+            SEARCH_FILTER_BY_TYPE[mt] for mt in media_types if mt in SEARCH_FILTER_BY_TYPE
+        ]
+        if not filters:
+            return parsed_results
+
+        results: list[dict] = []
+        for ytm_filter in filters:
+            # Keep categories independent: one failing filter must not sink
+            # the others.
+            try:
+                results.extend(await _search_type(ytm_filter))
+            except Exception as err:  # noqa: BLE001
+                self.logger.debug("search filter %s failed: %s", ytm_filter, err)
 
         for result in results:
             try:
@@ -383,6 +395,32 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 tracks.append(track)
         return tracks
 
+    @staticmethod
+    def _looks_like_channel_id(prov_artist_id: str) -> bool:
+        """Whether an id has the YTM channel-id shape (``UC...``).
+
+        Artist links embedded in track metadata sometimes carry an id that is
+        not a real channel id. Passing one to YTM's ``get_artist`` (a browse
+        call) returns HTTP 400 "invalid argument", which previously surfaced
+        raw to the user (issue #18). Gating on the shape avoids the doomed call.
+        """
+        return isinstance(prov_artist_id, str) and prov_artist_id.startswith("UC")
+
+    async def _fetch_artist_obj(self, prov_artist_id: str) -> dict | None:
+        """Fetch the raw YTM artist object, or None if the id can't resolve.
+
+        Returns None for non-channel ids and for YTM errors (e.g. the HTTP 400
+        a malformed id triggers), so callers degrade to an empty result instead
+        of raising a raw HTTP error.
+        """
+        if not self._looks_like_channel_id(prov_artist_id):
+            return None
+        try:
+            return await asyncio.to_thread(self._ytmusic.get_artist, prov_artist_id)
+        except Exception as err:  # noqa: BLE001
+            self.logger.debug("get_artist failed for %s: %s", prov_artist_id, err)
+            return None
+
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Get full artist details by id."""
         # Fake IDs created when artist channel ID is unknown — return a stub
@@ -400,6 +438,10 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     )
                 },
             )
+        # A non-channel id can only yield a 400 from YTM; treat it as not found
+        # rather than handing YTM an argument it will reject (issue #18).
+        if not self._looks_like_channel_id(prov_artist_id):
+            raise MediaNotFoundError(f"Artist {prov_artist_id} not found")
         try:
             artist_obj = await asyncio.to_thread(self._ytmusic.get_artist, prov_artist_id)
             if not artist_obj:
@@ -413,7 +455,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
         """Get a list of albums for the given artist."""
-        artist_obj = await asyncio.to_thread(self._ytmusic.get_artist, prov_artist_id)
+        artist_obj = await self._fetch_artist_obj(prov_artist_id)
         if not artist_obj:
             return []
         albums = []
@@ -428,7 +470,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
         """Get a list of most popular tracks for the given artist."""
-        artist_obj = await asyncio.to_thread(self._ytmusic.get_artist, prov_artist_id)
+        artist_obj = await self._fetch_artist_obj(prov_artist_id)
         if not artist_obj:
             return []
         songs = artist_obj.get("songs", {})
