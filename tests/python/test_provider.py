@@ -742,6 +742,38 @@ def test_get_artist_toptracks_ytm_error_returns_empty(provider):
     assert asyncio.run(provider.get_artist_toptracks("UCbroken")) == []
 
 
+def test_get_similar_tracks_watch_playlist_error_returns_empty(provider):
+    """A ytmusicapi failure (e.g. KeyError 'endpoint') degrades to [] instead of
+    propagating and failing the whole play_media command (issue #20)."""
+    mock = MagicMock()
+    mock.get_watch_playlist = MagicMock(side_effect=KeyError("endpoint"))
+    provider._ytmusic = mock
+    assert asyncio.run(provider.get_similar_tracks("vid_x")) == []
+    mock.get_watch_playlist.assert_called_once()
+
+
+def test_get_similar_tracks_parses_returned_tracks(provider):
+    """A normal watch-playlist response still parses its tracks."""
+    mock = MagicMock()
+    mock.get_watch_playlist = MagicMock(
+        return_value={
+            "tracks": [
+                {
+                    "videoId": "vid1",
+                    "title": "Song One",
+                    "artists": [{"id": "UCart", "name": "An Artist"}],
+                },
+                # Missing videoId — must be skipped, not crash the radio fill.
+                {"title": "broken", "artists": [{"id": "UCart", "name": "A"}]},
+            ]
+        }
+    )
+    provider._ytmusic = mock
+    tracks = asyncio.run(provider.get_similar_tracks("vid_x"))
+    assert len(tracks) == 1
+    assert tracks[0].item_id == "vid1"
+
+
 def test_library_methods_no_op_when_not_authenticated(provider):
     """Library generators should yield nothing when auth is off."""
     provider._authenticated = False
