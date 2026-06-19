@@ -633,11 +633,18 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
     async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Track]:
         """Return a dynamic list of tracks based on the provided track (song radio)."""
-        watch_playlist = await asyncio.to_thread(
-            self._ytmusic.get_watch_playlist,
-            videoId=prov_track_id,
-            limit=limit,
-        )
+        try:
+            watch_playlist = await asyncio.to_thread(
+                self._ytmusic.get_watch_playlist,
+                videoId=prov_track_id,
+                limit=limit,
+            )
+        except Exception as err:  # noqa: BLE001
+            # ytmusicapi can raise (e.g. KeyError 'endpoint') when the watch-playlist
+            # response lacks the expected navigation structure. Degrade to an empty
+            # radio list rather than failing the whole play_media command.
+            self.logger.debug("get_watch_playlist failed for %s: %s", prov_track_id, err)
+            return []
         if not watch_playlist or "tracks" not in watch_playlist:
             return []
         tracks = []
