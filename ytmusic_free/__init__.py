@@ -1164,15 +1164,21 @@ class YoutubeMusicFreeProvider(MusicProvider):
         """Parse a YTM artist dict into an Artist model object."""
         artist_id = (
             artist_obj.get("channelId")
+            or artist_obj.get("browseId")  # search results (filter="artists") use browseId
             or artist_obj.get("id")
         )
-        if not artist_id and artist_obj.get("name") == "Various Artists":
+        if not artist_id and (
+            artist_obj.get("name") == "Various Artists"
+            or artist_obj.get("artist") == "Various Artists"
+        ):
             artist_id = VARIOUS_ARTISTS_YTM_ID
         if not artist_id:
             raise InvalidDataError("Artist is missing an ID")
         artist = Artist(
             item_id=artist_id,
-            name=artist_obj.get("name", "Unknown Artist"),
+            # search results (filter="artists") use the "artist" key for the
+            # display name instead of "name" — fall back to it.
+            name=artist_obj.get("name") or artist_obj.get("artist", "Unknown Artist"),
             provider=self.instance_id,
             provider_mappings={
                 ProviderMapping(
