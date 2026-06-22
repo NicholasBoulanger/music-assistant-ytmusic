@@ -1,6 +1,6 @@
 # Provider Watcher Add-on
 
-When Home Assistant restarts, the Supervisor recreates the MA container from its image — wiping any files you copied into it, including this provider. The watcher add-on solves this by automatically re-copying the provider files whenever the MA container is recreated.
+When Home Assistant restarts, the Supervisor recreates the MA container from its image, wiping any files you copied into it, including this provider. The watcher add-on solves this by automatically re-copying the provider files whenever the MA container is recreated.
 
 ---
 
@@ -135,7 +135,7 @@ done
 
 ## Quick install (recommended)
 
-For most users the [`scripts/install_watcher_addon.sh`](scripts/install_watcher_addon.sh) installer handles steps 1–3 below automatically:
+For most users the [`scripts/install_watcher_addon.sh`](scripts/install_watcher_addon.sh) installer handles steps 1-3 below automatically:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main/scripts/install_watcher_addon.sh | sh
@@ -146,10 +146,10 @@ The script is POSIX `sh` (works on HAOS BusyBox `ash`), uses `curl + tar` instea
 > **Re-running the installer? Rebuild the add-on.** The provider files and `run.sh` are baked into the add-on image at build time. If the add-on is already installed and you re-run the script (for example to fix `--python-version` or `--ma-id`), Home Assistant keeps the cached image until you rebuild it: open the add-on → three-dot menu → **Rebuild**, then **Start**. The installer stamps a fresh version on every run so "Check for updates" flags the change, but a cached image is only replaced by a rebuild.
 
 Common flags:
-- `--force` — overwrite an existing install without prompting
-- `--ref TAG` — pin to a release tag instead of `main`
-- `--ma-id ID` / `--python-version pythonX.Y` — override auto-detection
-- `--addons-dir DIR` — skip path auto-detection (useful for non-standard installs)
+- `--force`: overwrite an existing install without prompting
+- `--ref TAG`: pin to a release tag instead of `main`
+- `--ma-id ID` / `--python-version pythonX.Y`: override auto-detection
+- `--addons-dir DIR`: skip path auto-detection (useful for non-standard installs)
 
 Run `sh install_watcher_addon.sh --help` to see all options.
 
@@ -161,7 +161,7 @@ Run `sh install_watcher_addon.sh --help` to see all options.
 >
 > `curl ... | sh --force` parses `--force` as a shell option and fails with `sh: bad option '--force'`.
 
-> **Auto-detection caveats:** the MA container ID and Python version are detected via `docker ps` / `docker exec`, which requires running the script from a host shell with Docker access (e.g. the SSH & Web Terminal add-on with Protection Mode off, or the host shell on a Supervised install). If detection fails, the script falls back to `addon_d5369777_music_assistant` and `python3.13` and prints a warning — verify and re-run with `--ma-id` / `--python-version` if those defaults are wrong for your install.
+> **Auto-detection caveats:** the MA container ID and Python version are detected via `docker ps` / `docker exec`, which requires running the script from a host shell with Docker access (e.g. the SSH & Web Terminal add-on with Protection Mode off, or the host shell on a Supervised install). If detection fails, the script falls back to `addon_d5369777_music_assistant` and `python3.13` and prints a warning, so verify and re-run with `--ma-id` / `--python-version` if those defaults are wrong for your install.
 
 ---
 
@@ -191,8 +191,8 @@ mkdir -p /addons/ma_provider_watcher
 ### 2. Copy the provider files
 
 Copy the `ytmusic_free` provider folder into the add-on directory (use whichever
-path matches your shell from the table above — `/addons/...` inside the SSH/Samba
-add-on, the `/mnt/data/supervisor/...` host path from the HAOS console):
+path matches your shell from the table above: `/addons/...` inside the SSH/Samba
+add-on, or the `/mnt/data/supervisor/...` host path from the HAOS console):
 
 ```bash
 # Inside the SSH / Samba add-on
@@ -210,7 +210,7 @@ In Home Assistant: **Settings → Add-ons → Add-on Store** (three-dot menu) �
 
 ### 5. Disable Protection Mode
 
-Go to the add-on's **Info** tab and turn **Protection mode OFF**. This is required — without it, the Docker socket is not mounted and the add-on cannot manage MA containers.
+Go to the add-on's **Info** tab and turn **Protection mode OFF**. This is required. Without it, the Docker socket is not mounted and the add-on cannot manage MA containers.
 
 ### 6. Start and verify
 
@@ -228,7 +228,7 @@ Polling for MA container changes every 10s...
 
 ## Updating the provider
 
-When you update the `ytmusic_free` provider code, copy the new files into the add-on directory and rebuild (path as in the table above — `/addons/...` inside the SSH/Samba add-on):
+When you update the `ytmusic_free` provider code, copy the new files into the add-on directory and rebuild (path as in the table above: `/addons/...` inside the SSH/Samba add-on):
 
 ```bash
 cp -r /path/to/ytmusic_free /addons/ma_provider_watcher/ytmusic_free
@@ -249,7 +249,7 @@ ha apps restart local_ma_provider_watcher
 **`could not find local add-ons directory. Pass --addons-dir explicitly.`**
 - The installer probed the known locations and none existed in your shell. Most often this is HAOS 18+, where the path moved from `addons/local` to `apps/local`.
 - From the HAOS host console, locate it: `find /mnt/data/supervisor -maxdepth 3 -type d -name local`, then re-run with `--addons-dir /mnt/data/supervisor/apps/local`.
-- Inside the SSH / Samba add-on the path is usually `/addons` — re-run with `--addons-dir /addons`.
+- Inside the SSH / Samba add-on the path is usually `/addons`, so re-run with `--addons-dir /addons`.
 
 **Add-on not found in store**
 - Ensure `config.yaml` and `build.yaml` are valid YAML. Check Supervisor logs: `ha supervisor logs | grep ma_provider`.

@@ -1,4 +1,4 @@
-# YouTube Music (Free) — Music Assistant Provider
+# YouTube Music (Free): Music Assistant Provider
 
 A custom Music Assistant provider that streams YouTube Music **without a premium subscription**, using the same technique as open-source players like [SimpMusic](https://github.com/maxrave-dev/SimpMusic).
 
@@ -19,7 +19,7 @@ For playlists, `yt-dlp` is used as a fallback when `ytmusicapi` cannot parse the
 
 ## Installation
 
-Music Assistant runs as a Docker container (HA add-on). The provider files must be copied **inside the container** — placing them in `/config/` is not sufficient.
+Music Assistant runs as a Docker container (HA add-on). The provider files must be copied **inside the container**. Placing them in `/config/` is not sufficient.
 
 ### Quick install (recommended)
 
@@ -88,7 +88,7 @@ curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main
 
 > Note the `sh -s --` separator. Writing `... | sh --force` makes the shell parse `--force` as one of its own options and fail with `sh: bad option '--force'`.
 
-The installer auto-detects the local add-ons folder across the common layouts: the SSH/Samba add-on mapping (`/addons`), Home Assistant OS (`/mnt/data/supervisor/apps/local`, or legacy `…/addons/local`), and Supervised hosts. On **HAOS 18+** the Supervisor renamed the `addons` tree to `apps`, so the folder is `apps/local` — older guides pointing at `addons/local` are out of date.
+The installer auto-detects the local add-ons folder across the common layouts: the SSH/Samba add-on mapping (`/addons`), Home Assistant OS (`/mnt/data/supervisor/apps/local`, or legacy `.../addons/local`), and Supervised hosts. On **HAOS 18+** the Supervisor renamed the `addons` tree to `apps`, so the folder is `apps/local`. Older guides pointing at `addons/local` are out of date.
 
 > **`could not find local add-ons directory`?** Pass the folder explicitly. From the HAOS host console:
 > ```bash
@@ -114,11 +114,11 @@ Authentication is **not required** for search, browse, and playback. However, ad
 
 1. In the MA UI, go to **Settings → Music sources → YouTube Music (Free)**
 2. Set **Authentication** to **Browser cookie**
-3. Get your cookie (do this in a fresh **incognito / private window** — see the tip below):
+3. Get your cookie (do this in a fresh **incognito / private window**, see the tip below):
    - Open a new incognito/private window and log in to `music.youtube.com`
    - Open DevTools (F12) → **Network** tab → reload the page
    - Click the first document request → under **Request Headers** find the `Cookie:` header → copy the full value
-   - **Do not log out.** Just close the incognito window when you are done — logging out invalidates the cookie.
+   - **Do not log out.** Just close the incognito window when you are done. Logging out invalidates the cookie.
 
 > **Tip: use a dedicated incognito session.** Logging in through a new incognito/private window is the easiest way to grab a clean cookie. The session is isolated, so the `Cookie:` header carries only what YouTube Music needs and is shorter and easier to copy. More importantly, that session stays valid for as long as you never click **log out**: closing the window keeps the cookie alive (good for ~2 years). In your everyday browser, an accidental sign-out or Google rotating the session can invalidate the cookie later and silently break library sync.
 
@@ -139,10 +139,10 @@ The cookie must contain `__Secure-3PAPISID`, `SID`, `HSID`, and `SSID`. Cookies 
 | Artist top tracks / albums | ✅ | ✅ |
 | Similar tracks (song radio) | ✅ | ✅ |
 | Album / playlist tracks | ✅ | ✅ |
-| Library sync (songs, albums, playlists) | — | ✅ |
-| Library artists (subscriptions + liked) | — | ✅ |
-| Personalized recommendations | — | ✅ |
-| Library editing (add/remove) | — | ✅ |
+| Library sync (songs, albums, playlists) | ❌ | ✅ |
+| Library artists (subscriptions + liked) | ❌ | ✅ |
+| Personalized recommendations | ❌ | ✅ |
+| Library editing (add/remove) | ❌ | ✅ |
 | Podcast support | ❌ | ❌ |
 
 ---
@@ -164,7 +164,7 @@ The cookie must contain `__Secure-3PAPISID`, `SID`, `HSID`, and `SSID`. Cookies 
 
 **Audio quality is low**
 - Enable "Prefer highest audio quality" in the provider settings (on by default).
-- The android_music client typically provides 128–256 kbps AAC or Opus in an M4A/WebM container.
+- The android_music client typically provides 128-256 kbps AAC or Opus in an M4A/WebM container.
 
 **Cookie authentication failed**
 - Make sure you copied the **entire** cookie string from the Network tab (2000+ characters).
@@ -199,7 +199,7 @@ This project is fully open-source (FOSS), created purely for educational purpose
 
 ### 2. A Thin Client, Not a Piracy Tool
 
-This provider acts strictly as a thin client that queries publicly accessible YouTube and YouTube Music APIs and passes the resulting stream URLs to Music Assistant for local playback — the same way a web browser with an ad-blocking extension would render the same content. It does not circumvent DRM, does not download or cache media to disk, and does not redistribute any audio or video content.
+This provider acts strictly as a thin client that queries publicly accessible YouTube and YouTube Music APIs and passes the resulting stream URLs to Music Assistant for local playback, the same way a web browser with an ad-blocking extension would render the same content. It does not circumvent DRM, does not download or cache media to disk, and does not redistribute any audio or video content.
 
 ### 3. No Hosting of Copyrighted Material
 
@@ -207,7 +207,7 @@ This project does not host, upload, store, or redistribute any audio, video, or 
 
 ### 4. Support the Artists You Listen To
 
-We strongly encourage all users to subscribe to [YouTube Premium](https://www.youtube.com/premium). A Premium subscription is the most direct way to financially support the musicians and creators whose work you enjoy, and to support the platform that hosts it. This project exists as a technical proof-of-concept for developers and home automation enthusiasts — not to deprive creators of revenue.
+We strongly encourage all users to subscribe to [YouTube Premium](https://www.youtube.com/premium). A Premium subscription is the most direct way to financially support the musicians and creators whose work you enjoy, and to support the platform that hosts it. This project exists as a technical proof-of-concept for developers and home automation enthusiasts. It is not intended to deprive creators of revenue.
 
 ### 5. YouTube Terms of Service
 
@@ -220,7 +220,7 @@ This provider interacts with YouTube's internal (unofficial) APIs without a prem
 
 ### 6. User Responsibility
 
-The software is provided **"AS IS"**, without warranty of any kind. Users are solely responsible for ensuring their use of this project complies with their local laws and the Terms of Service of any platforms they access through it. Because no media files are hosted by this project, DMCA takedown requests for audio or video content cannot be processed here — such requests should be directed to Google / YouTube directly.
+The software is provided **"AS IS"**, without warranty of any kind. Users are solely responsible for ensuring their use of this project complies with their local laws and the Terms of Service of any platforms they access through it. Because no media files are hosted by this project, DMCA takedown requests for audio or video content cannot be processed here. Such requests should be directed to Google / YouTube directly.
 
 ---
 
