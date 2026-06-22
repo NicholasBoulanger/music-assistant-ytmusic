@@ -31,7 +31,7 @@ The provider files are baked into the watcher image at build time, so there is n
 ```yaml
 name: "MA Provider Watcher"
 description: "Re-installs the ytmusic_free provider into Music Assistant after every container restart."
-version: "1.0.0"
+version: "1.0.0"  # the installer stamps a fresh "1.0.<timestamp>" on each run so HA detects the change
 slug: ma_provider_watcher
 init: false
 boot: auto
@@ -143,6 +143,8 @@ curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main
 
 The script is POSIX `sh` (works on HAOS BusyBox `ash`), uses `curl + tar` instead of `git`, auto-detects the HAOS vs. Supervised add-ons path, and tries to detect the MA container ID and Python venv version. After it finishes, jump to [step 4 (Install the add-on)](#4-install-the-add-on) below.
 
+> **Re-running the installer? Rebuild the add-on.** The provider files and `run.sh` are baked into the add-on image at build time. If the add-on is already installed and you re-run the script (for example to fix `--python-version` or `--ma-id`), Home Assistant keeps the cached image until you rebuild it: open the add-on → three-dot menu → **Rebuild**, then **Start**. The installer stamps a fresh version on every run so "Check for updates" flags the change, but a cached image is only replaced by a rebuild.
+
 Common flags:
 - `--force` — overwrite an existing install without prompting
 - `--ref TAG` — pin to a release tag instead of `main`
@@ -244,3 +246,8 @@ ha apps restart local_ma_provider_watcher
 **Provider still missing after HA restart**
 - Check the watcher logs for `cp failed` or `restart failed` errors.
 - Confirm the MA container name matches `MA=` in `run.sh`.
+
+**`cp failed` with `Could not find the file /app/venv/lib/pythonX.Y/...`, or re-running the installer changes nothing**
+- The add-on is running a cached image with the old `run.sh` (wrong Python version or MA ID baked in). Re-running the installer updates the files on disk but not the running image.
+- Rebuild the add-on: open it → three-dot menu → **Rebuild**, then **Start** (or `ha apps rebuild local_ma_provider_watcher && ha apps restart local_ma_provider_watcher`).
+- Confirm the Python version MA actually uses with `docker exec <ma-id> ls /app/venv/lib/`, and re-run with `--python-version pythonX.Y` if it differs.
