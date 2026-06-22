@@ -16,7 +16,11 @@ REPO_OWNER="sproft"
 REPO_NAME="music-assistant-ytmusic"
 ADDON_SLUG="ma_provider_watcher"
 ADDON_NAME="MA Provider Watcher"
-ADDON_VERSION="1.0.0"
+# Stamp a fresh, strictly-increasing version on every run so Home Assistant sees
+# a newer version and rebuilds the add-on image. Without this the version stays
+# pinned, so re-running the installer (e.g. to fix the Python version or MA ID)
+# silently keeps the stale cached image with the old run.sh -- issue #22.
+ADDON_VERSION="1.0.$(date +%Y%m%d%H%M%S)"
 
 REF="main"
 FORCE=0
@@ -283,9 +287,18 @@ cat <<EOF
 Next steps:
   1. In Home Assistant: Settings -> Add-ons -> Add-on Store
      (three-dot menu) -> Check for updates.
-  2. Open "$ADDON_NAME" under Local add-ons and click Install.
+  2. Open "$ADDON_NAME" under Local add-ons.
+       First install:  click Install.
+       Re-installing:  click Rebuild (three-dot menu) so the new run.sh and
+                       provider files are baked into the image. A running
+                       add-on keeps its old cached image until you rebuild.
   3. On the Info tab, turn Protection mode OFF (required for Docker socket access).
   4. Start the add-on and check the logs for "Copied OK" / "MA restarted".
+
+This installer stamped version $ADDON_VERSION so Home Assistant detects the
+change. If you re-ran to fix the MA container ID or Python version and the
+add-on still uses the old value, Rebuild it (step 2) -- "Check for updates"
+alone does not rebuild a cached local add-on image.
 
 If MA container ID or Python version was wrong, re-run with:
   sh install_watcher_addon.sh --force --ma-id <ID> --python-version <pythonX.Y>

@@ -151,6 +151,13 @@ if [ "$network_ok" = "1" ]; then
     assert_contains "config.yaml has slug"      "slug: ma_provider_watcher" "$config"
     assert_contains "config.yaml has docker_api" "docker_api: true"          "$config"
     assert_contains "config.yaml has boot auto"  "boot: auto"                "$config"
+    # Version must be build-stamped (1.0.<timestamp>), not the static "1.0.0",
+    # so HA detects a change and rebuilds the cached image on re-run (issue #22).
+    assert_contains "config.yaml version is build-stamped" 'version: "1.0.2' "$config"
+    case "$config" in
+        *'version: "1.0.0"'*) fail "config.yaml version is not the static 1.0.0" ;;
+        *) pass "config.yaml version is not the static 1.0.0" ;;
+    esac
 
     runsh="$(cat "$ADDON/run.sh")"
     assert_contains "run.sh has substituted MA ID" 'MA="addon_TESTID_music_assistant"' "$runsh"
