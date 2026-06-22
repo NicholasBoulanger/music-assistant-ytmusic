@@ -102,6 +102,22 @@ else
 fi
 assert_contains "missing dir error mentions the path" "/nonexistent/path/does/not/exist" "$missing_dir_out"
 
+# Auto-detection failure message must list the modern apps/local candidates, not
+# only the legacy addons/local path (issue #22: HAOS 18+ renamed addons -> apps).
+# --ma-id / --python-version are passed so this never depends on docker.
+autodetect_out="$(sh "$SCRIPT" --force --ma-id x --python-version python3.13 2>&1)"; autodetect_rc=$?
+if [ "$autodetect_rc" -ne 0 ]; then
+    pass "auto-detect with no known dirs exits non-zero"
+    assert_contains "auto-detect error lists apps/local candidates" "apps/local" "$autodetect_out"
+    assert_contains "auto-detect error mentions in-container /addons path" "/addons" "$autodetect_out"
+    case "$autodetect_out" in
+        *"/root/addons"*) fail "auto-detect error drops non-standard /root/addons" ;;
+        *) pass "auto-detect error drops non-standard /root/addons" ;;
+    esac
+else
+    skip "auto-detect found a real add-ons dir on this host -- failure path not exercised"
+fi
+
 # --- Section 2: end-to-end install (network) --------------------------------
 
 printf '\n== End-to-end install ==\n'
