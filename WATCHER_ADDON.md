@@ -15,7 +15,7 @@ The provider files are baked into the watcher image at build time, so there is n
 ## File layout
 
 ```
-/mnt/data/supervisor/addons/local/ma_provider_watcher/
+/mnt/data/supervisor/apps/local/ma_provider_watcher/   # HAOS 18+; older HAOS: .../addons/local/
 ├── config.yaml
 ├── Dockerfile
 ├── run.sh
@@ -141,7 +141,7 @@ For most users the [`scripts/install_watcher_addon.sh`](scripts/install_watcher_
 curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main/scripts/install_watcher_addon.sh | sh
 ```
 
-The script is POSIX `sh` (works on HAOS BusyBox `ash`), uses `curl + tar` instead of `git`, auto-detects the HAOS vs. Supervised add-ons path, and tries to detect the MA container ID and Python venv version. After it finishes, jump to [step 4 (Install the add-on)](#4-install-the-add-on) below.
+The script is POSIX `sh` (works on HAOS BusyBox `ash`), uses `curl + tar` instead of `git`, auto-detects the local add-ons path (HAOS `apps/local` and legacy `addons/local`, Supervised, and the in-add-on `/addons` mapping), and tries to detect the MA container ID and Python venv version. After it finishes, jump to [step 4 (Install the add-on)](#4-install-the-add-on) below.
 
 > **Re-running the installer? Rebuild the add-on.** The provider files and `run.sh` are baked into the add-on image at build time. If the add-on is already installed and you re-run the script (for example to fix `--python-version` or `--ma-id`), Home Assistant keeps the cached image until you rebuild it: open the add-on → three-dot menu → **Rebuild**, then **Start**. The installer stamps a fresh version on every run so "Check for updates" flags the change, but a cached image is only replaced by a rebuild.
 
@@ -173,23 +173,30 @@ Open the Terminal add-on and create the directory structure. The path depends on
 
 | Installation | Local add-ons path |
 |---|---|
-| **HAOS** | `/mnt/data/supervisor/addons/local/` |
-| **Supervised / Container** | `/root/addons/` |
+| **HAOS 18+** | `/mnt/data/supervisor/apps/local/` |
+| **HAOS (older)** | `/mnt/data/supervisor/addons/local/` |
+| **Supervised** | `/usr/share/hassio/apps/local/` (older: `/usr/share/hassio/addons/local/`) |
+| **Inside the SSH / Samba add-on** | `/addons/` |
+
+> Home Assistant renamed the Supervisor `addons` tree to `apps` (HAOS 18+, the same rename behind `ha apps` replacing `ha addons`). On upgrade the Supervisor migrates existing local add-ons from `addons/local` to `apps/local`. From the HAOS host console, find yours with `find /mnt/data/supervisor -maxdepth 3 -type d -name local`.
 
 ```bash
-# HAOS
-mkdir -p /mnt/data/supervisor/addons/local/ma_provider_watcher
+# HAOS 18+ (host console)
+mkdir -p /mnt/data/supervisor/apps/local/ma_provider_watcher
 
-# Supervised / Container
-mkdir -p /root/addons/ma_provider_watcher
+# Inside the SSH / Samba add-on
+mkdir -p /addons/ma_provider_watcher
 ```
 
 ### 2. Copy the provider files
 
-Copy the `ytmusic_free` provider folder into the add-on directory:
+Copy the `ytmusic_free` provider folder into the add-on directory (use whichever
+path matches your shell from the table above — `/addons/...` inside the SSH/Samba
+add-on, the `/mnt/data/supervisor/...` host path from the HAOS console):
 
 ```bash
-cp -r /path/to/ytmusic_free /mnt/data/supervisor/addons/local/ma_provider_watcher/ytmusic_free
+# Inside the SSH / Samba add-on
+cp -r /path/to/ytmusic_free /addons/ma_provider_watcher/ytmusic_free
 ```
 
 ### 3. Create the add-on files
@@ -221,10 +228,10 @@ Polling for MA container changes every 10s...
 
 ## Updating the provider
 
-When you update the `ytmusic_free` provider code, copy the new files into the add-on directory and rebuild:
+When you update the `ytmusic_free` provider code, copy the new files into the add-on directory and rebuild (path as in the table above — `/addons/...` inside the SSH/Samba add-on):
 
 ```bash
-cp -r /path/to/ytmusic_free /mnt/data/supervisor/addons/local/ma_provider_watcher/ytmusic_free
+cp -r /path/to/ytmusic_free /addons/ma_provider_watcher/ytmusic_free
 ha apps rebuild local_ma_provider_watcher
 ha apps restart local_ma_provider_watcher
 ```
@@ -238,6 +245,11 @@ ha apps restart local_ma_provider_watcher
 
 **`lstat /provider: no such file or directory`**
 - The `ytmusic_free/` folder is missing from the add-on directory. Copy it and rebuild.
+
+**`could not find local add-ons directory. Pass --addons-dir explicitly.`**
+- The installer probed the known locations and none existed in your shell. Most often this is HAOS 18+, where the path moved from `addons/local` to `apps/local`.
+- From the HAOS host console, locate it: `find /mnt/data/supervisor -maxdepth 3 -type d -name local`, then re-run with `--addons-dir /mnt/data/supervisor/apps/local`.
+- Inside the SSH / Samba add-on the path is usually `/addons` — re-run with `--addons-dir /addons`.
 
 **Add-on not found in store**
 - Ensure `config.yaml` and `build.yaml` are valid YAML. Check Supervisor logs: `ha supervisor logs | grep ma_provider`.
