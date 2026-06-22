@@ -128,7 +128,7 @@ done
 > **Note:** If your MA add-on ID differs from `addon_d5369777_music_assistant`, update the `MA=` line.
 > Check with: `docker ps | grep music`
 
-> **Note:** If MA ever upgrades its Python version, update `python3.13` in `DST=` accordingly.
+> **Note:** The `python3.13` in `DST=` tracks MA's Python version, which changes over time (recent Music Assistant builds use `python3.14`). The installer auto-detects it; if you edit `run.sh` by hand, set it to match.
 > Check with: `docker exec addon_d5369777_music_assistant ls /app/venv/lib/`
 
 ---

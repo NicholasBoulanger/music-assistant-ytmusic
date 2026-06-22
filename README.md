@@ -50,17 +50,15 @@ docker ps | grep music
 
 ### 2. Copy the provider into the container
 
+The provider lives in MA's Python `site-packages`, and the Python version moves over time (recent Music Assistant builds use `python3.14`, older ones `python3.13`). Detect it instead of hard-coding the path:
+
 ```bash
+PYVER=$(docker exec addon_d5369777_music_assistant sh -c 'ls /app/venv/lib' | grep -m1 '^python3')
 docker cp /path/to/ytmusic_free \
-  addon_d5369777_music_assistant:/app/venv/lib/python3.13/site-packages/music_assistant/providers/
+  "addon_d5369777_music_assistant:/app/venv/lib/$PYVER/site-packages/music_assistant/providers/"
 ```
 
-Replace `/path/to/ytmusic_free` with wherever you placed the folder (e.g. `/config/custom_components/mass/providers/ytmusic_free`).
-
-> **Note on Python version:** If MA ever upgrades its Python version, adjust `python3.13` in the path accordingly. Check with:
-> ```bash
-> docker exec addon_d5369777_music_assistant ls /app/venv/lib/
-> ```
+Replace `/path/to/ytmusic_free` with wherever you placed the folder (e.g. `/config/custom_components/mass/providers/ytmusic_free`). The one-line `install_provider.sh` runs this detection for you, so prefer it unless you are debugging.
 
 ### 3. Restart Music Assistant
 
@@ -90,6 +88,14 @@ curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main
 
 > Note the `sh -s --` separator. Writing `... | sh --force` makes the shell parse `--force` as one of its own options and fail with `sh: bad option '--force'`.
 
+The installer auto-detects the local add-ons folder across the common layouts: the SSH/Samba add-on mapping (`/addons`), Home Assistant OS (`/mnt/data/supervisor/apps/local`, or legacy `…/addons/local`), and Supervised hosts. On **HAOS 18+** the Supervisor renamed the `addons` tree to `apps`, so the folder is `apps/local` — older guides pointing at `addons/local` are out of date.
+
+> **`could not find local add-ons directory`?** Pass the folder explicitly. From the HAOS host console:
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main/scripts/install_watcher_addon.sh | sh -s -- --force --addons-dir /mnt/data/supervisor/apps/local
+> ```
+> Inside the SSH/Samba add-on use `--addons-dir /addons`. After re-running, **Rebuild** the add-on (three-dot menu) so the new files are baked into its image, then **Start** it.
+
 See **[WATCHER_ADDON.md](WATCHER_ADDON.md)** for the manual procedure, troubleshooting, and the available installer flags.
 
 > **If the automatic installer doesn't work on your system,** the [`v0.1.0-beta.1` pre-release](https://github.com/sproft/music-assistant-ytmusic/releases/tag/v0.1.0-beta.1) is a known-good checkpoint of the manual install path. Pin to it (the manual procedure in `WATCHER_ADDON.md` from that tag was the only documented option at the time and works on HAOS and Supervised installs) and please [open an issue](https://github.com/sproft/music-assistant-ytmusic/issues/new) so the installer can be fixed.
@@ -108,10 +114,14 @@ Authentication is **not required** for search, browse, and playback. However, ad
 
 1. In the MA UI, go to **Settings → Music sources → YouTube Music (Free)**
 2. Set **Authentication** to **Browser cookie**
-3. Get your cookie:
-   - Open `music.youtube.com` in your browser while logged in
+3. Get your cookie (do this in a fresh **incognito / private window** — see the tip below):
+   - Open a new incognito/private window and log in to `music.youtube.com`
    - Open DevTools (F12) → **Network** tab → reload the page
-   - Click the first request → find the `Cookie:` header → copy the full value
+   - Click the first document request → under **Request Headers** find the `Cookie:` header → copy the full value
+   - **Do not log out.** Just close the incognito window when you are done — logging out invalidates the cookie.
+
+> **Tip: use a dedicated incognito session.** Logging in through a new incognito/private window is the easiest way to grab a clean cookie. The session is isolated, so the `Cookie:` header carries only what YouTube Music needs and is shorter and easier to copy. More importantly, that session stays valid for as long as you never click **log out**: closing the window keeps the cookie alive (good for ~2 years). In your everyday browser, an accidental sign-out or Google rotating the session can invalidate the cookie later and silently break library sync.
+
 4. Paste the cookie into the **Cookie header** field
 5. **Brand accounts:** If your YouTube Music library is on a brand account, enter your brand account ID in the **Brand account ID** field. Find it at [myaccount.google.com/brandaccounts](https://myaccount.google.com/brandaccounts) or check the `X-Goog-PageId` header in DevTools. After logging into your Google account and selecting the correct Brand account you will find it here: ```https://myaccount.google.com/brandaccounts/THISISYOURIDRIGHTHERE/view```.
 6. Click **Save**
