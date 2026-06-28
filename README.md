@@ -17,6 +17,20 @@ For playlists, `yt-dlp` is used as a fallback when `ytmusicapi` cannot parse the
 
 ---
 
+## Support and bug reports
+
+This is an unofficial, independent provider. It is not affiliated with or supported by the Music Assistant project.
+
+The Music Assistant maintainers have stated more than once that they do not want this provider and will not support it. Please respect that:
+
+- Do not open issues, discussions, or support requests about this provider on the Music Assistant repositories, Discord, or forum.
+- Do not mention this provider when reporting an unrelated Music Assistant bug. If you hit a problem in Music Assistant itself, reproduce it with this provider removed before reporting it upstream.
+- Report anything about this provider here, on this repository's [issue tracker](https://github.com/sproft/music-assistant-ytmusic/issues).
+
+Keeping these reports here respects the Music Assistant team's wishes and keeps them out of a project they have asked not to be involved with.
+
+---
+
 ## Installation
 
 Music Assistant runs as a Docker container (HA add-on). The provider files must be copied **inside the container**. Placing them in `/config/` is not sufficient.
