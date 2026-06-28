@@ -790,16 +790,16 @@ class YoutubeMusicFreeProvider(MusicProvider):
         seen_ids: set[str] = set()
         for item in subs:
             with suppress(InvalidDataError, KeyError, TypeError):
-                item.setdefault("channelId", item.get("browseId"))
-                item.setdefault("name", item.get("artist"))
+                # _parse_artist reads browseId/artist directly, so the
+                # search-result keys do not need pre-mapping here.
                 artist = self._parse_artist(item)
                 if artist.item_id not in seen_ids:
                     seen_ids.add(artist.item_id)
                     yield artist
         for item in lib_artists:
             with suppress(InvalidDataError, KeyError, TypeError):
-                item.setdefault("channelId", item.get("browseId"))
-                item.setdefault("name", item.get("artist"))
+                # _parse_artist reads browseId/artist directly, so the
+                # search-result keys do not need pre-mapping here.
                 artist = self._parse_artist(item)
                 if artist.item_id not in seen_ids:
                     seen_ids.add(artist.item_id)
@@ -1078,7 +1078,13 @@ class YoutubeMusicFreeProvider(MusicProvider):
             track.artists = [
                 self._get_artist_item_mapping(a)
                 for a in artists_raw
-                if a.get("id") or a.get("channelId") or a.get("name") == "Various Artists"
+                if (
+                    a.get("id")
+                    or a.get("channelId")
+                    or a.get("browseId")
+                    or a.get("name") == "Various Artists"
+                    or a.get("artist") == "Various Artists"
+                )
             ]
         # Fall back: build a minimal artist mapping from whatever name is available
         if not track.artists and artists_raw:
@@ -1143,7 +1149,13 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 [
                     self._get_artist_item_mapping(a)
                     for a in album_obj["artists"]
-                    if a.get("id") or a.get("channelId") or a.get("name") == "Various Artists"
+                    if (
+                        a.get("id")
+                        or a.get("channelId")
+                        or a.get("browseId")
+                        or a.get("name") == "Various Artists"
+                        or a.get("artist") == "Various Artists"
+                    )
                 ]
             )
         album_type_raw = album_obj.get("type", "")
@@ -1177,8 +1189,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
         artist = Artist(
             item_id=artist_id,
             # search results (filter="artists") use the "artist" key for the
-            # display name instead of "name" — fall back to it.
-            name=artist_obj.get("name") or artist_obj.get("artist", "Unknown Artist"),
+            # display name instead of "name". Final fallback is unconditional so
+            # a present-but-empty value cannot leak through as the name.
+            name=artist_obj.get("name") or artist_obj.get("artist") or "Unknown Artist",
             provider=self.instance_id,
             provider_mappings={
                 ProviderMapping(
@@ -1280,11 +1293,24 @@ class YoutubeMusicFreeProvider(MusicProvider):
         )
 
     def _get_artist_item_mapping(self, artist_obj: dict) -> ItemMapping:
-        artist_id = artist_obj.get("id") or artist_obj.get("channelId")
-        if not artist_id and artist_obj.get("name") == "Various Artists":
+        # search results (filter="artists") key the id as "browseId" and the
+        # display name as "artist" instead of "channelId"/"name".
+        artist_id = (
+            artist_obj.get("id")
+            or artist_obj.get("channelId")
+            or artist_obj.get("browseId")
+        )
+        if not artist_id and (
+            artist_obj.get("name") == "Various Artists"
+            or artist_obj.get("artist") == "Various Artists"
+        ):
             artist_id = VARIOUS_ARTISTS_YTM_ID
         return self._get_item_mapping(
-            MediaType.ARTIST, artist_id or "", artist_obj.get("name", "Unknown")
+            MediaType.ARTIST,
+            artist_id or "",
+            # Unconditional final fallback: a present-but-empty "artist" value
+            # must not leak through (dict.get default only fires when absent).
+            artist_obj.get("name") or artist_obj.get("artist") or "Unknown",
         )
 
     async def _install_packages(self) -> None:

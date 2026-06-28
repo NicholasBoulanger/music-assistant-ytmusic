@@ -216,6 +216,32 @@ def test_parse_track_various_artists_resolves_to_canonical_id(provider):
     assert track.artists[0].item_id == ytm.VARIOUS_ARTISTS_YTM_ID
 
 
+def test_parse_track_artist_uses_browse_id_and_artist_keys(provider):
+    """A browseId/artist-keyed track artist resolves to a real id, not unknown_*."""
+    track = provider._parse_track(
+        {
+            "videoId": "abc",
+            "title": "Song",
+            "artists": [{"browseId": "UCart", "artist": "Real Artist"}],
+        }
+    )
+    assert track.artists[0].item_id == "UCart"
+    assert track.artists[0].name == "Real Artist"
+
+
+def test_parse_track_various_artists_via_artist_key(provider):
+    """Track artist keyed only as artist='Various Artists' resolves to canonical id."""
+    track = provider._parse_track(
+        {
+            "videoId": "abc",
+            "title": "Compilation",
+            "artists": [{"artist": "Various Artists"}],
+        }
+    )
+    assert track.artists[0].item_id == ytm.VARIOUS_ARTISTS_YTM_ID
+    assert track.artists[0].name == "Various Artists"
+
+
 def test_parse_track_duration_from_seconds(provider):
     track = provider._parse_track(
         {
@@ -323,6 +349,32 @@ def test_parse_album_inferred_live(provider):
     assert album.album_type == AlbumType.LIVE
 
 
+def test_parse_album_artist_uses_browse_id_and_artist_keys(provider):
+    """Album artists from search results are keyed browseId/artist, not id/name."""
+    album = provider._parse_album(
+        {
+            "browseId": "MPREb_x",
+            "title": "A",
+            "artists": [{"browseId": "UCartist", "artist": "Album Artist"}],
+        }
+    )
+    assert len(album.artists) == 1
+    assert album.artists[0].item_id == "UCartist"
+    assert album.artists[0].name == "Album Artist"
+
+
+def test_parse_album_artist_various_artists_via_artist_key(provider):
+    album = provider._parse_album(
+        {
+            "browseId": "MPREb_x",
+            "title": "A",
+            "artists": [{"artist": "Various Artists"}],
+        }
+    )
+    assert len(album.artists) == 1
+    assert album.artists[0].item_id == ytm.VARIOUS_ARTISTS_YTM_ID
+
+
 # ---------------------------------------------------------------------------
 # _parse_artist
 # ---------------------------------------------------------------------------
@@ -349,6 +401,74 @@ def test_parse_artist_various_artists_canonical_id(provider):
 def test_parse_artist_missing_id_raises(provider):
     with pytest.raises(InvalidDataError, match="ID"):
         provider._parse_artist({"name": "Mystery"})
+
+
+def test_parse_artist_uses_browse_id_and_artist_keys(provider):
+    """Search results (filter='artists') key the id as browseId, name as artist."""
+    artist = provider._parse_artist({"browseId": "UCxyz", "artist": "Some Artist"})
+    assert artist.item_id == "UCxyz"
+    assert artist.name == "Some Artist"
+
+
+def test_parse_artist_channel_id_takes_precedence_over_browse_id(provider):
+    artist = provider._parse_artist(
+        {"channelId": "UCchan", "browseId": "UCbrowse", "name": "A"}
+    )
+    assert artist.item_id == "UCchan"
+
+
+def test_parse_artist_name_key_preferred_over_artist_key(provider):
+    artist = provider._parse_artist(
+        {"browseId": "UCx", "name": "Real Name", "artist": "Alt Name"}
+    )
+    assert artist.name == "Real Name"
+
+
+def test_parse_artist_various_artists_via_artist_key(provider):
+    artist = provider._parse_artist({"artist": "Various Artists"})
+    assert artist.item_id == ytm.VARIOUS_ARTISTS_YTM_ID
+
+
+# ---------------------------------------------------------------------------
+# _get_artist_item_mapping
+# ---------------------------------------------------------------------------
+
+
+def test_artist_item_mapping_id_precedence(provider):
+    mapping = provider._get_artist_item_mapping(
+        {"id": "UCid", "channelId": "UCchan", "browseId": "UCbrowse", "name": "A"}
+    )
+    assert mapping.media_type == MediaType.ARTIST
+    assert mapping.item_id == "UCid"
+    assert mapping.name == "A"
+
+
+def test_artist_item_mapping_browse_id_and_artist_keys(provider):
+    mapping = provider._get_artist_item_mapping(
+        {"browseId": "UCbrowse", "artist": "Search Artist"}
+    )
+    assert mapping.item_id == "UCbrowse"
+    assert mapping.name == "Search Artist"
+
+
+def test_artist_item_mapping_various_artists_via_artist_key(provider):
+    mapping = provider._get_artist_item_mapping({"artist": "Various Artists"})
+    assert mapping.item_id == ytm.VARIOUS_ARTISTS_YTM_ID
+
+
+def test_artist_item_mapping_empty_name_falls_back_to_unknown(provider):
+    """A truthy id with a present-but-empty name/artist must not yield a blank name."""
+    assert provider._get_artist_item_mapping(
+        {"channelId": "UCx", "artist": ""}
+    ).name == "Unknown"
+    assert provider._get_artist_item_mapping(
+        {"browseId": "UCy", "name": "", "artist": None}
+    ).name == "Unknown"
+
+
+def test_parse_artist_empty_name_falls_back_to_unknown(provider):
+    artist = provider._parse_artist({"browseId": "UCz", "name": "", "artist": ""})
+    assert artist.name == "Unknown Artist"
 
 
 # ---------------------------------------------------------------------------
@@ -1297,6 +1417,27 @@ def test_partial_auth_guard_covers_get_library_artists(provider):
     assert len(first) == 1
     with pytest.raises(RuntimeError, match="partial-auth"):
         _consume(provider.get_library_artists())
+
+
+def test_get_library_artists_parses_browse_id_and_artist_keys(provider):
+    """Subscriptions/library artists keyed browseId/artist parse without pre-mapping."""
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_subscriptions = MagicMock(
+        return_value=[{"browseId": "UCsub", "artist": "Subscribed Artist"}]
+    )
+    mock.get_library_artists = MagicMock(
+        return_value=[{"browseId": "UClib", "artist": "Library Artist"}]
+    )
+    mock.get_account_info = MagicMock(return_value={})
+    provider._ytmusic = mock
+
+    artists = _consume(provider.get_library_artists())
+    assert {a.item_id: a.name for a in artists} == {
+        "UCsub": "Subscribed Artist",
+        "UClib": "Library Artist",
+    }
 
 
 def test_partial_auth_guard_per_category_state_isolated(provider):
