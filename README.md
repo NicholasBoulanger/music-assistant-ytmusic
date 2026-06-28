@@ -31,6 +31,8 @@ curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main
 
 The script auto-detects your MA container ID, Python version, and `/config` path, downloads the latest provider, stages it under `/config/custom_components/mass/providers/`, copies it into the MA container, and restarts MA. Re-run anytime to upgrade.
 
+> **Installing from a fork?** Both install scripts accept `--repo-owner OWNER` to download from your own fork instead of the default `sproft`. For example: `curl -fsSL .../install_provider.sh | sh -s -- --repo-owner youruser`.
+
 > **No Docker in your shell?** On Home Assistant OS the watcher add-on route does not need Docker in your terminal: run `install_watcher_addon.sh` (see below), then install and start the **MA Provider Watcher** local add-on with Protection mode off. It injects the provider for you and keeps it installed across restarts.
 
 Then jump to step 4 below to add the provider in the MA UI, and see [WATCHER_ADDON.md](WATCHER_ADDON.md) (or the quick installer further down) to make the install survive HA restarts.
@@ -150,8 +152,8 @@ The cookie must contain `__Secure-3PAPISID`, `SID`, `HSID`, and `SSID`. Cookies 
 ### Adding an arbitrary YouTube link
 
 Music Assistant's global search normally only surfaces YouTube **Music** catalog
-content. To add any specific YouTube or YouTube Music item — including plain
-`youtube.com` videos that aren't in the Music catalog — **paste its URL directly
+content. To add any specific YouTube or YouTube Music item, including plain
+`youtube.com` videos that aren't in the Music catalog, **paste its URL directly
 into the search box**. The provider detects the link and resolves it to the exact
 item, placed first in the results, that you can then play or add to your library.
 
@@ -163,7 +165,7 @@ Recognized link formats:
 Notes:
 
 - A watch link that also carries a `list=` parameter resolves to the **song**, not the surrounding playlist.
-- A pasted link bypasses any media-type filter — a deliberate paste always resolves.
+- A pasted link bypasses any media-type filter, so a deliberate paste always resolves.
 - Plain (non-Music) videos still play; their metadata (title, uploader) may be sparse.
 - Albums are intentionally left to normal search, since YouTube albums already carry the metadata needed to surface there.
 
@@ -171,7 +173,7 @@ Notes:
 
 When you paste a **track** link, the remaining results aren't matches on the raw
 URL string. The provider looks up the video's title and runs a normal search on
-that name, so the other results are related songs, albums and artists — while the
+that name, so the other results are related songs, albums and artists, while the
 pasted video itself stays at the top.
 
 #### Trimming a video (start / end timestamps)
@@ -236,6 +238,17 @@ These are installed automatically by the provider on first run via MA's `install
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp)
 - [`ytmusicapi`](https://github.com/sigma67/ytmusicapi)
 - [`duration-parser`](https://pypi.org/project/duration-parser/)
+
+---
+
+## Credits
+
+Built and maintained by [@sproft](https://github.com/sproft), with features and fixes contributed by the community:
+
+- **[@gusjengis](https://github.com/gusjengis):** resolving a pasted YouTube or YTM link directly from the search box, plus the `@start-end` video trimming feature ([#29](https://github.com/sproft/music-assistant-ytmusic/pull/29)).
+- **[@bsny](https://github.com/bsny):** correct parsing of artists from search results, plus the `--repo-owner` option for the install scripts so forks can install from their own copy ([#26](https://github.com/sproft/music-assistant-ytmusic/pull/26)).
+
+Contributions are welcome. Please [open an issue](https://github.com/sproft/music-assistant-ytmusic/issues) or a pull request.
 
 ---
 
