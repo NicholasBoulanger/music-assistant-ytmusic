@@ -187,11 +187,14 @@ def _split_trim_spec(query: str) -> tuple[str, int | None, int | None]:
     start = _parse_timestamp(match.group(1))
     end = _parse_timestamp(match.group(2))
     if start is None and end is None:
-        return query, None, None
-    if start is not None and end is not None and start >= end:
-        # Nonsensical window: ignore the spec rather than producing empty audio.
+        # Not a recognizable trim window (e.g. "@-"); leave the suffix on the
+        # query so a genuine text search isn't silently altered.
         return query, None, None
     trimmed = query[: match.start()].rstrip()
+    if start is not None and end is not None and start >= end:
+        # Nonsensical window (start >= end): ignore the bounds, but still strip
+        # the recognized "@start-end" suffix so it can't corrupt URL resolution.
+        return trimmed, None, None
     return trimmed, start, end
 
 
@@ -1000,18 +1003,23 @@ class YoutubeMusicFreeProvider(MusicProvider):
         return result
 
     async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Track]:
-        """Return a dynamic list of tracks based on the provided track (song radio)."""
+        """Return a dynamic list of tracks based on the provided track (song radio).
+
+        ``prov_track_id`` may carry a trim window (``VIDEOID@start-end``); only
+        the bare video id is meaningful to YTM, so strip it before the call.
+        """
+        video_id, _, _ = _split_track_id(prov_track_id)
         try:
             watch_playlist = await asyncio.to_thread(
                 self._ytmusic.get_watch_playlist,
-                videoId=prov_track_id,
+                videoId=video_id,
                 limit=limit,
             )
         except Exception as err:  # noqa: BLE001
             # ytmusicapi can raise (e.g. KeyError 'endpoint') when the watch-playlist
             # response lacks the expected navigation structure. Degrade to an empty
             # radio list rather than failing the whole play_media command.
-            self.logger.debug("get_watch_playlist failed for %s: %s", prov_track_id, err)
+            self.logger.debug("get_watch_playlist failed for %s: %s", video_id, err)
             return []
         if not watch_playlist or "tracks" not in watch_playlist:
             return []

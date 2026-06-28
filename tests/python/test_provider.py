@@ -1005,8 +1005,9 @@ def test_parse_timestamp(token, expected):
         # No spec / unparseable spec -> query untouched, no bounds.
         ("https://youtu.be/abc123", ("https://youtu.be/abc123", None, None)),
         ("an email a@b thing", ("an email a@b thing", None, None)),
-        # start >= end is nonsensical -> ignored.
-        ("https://youtu.be/abc123 @3:42-0:15", ("https://youtu.be/abc123 @3:42-0:15", None, None)),
+        # start >= end is nonsensical -> bounds ignored, but the recognized
+        # "@start-end" suffix is still stripped so URL resolution stays clean.
+        ("https://youtu.be/abc123 @3:42-0:15", ("https://youtu.be/abc123", None, None)),
     ],
 )
 def test_split_trim_spec(query, expected):
@@ -1029,6 +1030,15 @@ def test_encode_split_track_id_roundtrip(video_id, start, end, encoded):
 
 def test_split_track_id_plain():
     assert ytm._split_track_id("abc12345678") == ("abc12345678", None, None)
+
+
+def test_get_similar_tracks_strips_trim_suffix(provider):
+    """Song radio on a trimmed track must query YTM with the bare video id."""
+    mock = MagicMock()
+    mock.get_watch_playlist = MagicMock(return_value={"tracks": []})
+    provider._ytmusic = mock
+    asyncio.run(provider.get_similar_tracks("abc12345678@15-222"))
+    assert mock.get_watch_playlist.call_args.kwargs["videoId"] == "abc12345678"
 
 
 def test_parse_youtube_url_encodes_trim(provider):
