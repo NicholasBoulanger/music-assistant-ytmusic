@@ -5,7 +5,7 @@
 # instead of git so it runs on HAOS, where git is not available.
 #
 # Usage:
-#   sh install_watcher_addon.sh [--force] [--ref REF] [--ma-id ID]
+#   sh install_watcher_addon.sh [--force] [--repo-owner OWNER] [--ref REF] [--ma-id ID]
 #                               [--python-version VER] [--addons-dir DIR]
 #
 # See WATCHER_ADDON.md for the underlying manual procedure.
@@ -51,6 +51,7 @@ Usage: sh install_watcher_addon.sh [options]
 
 Options:
   --force, -f               Overwrite existing add-on directory without prompting
+  --repo-owner OWNER        Repository owner (default: sproft)
   --ref REF                 Git ref (branch/tag/commit) to download (default: main)
   --ma-id ID                Music Assistant container ID (default: auto-detect)
   --python-version VER      MA Python version, e.g. python3.13 (default: auto-detect)
@@ -62,6 +63,7 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         --force|-f) FORCE=1 ;;
+        --repo-owner) shift; REPO_OWNER="${1:-}" ;;
         --ref) shift; REF="${1:-}" ;;
         --ma-id) shift; MA_ID="${1:-}" ;;
         --python-version) shift; PYTHON_VERSION="${1:-}" ;;
