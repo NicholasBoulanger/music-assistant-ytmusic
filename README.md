@@ -17,6 +17,20 @@ For playlists, `yt-dlp` is used as a fallback when `ytmusicapi` cannot parse the
 
 ---
 
+## Support and bug reports
+
+This is an unofficial, independent provider. It is not affiliated with or supported by the Music Assistant project.
+
+The Music Assistant maintainers have stated more than once that they do not want this provider and will not support it. Please respect that:
+
+- Do not open issues, discussions, or support requests about this provider on the Music Assistant repositories, Discord, or forum.
+- Do not mention this provider when reporting an unrelated Music Assistant bug. If you hit a problem in Music Assistant itself, reproduce it with this provider removed before reporting it upstream.
+- Report anything about this provider here, on this repository's [issue tracker](https://github.com/sproft/music-assistant-ytmusic/issues).
+
+Keeping these reports here respects the Music Assistant team's wishes and keeps them out of a project they have asked not to be involved with.
+
+---
+
 ## Installation
 
 Music Assistant runs as a Docker container (HA add-on). The provider files must be copied **inside the container**. Placing them in `/config/` is not sufficient.
@@ -30,6 +44,8 @@ curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main
 ```
 
 The script auto-detects your MA container ID, Python version, and `/config` path, downloads the latest provider, stages it under `/config/custom_components/mass/providers/`, copies it into the MA container, and restarts MA. Re-run anytime to upgrade.
+
+> **Installing from a fork?** Both install scripts accept `--repo-owner OWNER` to download from your own fork instead of the default `sproft`. For example: `curl -fsSL .../install_provider.sh | sh -s -- --repo-owner youruser`.
 
 > **No Docker in your shell?** On Home Assistant OS the watcher add-on route does not need Docker in your terminal: run `install_watcher_addon.sh` (see below), then install and start the **MA Provider Watcher** local add-on with Protection mode off. It injects the provider for you and keeps it installed across restarts.
 
@@ -150,8 +166,8 @@ The cookie must contain `__Secure-3PAPISID`, `SID`, `HSID`, and `SSID`. Cookies 
 ### Adding an arbitrary YouTube link
 
 Music Assistant's global search normally only surfaces YouTube **Music** catalog
-content. To add any specific YouTube or YouTube Music item — including plain
-`youtube.com` videos that aren't in the Music catalog — **paste its URL directly
+content. To add any specific YouTube or YouTube Music item, including plain
+`youtube.com` videos that aren't in the Music catalog, **paste its URL directly
 into the search box**. The provider detects the link and resolves it to the exact
 item, placed first in the results, that you can then play or add to your library.
 
@@ -163,7 +179,7 @@ Recognized link formats:
 Notes:
 
 - A watch link that also carries a `list=` parameter resolves to the **song**, not the surrounding playlist.
-- A pasted link bypasses any media-type filter — a deliberate paste always resolves.
+- A pasted link bypasses any media-type filter, so a deliberate paste always resolves.
 - Plain (non-Music) videos still play; their metadata (title, uploader) may be sparse.
 - Albums are intentionally left to normal search, since YouTube albums already carry the metadata needed to surface there.
 
@@ -171,7 +187,7 @@ Notes:
 
 When you paste a **track** link, the remaining results aren't matches on the raw
 URL string. The provider looks up the video's title and runs a normal search on
-that name, so the other results are related songs, albums and artists — while the
+that name, so the other results are related songs, albums and artists, while the
 pasted video itself stays at the top.
 
 #### Trimming a video (start / end timestamps)
@@ -236,6 +252,17 @@ These are installed automatically by the provider on first run via MA's `install
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp)
 - [`ytmusicapi`](https://github.com/sigma67/ytmusicapi)
 - [`duration-parser`](https://pypi.org/project/duration-parser/)
+
+---
+
+## Credits
+
+Built and maintained by [@sproft](https://github.com/sproft), with features and fixes contributed by the community:
+
+- **[@gusjengis](https://github.com/gusjengis):** resolving a pasted YouTube or YTM link directly from the search box, plus the `@start-end` video trimming feature ([#29](https://github.com/sproft/music-assistant-ytmusic/pull/29)).
+- **[@bsny](https://github.com/bsny):** correct parsing of artists from search results, plus the `--repo-owner` option for the install scripts so forks can install from their own copy ([#26](https://github.com/sproft/music-assistant-ytmusic/pull/26)).
+
+Contributions are welcome. Please [open an issue](https://github.com/sproft/music-assistant-ytmusic/issues) or a pull request.
 
 ---
 
