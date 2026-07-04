@@ -218,6 +218,32 @@ arch:
   - armhf
   - armv7
   - i386
+options:
+  auto_update: true
+  update_interval_hours: 24
+schema:
+  auto_update: bool
+  update_interval_hours: int(1,)
+EOF
+
+log "Writing translations/en.yaml"
+mkdir -p "$ADDON_DIR/translations"
+cat > "$ADDON_DIR/translations/en.yaml" <<'EOF'
+configuration:
+  auto_update:
+    name: Keep the ytmusic_free provider up to date
+    description: >-
+      Periodically check GitHub for a newer ytmusic_free provider and reinstall
+      it (restarting Music Assistant) only when the code actually changed. This
+      is NOT the add-on's own "Auto update" control on the Info tab (that
+      updates the watcher add-on itself) — this updates the music provider
+      inside Music Assistant. Turn off to stay on the version bundled in the
+      add-on image.
+  update_interval_hours:
+    name: Check the provider for updates every (hours)
+    description: >-
+      How often to check GitHub for a newer provider, in hours. 24 = once a
+      day, 168 = weekly, 1 = hourly. Minimum 1 hour.
 EOF
 
 log "Writing build.yaml"
@@ -235,7 +261,7 @@ cat > "$ADDON_DIR/Dockerfile" <<'EOF'
 ARG BUILD_FROM
 FROM $BUILD_FROM
 
-RUN apk add --no-cache docker-cli bash
+RUN apk add --no-cache docker-cli bash curl tar jq
 
 COPY ytmusic_free/ /provider/ytmusic_free/
 
@@ -250,12 +276,29 @@ cat > "$ADDON_DIR/run.sh" <<EOF
 #!/usr/bin/env bash
 
 MA="$MA_ID"
-SRC="/provider/ytmusic_free"
+BUNDLED="/provider/ytmusic_free"
+CACHE="/data/ytmusic_free"
+HASHFILE="/data/ytmusic_free.sha256"
 DST="/app/venv/lib/$PYTHON_VERSION/site-packages/music_assistant/providers"
+# Where auto-update pulls the latest provider from. Baked from the installer's
+# --repo-owner/--ref so a fork self-updates from its own source.
+TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REF"
 # How long to wait for the configured MA container to appear before logging a
 # loud ERROR. Catches the case where the installer's auto-detect fallback
 # baked in a container name that does not exist on this host (issue #11).
 MISSING_GRACE_SECONDS=60
+
+# Add-on options (Configuration tab): opt-in auto-update from GitHub.
+# The interval is configured in HOURS (human-friendly) and converted to seconds.
+AUTO_UPDATE="true"
+UPDATE_INTERVAL_HOURS=24
+if [ -r /data/options.json ]; then
+    AUTO_UPDATE="\$(jq -r '.auto_update // true' /data/options.json 2>/dev/null || echo true)"
+    UPDATE_INTERVAL_HOURS="\$(jq -r '.update_interval_hours // 24' /data/options.json 2>/dev/null || echo 24)"
+fi
+case "\$UPDATE_INTERVAL_HOURS" in ''|*[!0-9]*) UPDATE_INTERVAL_HOURS=24 ;; esac
+[ "\$UPDATE_INTERVAL_HOURS" -lt 1 ] 2>/dev/null && UPDATE_INTERVAL_HOURS=1
+UPDATE_INTERVAL=\$((UPDATE_INTERVAL_HOURS * 3600))
 
 echo "[\$(date)] MA Provider Watcher starting..."
 echo "[\$(date)] Watching for container name: \$MA"
@@ -267,10 +310,42 @@ if ! docker info > /dev/null 2>&1; then
 fi
 echo "[\$(date)] Docker OK"
 
+log() { echo "[\$(date)] \$*"; }
+
+# Inject source: the auto-updated cache in /data if present, else the copy
+# baked into the image at build time. /data survives add-on rebuilds.
+provider_src() { [ -d "\$CACHE" ] && printf '%s' "\$CACHE" || printf '%s' "\$BUNDLED"; }
+
+# Fetch the latest provider from GitHub into \$CACHE.
+# Return: 0 = updated (changed), 2 = unchanged, 1 = fetch/parse failed.
+fetch_latest() {
+    tmp="\$(mktemp -d 2>/dev/null || mktemp -d -t maw)" || return 1
+    if ! curl -fsSL "\$TARBALL_URL" -o "\$tmp/p.tgz" 2>/dev/null; then
+        log "auto-update: download failed"; rm -rf "\$tmp"; return 1
+    fi
+    if ! tar -xzf "\$tmp/p.tgz" -C "\$tmp" 2>/dev/null; then
+        log "auto-update: extract failed"; rm -rf "\$tmp"; return 1
+    fi
+    nd="\$(find "\$tmp" -maxdepth 3 -type d -name ytmusic_free 2>/dev/null | head -n1)"
+    if [ -z "\$nd" ]; then
+        log "auto-update: ytmusic_free not found in tarball"; rm -rf "\$tmp"; return 1
+    fi
+    # hash file contents by RELATIVE path (cd into \$nd) so a random tmp dir
+    # name doesn't change the digest -> stable across fetches of identical code
+    nh="\$( (cd "\$nd" && find . -type f -exec sha256sum {} \; 2>/dev/null | sort) | sha256sum | awk '{print \$1}')"
+    oh="\$(cat "\$HASHFILE" 2>/dev/null || echo none)"
+    if [ "\$nh" = "\$oh" ] && [ -d "\$CACHE" ]; then rm -rf "\$tmp"; return 2; fi
+    rm -rf "\$CACHE"; mkdir -p "\$CACHE" && cp -a "\$nd/." "\$CACHE/" || { rm -rf "\$tmp"; return 1; }
+    printf '%s\n' "\$nh" > "\$HASHFILE"
+    log "auto-update: cached new provider (\$nh)"
+    rm -rf "\$tmp"; return 0
+}
+
 install_provider() {
-    echo "[\$(date)] Installing ytmusic_free provider..."
+    src="\$(provider_src)"
+    echo "[\$(date)] Installing ytmusic_free provider from \$src ..."
     sleep 3
-    docker cp "\$SRC" "\$MA:\$DST/" && echo "[\$(date)] Copied OK" || { echo "[\$(date)] ERROR: cp failed"; return 1; }
+    docker cp "\$src" "\$MA:\$DST/" && echo "[\$(date)] Copied OK" || { echo "[\$(date)] ERROR: cp failed"; return 1; }
     docker restart "\$MA" && echo "[\$(date)] MA restarted" || echo "[\$(date)] ERROR: restart failed"
 }
 
@@ -289,6 +364,15 @@ warn_if_ma_misconfigured() {
     fi
 }
 
+# Prime the cache with the latest provider before the first inject (opt-in).
+if [ "\$AUTO_UPDATE" = "true" ]; then
+    log "auto-update enabled (checking every \${UPDATE_INTERVAL_HOURS}h); fetching latest..."
+    fetch_latest || true
+else
+    log "auto-update disabled; using the bundled provider copy."
+fi
+log "provider source: \$(provider_src)"
+
 LAST_ID=\$(docker ps -q --no-trunc --filter name="\$MA" 2>/dev/null)
 if [ -n "\$LAST_ID" ]; then
     echo "[\$(date)] MA running (\${LAST_ID:0:12}), installing provider..."
@@ -300,6 +384,7 @@ fi
 echo "[\$(date)] Polling for MA container changes every 10s..."
 MISSING_SINCE=0
 MISSING_WARNED=0
+LAST_UPDATE=\$(date +%s)
 [ -z "\$LAST_ID" ] && MISSING_SINCE=\$(date +%s)
 while true; do
     sleep 10
@@ -318,6 +403,18 @@ while true; do
         if [ \$((\$(date +%s) - MISSING_SINCE)) -ge "\$MISSING_GRACE_SECONDS" ]; then
             warn_if_ma_misconfigured
             MISSING_WARNED=1
+        fi
+    fi
+    # Periodic auto-update: fetch latest; reinject + restart MA only on change.
+    if [ "\$AUTO_UPDATE" = "true" ]; then
+        now=\$(date +%s)
+        if [ \$((now - LAST_UPDATE)) -ge "\$UPDATE_INTERVAL" ]; then
+            LAST_UPDATE=\$now
+            if fetch_latest; then
+                log "auto-update: new provider version detected -> reinstalling"
+                CUR_ID=\$(docker ps -q --no-trunc --filter name="\$MA" 2>/dev/null)
+                if [ -n "\$CUR_ID" ]; then LAST_ID="\$CUR_ID"; install_provider; fi
+            fi
         fi
     fi
 done

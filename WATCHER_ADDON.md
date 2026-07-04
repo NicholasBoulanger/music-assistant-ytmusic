@@ -10,6 +10,8 @@ The add-on polls the MA container ID every 10 seconds. When the Supervisor recre
 
 The provider files are baked into the watcher image at build time, so there is no dependency on `/config` volume mapping at runtime.
 
+Optionally, the watcher can also keep the provider **up to date**: with `auto_update` enabled (the default) it periodically fetches the latest provider from GitHub, and reinstalls + restarts MA **only when the code actually changed** (SHA-256 comparison). See [Auto-update](#auto-update) below.
+
 ---
 
 ## File layout
@@ -19,6 +21,8 @@ The provider files are baked into the watcher image at build time, so there is n
 ├── config.yaml
 ├── Dockerfile
 ├── run.sh
+├── translations/
+│   └── en.yaml          # friendly names/descriptions for the options below
 └── ytmusic_free/
     ├── __init__.py
     └── manifest.json
@@ -42,6 +46,31 @@ arch:
   - armhf
   - armv7
   - i386
+options:
+  auto_update: true
+  update_interval_hours: 24
+schema:
+  auto_update: bool
+  update_interval_hours: int(1,)
+```
+
+The `options`/`schema` block exposes the [Auto-update](#auto-update) settings in the add-on's **Configuration** tab. `update_interval_hours` is in hours and clamped to a minimum of 1 at runtime. A `translations/en.yaml` file gives the fields friendly names and descriptions instead of the raw keys:
+
+```yaml
+# translations/en.yaml
+configuration:
+  auto_update:
+    name: Keep the ytmusic_free provider up to date
+    description: >-
+      Periodically check GitHub for a newer ytmusic_free provider and reinstall
+      it (restarting Music Assistant) only when the code actually changed. This
+      is NOT the add-on's own "Auto update" control on the Info tab (that
+      updates the watcher add-on itself) — this updates the music provider.
+  update_interval_hours:
+    name: Check the provider for updates every (hours)
+    description: >-
+      How often to check GitHub for a newer provider, in hours. 24 = once a
+      day, 168 = weekly, 1 = hourly. Minimum 1 hour.
 ```
 
 ---
@@ -65,7 +94,7 @@ build_from:
 ARG BUILD_FROM
 FROM $BUILD_FROM
 
-RUN apk add --no-cache docker-cli bash
+RUN apk add --no-cache docker-cli bash curl tar jq
 
 COPY ytmusic_free/ /provider/ytmusic_free/
 
@@ -131,6 +160,8 @@ done
 > **Note:** The `python3.13` in `DST=` tracks MA's Python version, which changes over time (recent Music Assistant builds use `python3.14`). The installer auto-detects it; if you edit `run.sh` by hand, set it to match.
 > Check with: `docker exec addon_d5369777_music_assistant ls /app/venv/lib/`
 
+> **Note:** The `run.sh` above is the minimal core (re-inject after container recreation). The `run.sh` that the installer generates additionally implements [Auto-update](#auto-update): it reads `auto_update`/`update_interval_hours` from `/data/options.json`, fetches the latest provider tarball into a `/data` cache, and reinstalls only when the SHA-256 changes.
+
 ---
 
 ## Quick install (recommended)
@@ -144,6 +175,8 @@ curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main
 The script is POSIX `sh` (works on HAOS BusyBox `ash`), uses `curl + tar` instead of `git`, auto-detects the local add-ons path (HAOS `apps/local` and legacy `addons/local`, Supervised, and the in-add-on `/addons` mapping), and tries to detect the MA container ID and Python venv version. After it finishes, jump to [step 4 (Install the add-on)](#4-install-the-add-on) below.
 
 > **Re-running the installer? Rebuild the add-on.** The provider files and `run.sh` are baked into the add-on image at build time. If the add-on is already installed and you re-run the script (for example to fix `--python-version` or `--ma-id`), Home Assistant keeps the cached image until you rebuild it: open the add-on → three-dot menu → **Rebuild**, then **Start**. The installer stamps a fresh version on every run so "Check for updates" flags the change, but a cached image is only replaced by a rebuild.
+>
+> **Getting the new options after an upgrade from a version without them:** the Supervisor caches a local add-on's config schema at install time. If you had an older watcher installed (before these options existed), a Rebuild alone won't surface the new **Configuration** fields — the schema is only re-read on an **update**. Do **Check for updates**, then **Update** the add-on (three-dot menu), and the `auto_update` / `update_interval_hours` fields appear. This is the normal add-on-update flow (no console commands needed). A fresh install shows them immediately.
 
 Common flags:
 - `--force`: overwrite an existing install without prompting
@@ -235,6 +268,44 @@ cp -r /path/to/ytmusic_free /addons/ma_provider_watcher/ytmusic_free
 ha apps rebuild local_ma_provider_watcher
 ha apps restart local_ma_provider_watcher
 ```
+
+Or let the watcher do it for you — see [Auto-update](#auto-update).
+
+---
+
+<a id="auto-update"></a>
+## Auto-update
+
+The watcher can keep the provider current on its own, so you don't have to manually copy files and rebuild every time `ytmusic_free` changes upstream.
+
+### Options
+
+Set these in the add-on's **Configuration** tab (or `options` in `config.yaml`):
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `auto_update` | bool | `true` | When on, the watcher periodically checks GitHub for a newer provider and reinstalls it. Turn off to pin to the version baked into the image. |
+| `update_interval_hours` | int (hours) | `24` | How often to check. `24` = daily, `168` = weekly, `1` = hourly. Clamped to a minimum of `1` at runtime; invalid values fall back to the default. |
+
+### How it works
+
+1. On startup (and every `update_interval_hours` hours thereafter), the watcher downloads the provider tarball for the configured `--ref` (default `main`) from GitHub into a cache under `/data`.
+2. It compares the SHA-256 of the fetched `ytmusic_free/` against what's already cached.
+3. **Only if the code changed**, it copies the new files into the MA container and restarts MA. Unchanged fetches are a no-op — no needless restarts.
+4. If a fetch fails (offline, GitHub down), the watcher logs a warning and keeps using the currently installed version. It never leaves MA without a provider.
+
+Once a newer version has been cached, it also survives MA container recreation — the watcher installs from the cache in preference to the image-baked copy.
+
+### Logs
+
+With auto-update active you'll see lines such as:
+
+```
+provider source: /data/ytmusic_free
+auto-update: new provider version detected -> reinstalling
+```
+
+If `auto_update` is `false`, the watcher behaves exactly as before (re-inject on container recreation only).
 
 ---
 
