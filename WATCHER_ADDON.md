@@ -10,7 +10,7 @@ The add-on polls the MA container ID every 10 seconds. When the Supervisor recre
 
 The provider files are baked into the watcher image at build time, so there is no dependency on `/config` volume mapping at runtime.
 
-Optionally, the watcher can also keep the provider **up to date**: with `auto_update` enabled (the default) it periodically fetches the latest provider from GitHub, and reinstalls + restarts MA **only when the code actually changed** (SHA-256 comparison). See [Auto-update](#auto-update) below.
+Optionally, the watcher can also keep the provider **up to date**: enable `auto_update` (opt-in, off by default) and it periodically fetches the latest provider from GitHub, then reinstalls + restarts MA **only when the code actually changed** (SHA-256 comparison). See [Auto-update](#auto-update) below.
 
 ---
 
@@ -47,7 +47,7 @@ arch:
   - armv7
   - i386
 options:
-  auto_update: true
+  auto_update: false
   update_interval_hours: 24
 schema:
   auto_update: bool
@@ -62,10 +62,12 @@ configuration:
   auto_update:
     name: Keep the ytmusic_free provider up to date
     description: >-
-      Periodically check GitHub for a newer ytmusic_free provider and reinstall
-      it (restarting Music Assistant) only when the code actually changed. This
-      is NOT the add-on's own "Auto update" control on the Info tab (that
-      updates the watcher add-on itself) — this updates the music provider.
+      Off by default. When enabled, periodically check GitHub for a newer
+      ytmusic_free provider and reinstall it (restarting Music Assistant) only
+      when the code actually changed. Note this downloads and runs branch-head
+      code inside Music Assistant unattended. This is NOT the add-on's own "Auto
+      update" control on the Info tab, which updates the watcher add-on itself;
+      this option updates the music provider.
   update_interval_hours:
     name: Check the provider for updates every (hours)
     description: >-
@@ -176,7 +178,7 @@ The script is POSIX `sh` (works on HAOS BusyBox `ash`), uses `curl + tar` instea
 
 > **Re-running the installer? Rebuild the add-on.** The provider files and `run.sh` are baked into the add-on image at build time. If the add-on is already installed and you re-run the script (for example to fix `--python-version` or `--ma-id`), Home Assistant keeps the cached image until you rebuild it: open the add-on → three-dot menu → **Rebuild**, then **Start**. The installer stamps a fresh version on every run so "Check for updates" flags the change, but a cached image is only replaced by a rebuild.
 >
-> **Getting the new options after an upgrade from a version without them:** the Supervisor caches a local add-on's config schema at install time. If you had an older watcher installed (before these options existed), a Rebuild alone won't surface the new **Configuration** fields — the schema is only re-read on an **update**. Do **Check for updates**, then **Update** the add-on (three-dot menu), and the `auto_update` / `update_interval_hours` fields appear. This is the normal add-on-update flow (no console commands needed). A fresh install shows them immediately.
+> **Getting the new options after an upgrade from a version without them:** the Supervisor caches a local add-on's config schema at install time. If you had an older watcher installed (before these options existed), a Rebuild alone won't surface the new **Configuration** fields; the schema is only re-read on an **update**. Do **Check for updates**, then **Update** the add-on (three-dot menu), and the `auto_update` / `update_interval_hours` fields appear. This is the normal add-on-update flow (no console commands needed). A fresh install shows them immediately.
 
 Common flags:
 - `--force`: overwrite an existing install without prompting
@@ -269,7 +271,7 @@ ha apps rebuild local_ma_provider_watcher
 ha apps restart local_ma_provider_watcher
 ```
 
-Or let the watcher do it for you — see [Auto-update](#auto-update).
+Or let the watcher do it for you, see [Auto-update](#auto-update).
 
 ---
 
@@ -284,17 +286,19 @@ Set these in the add-on's **Configuration** tab (or `options` in `config.yaml`):
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `auto_update` | bool | `true` | When on, the watcher periodically checks GitHub for a newer provider and reinstalls it. Turn off to pin to the version baked into the image. |
+| `auto_update` | bool | `false` | Off by default (opt-in). When on, the watcher periodically checks GitHub for a newer provider and reinstalls it. Note it then runs branch-head code inside MA unattended. Leave off to pin to the version baked into the image. |
 | `update_interval_hours` | int (hours) | `24` | How often to check. `24` = daily, `168` = weekly, `1` = hourly. Clamped to a minimum of `1` at runtime; invalid values fall back to the default. |
+
+Auto-update follows the **branch head** given by `--ref` (default `main`); it does not resolve tags or commit SHAs.
 
 ### How it works
 
 1. On startup (and every `update_interval_hours` hours thereafter), the watcher downloads the provider tarball for the configured `--ref` (default `main`) from GitHub into a cache under `/data`.
 2. It compares the SHA-256 of the fetched `ytmusic_free/` against what's already cached.
-3. **Only if the code changed**, it copies the new files into the MA container and restarts MA. Unchanged fetches are a no-op — no needless restarts.
+3. **Only if the code changed**, it copies the new files into the MA container and restarts MA. Unchanged fetches are a no-op, so no needless restarts.
 4. If a fetch fails (offline, GitHub down), the watcher logs a warning and keeps using the currently installed version. It never leaves MA without a provider.
 
-Once a newer version has been cached, it also survives MA container recreation — the watcher installs from the cache in preference to the image-baked copy.
+Once a newer version has been cached, it also survives MA container recreation: the watcher installs from the cache in preference to the image-baked copy.
 
 ### Logs
 

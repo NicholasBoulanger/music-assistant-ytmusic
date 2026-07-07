@@ -52,7 +52,7 @@ Usage: sh install_watcher_addon.sh [options]
 Options:
   --force, -f               Overwrite existing add-on directory without prompting
   --repo-owner OWNER        Repository owner (default: sproft)
-  --ref REF                 Git ref (branch/tag/commit) to download (default: main)
+  --ref REF                 Branch to download; auto-update follows this branch head (default: main)
   --ma-id ID                Music Assistant container ID (default: auto-detect)
   --python-version VER      MA Python version, e.g. python3.13 (default: auto-detect)
   --addons-dir DIR          Local add-ons directory (default: auto-detect HAOS vs. Supervised)
@@ -203,6 +203,16 @@ log "Creating $ADDON_DIR"
 mkdir -p "$ADDON_DIR"
 cp -R "$SRC_ROOT/ytmusic_free" "$ADDON_DIR/ytmusic_free"
 
+# Guard values that get interpolated into run.sh (unquoted heredoc) + TARBALL_URL
+# against shell metacharacters, so operator input can't inject code into the
+# root-run watcher. Conservative charset covers real owners/refs/ids/versions.
+for _pair in "repo-owner:$REPO_OWNER" "ref:$REF" "ma-id:$MA_ID" "python-version:$PYTHON_VERSION"; do
+    _val="${_pair#*:}"
+    case "$_val" in
+        ""|*[!A-Za-z0-9._/-]*) die "invalid --${_pair%%:*} value '$_val' (allowed: letters digits . _ / -)" ;;
+    esac
+done
+
 log "Writing config.yaml"
 cat > "$ADDON_DIR/config.yaml" <<EOF
 name: "$ADDON_NAME"
@@ -219,7 +229,7 @@ arch:
   - armv7
   - i386
 options:
-  auto_update: true
+  auto_update: false
   update_interval_hours: 24
 schema:
   auto_update: bool
@@ -233,12 +243,12 @@ configuration:
   auto_update:
     name: Keep the ytmusic_free provider up to date
     description: >-
-      Periodically check GitHub for a newer ytmusic_free provider and reinstall
-      it (restarting Music Assistant) only when the code actually changed. This
-      is NOT the add-on's own "Auto update" control on the Info tab (that
-      updates the watcher add-on itself) — this updates the music provider
-      inside Music Assistant. Turn off to stay on the version bundled in the
-      add-on image.
+      Off by default. When enabled, periodically check GitHub for a newer
+      ytmusic_free provider and reinstall it (restarting Music Assistant) only
+      when the code actually changed. Note this downloads and runs branch-head
+      code inside Music Assistant unattended. This is NOT the add-on's own "Auto
+      update" control on the Info tab, which updates the watcher add-on itself;
+      this option updates the music provider inside Music Assistant.
   update_interval_hours:
     name: Check the provider for updates every (hours)
     description: >-
@@ -265,11 +275,68 @@ RUN apk add --no-cache docker-cli bash curl tar jq
 
 COPY ytmusic_free/ /provider/ytmusic_free/
 
+COPY watcher_lib.sh /watcher_lib.sh
 COPY run.sh /run.sh
-RUN chmod +x /run.sh && sed -i 's/\r//' /run.sh
+RUN chmod +x /run.sh && sed -i 's/\r//' /run.sh /watcher_lib.sh
 
 ENTRYPOINT ["/run.sh"]
 EOF
+
+log "Writing watcher_lib.sh"
+# Sourceable helpers, unit-testable without docker/network. Quoted heredoc: no
+# install-time interpolation — pure runtime logic. Callers set CACHE / BUNDLED /
+# HASHFILE / TARBALL_URL first.
+cat > "$ADDON_DIR/watcher_lib.sh" <<'LIBEOF'
+#!/usr/bin/env bash
+# Helpers for the MA Provider Watcher. Source this, then call read_options.
+
+# read_options [options.json path] -> sets AUTO_UPDATE, UPDATE_INTERVAL_HOURS, UPDATE_INTERVAL.
+# Boolean is parsed WITHOUT jq's `//` (which coerces an explicit false to the
+# default); auto-update is opt-in, so anything but an explicit true is false.
+read_options() {
+    f="${1:-/data/options.json}"
+    AUTO_UPDATE="false"; UPDATE_INTERVAL_HOURS=24
+    if [ -r "$f" ]; then
+        AUTO_UPDATE="$(jq -r 'if .auto_update == true then "true" else "false" end' "$f" 2>/dev/null || echo false)"
+        UPDATE_INTERVAL_HOURS="$(jq -r 'if (.update_interval_hours|type)=="number" then (.update_interval_hours|floor) else 24 end' "$f" 2>/dev/null || echo 24)"
+    fi
+    case "$UPDATE_INTERVAL_HOURS" in ''|*[!0-9-]*) UPDATE_INTERVAL_HOURS=24 ;; esac   # non-integer -> default
+    [ "$UPDATE_INTERVAL_HOURS" -lt 1 ] 2>/dev/null && UPDATE_INTERVAL_HOURS=1          # 0/negative -> 1
+    UPDATE_INTERVAL=$((UPDATE_INTERVAL_HOURS * 3600))
+}
+
+# Inject source: the auto-updated cache in /data if present, else the copy baked
+# into the image at build time. /data survives add-on rebuilds.
+provider_src() { [ -d "$CACHE" ] && printf '%s' "$CACHE" || printf '%s' "$BUNDLED"; }
+
+# Fetch the latest provider from GitHub into $CACHE.
+# Return: 0 = updated (changed), 2 = unchanged, 1 = fetch/parse failed.
+fetch_latest() {
+    tmp="$(mktemp -d 2>/dev/null || mktemp -d -t maw)" || return 1
+    if ! curl -fsSL --connect-timeout 10 --max-time 120 "$TARBALL_URL" -o "$tmp/p.tgz" 2>/dev/null; then
+        echo "auto-update: download failed"; rm -rf "$tmp"; return 1
+    fi
+    if ! tar -xzf "$tmp/p.tgz" -C "$tmp" 2>/dev/null; then
+        echo "auto-update: extract failed"; rm -rf "$tmp"; return 1
+    fi
+    nd="$(find "$tmp" -maxdepth 3 -type d -name ytmusic_free 2>/dev/null | head -n1)"
+    if [ -z "$nd" ]; then
+        echo "auto-update: ytmusic_free not found in tarball"; rm -rf "$tmp"; return 1
+    fi
+    # hash file contents by RELATIVE path (cd into $nd) so a random tmp dir name
+    # doesn't change the digest -> stable across fetches of identical code
+    nh="$( (cd "$nd" && find . -type f -exec sha256sum {} \; 2>/dev/null | sort) | sha256sum | awk '{print $1}')"
+    oh="$(cat "$HASHFILE" 2>/dev/null || echo none)"
+    if [ "$nh" = "$oh" ] && [ -d "$CACHE" ]; then rm -rf "$tmp"; return 2; fi
+    # stage-and-swap so a failed copy never wipes a good cache
+    rm -rf "$CACHE.new"
+    mkdir -p "$CACHE.new" && cp -a "$nd/." "$CACHE.new/" || { rm -rf "$tmp" "$CACHE.new"; return 1; }
+    rm -rf "$CACHE" && mv "$CACHE.new" "$CACHE" || { rm -rf "$tmp"; return 1; }
+    printf '%s\n' "$nh" > "$HASHFILE"
+    echo "auto-update: cached new provider ($nh)"
+    rm -rf "$tmp"; return 0
+}
+LIBEOF
 
 log "Writing run.sh (MA=$MA_ID, $PYTHON_VERSION)"
 cat > "$ADDON_DIR/run.sh" <<EOF
@@ -288,17 +355,10 @@ TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/head
 # baked in a container name that does not exist on this host (issue #11).
 MISSING_GRACE_SECONDS=60
 
-# Add-on options (Configuration tab): opt-in auto-update from GitHub.
-# The interval is configured in HOURS (human-friendly) and converted to seconds.
-AUTO_UPDATE="true"
-UPDATE_INTERVAL_HOURS=24
-if [ -r /data/options.json ]; then
-    AUTO_UPDATE="\$(jq -r '.auto_update // true' /data/options.json 2>/dev/null || echo true)"
-    UPDATE_INTERVAL_HOURS="\$(jq -r '.update_interval_hours // 24' /data/options.json 2>/dev/null || echo 24)"
-fi
-case "\$UPDATE_INTERVAL_HOURS" in ''|*[!0-9]*) UPDATE_INTERVAL_HOURS=24 ;; esac
-[ "\$UPDATE_INTERVAL_HOURS" -lt 1 ] 2>/dev/null && UPDATE_INTERVAL_HOURS=1
-UPDATE_INTERVAL=\$((UPDATE_INTERVAL_HOURS * 3600))
+# Add-on options (Configuration tab): opt-in auto-update from GitHub. Parsing +
+# interval clamp live in a sourceable helper so they can be unit-tested.
+. /watcher_lib.sh
+read_options
 
 echo "[\$(date)] MA Provider Watcher starting..."
 echo "[\$(date)] Watching for container name: \$MA"
@@ -312,34 +372,7 @@ echo "[\$(date)] Docker OK"
 
 log() { echo "[\$(date)] \$*"; }
 
-# Inject source: the auto-updated cache in /data if present, else the copy
-# baked into the image at build time. /data survives add-on rebuilds.
-provider_src() { [ -d "\$CACHE" ] && printf '%s' "\$CACHE" || printf '%s' "\$BUNDLED"; }
-
-# Fetch the latest provider from GitHub into \$CACHE.
-# Return: 0 = updated (changed), 2 = unchanged, 1 = fetch/parse failed.
-fetch_latest() {
-    tmp="\$(mktemp -d 2>/dev/null || mktemp -d -t maw)" || return 1
-    if ! curl -fsSL "\$TARBALL_URL" -o "\$tmp/p.tgz" 2>/dev/null; then
-        log "auto-update: download failed"; rm -rf "\$tmp"; return 1
-    fi
-    if ! tar -xzf "\$tmp/p.tgz" -C "\$tmp" 2>/dev/null; then
-        log "auto-update: extract failed"; rm -rf "\$tmp"; return 1
-    fi
-    nd="\$(find "\$tmp" -maxdepth 3 -type d -name ytmusic_free 2>/dev/null | head -n1)"
-    if [ -z "\$nd" ]; then
-        log "auto-update: ytmusic_free not found in tarball"; rm -rf "\$tmp"; return 1
-    fi
-    # hash file contents by RELATIVE path (cd into \$nd) so a random tmp dir
-    # name doesn't change the digest -> stable across fetches of identical code
-    nh="\$( (cd "\$nd" && find . -type f -exec sha256sum {} \; 2>/dev/null | sort) | sha256sum | awk '{print \$1}')"
-    oh="\$(cat "\$HASHFILE" 2>/dev/null || echo none)"
-    if [ "\$nh" = "\$oh" ] && [ -d "\$CACHE" ]; then rm -rf "\$tmp"; return 2; fi
-    rm -rf "\$CACHE"; mkdir -p "\$CACHE" && cp -a "\$nd/." "\$CACHE/" || { rm -rf "\$tmp"; return 1; }
-    printf '%s\n' "\$nh" > "\$HASHFILE"
-    log "auto-update: cached new provider (\$nh)"
-    rm -rf "\$tmp"; return 0
-}
+# provider_src() and fetch_latest() come from /watcher_lib.sh (sourced above).
 
 install_provider() {
     src="\$(provider_src)"
