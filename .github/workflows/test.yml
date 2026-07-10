@@ -9,7 +9,7 @@ jobs:
   shell:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Run shellcheck
         run: |
@@ -37,7 +37,7 @@ jobs:
     # must rely on curl + tar only.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Run installer test suite inside alpine (BusyBox ash)
         run: |
@@ -59,10 +59,10 @@ jobs:
         # historically supported, so we cover the floor too.
         python-version: ["3.11", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -71,3 +71,52 @@ jobs:
 
       - name: Run provider unit tests
         run: python -m pytest tests/python -v
+
+  docker-lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Lint Dockerfile (Hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Test Build (Single-Arch, No Push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true # Loads image into local docker daemon for inspection
+          tags: local-test-image:latest
+          build-args: MA_VERSION=latest
+
+      - name: Assert provider files exist in site-packages
+        run: |
+          # Spin up the built container and verify the provider directory exists in the computed venv path
+          # We use --entrypoint sh to override the default "mass" entrypoint of the image
+          docker run --rm --entrypoint sh local-test-image:latest -c '
+            PYVER=""
+            
+            # Clean POSIX alternative to ls | grep
+            for d in /app/venv/lib/python3.*/; do
+              if [ -d "$d" ]; then
+                PYVER=$(basename "$d")
+                break
+              fi
+            done
+            
+            [ -z "$PYVER" ] && PYVER="python3.13"
+            
+            TARGET_DIR="/app/venv/lib/$PYVER/site-packages/music_assistant/providers/ytmusic_free"
+            echo "Checking path: $TARGET_DIR"
+            if [ -d "$TARGET_DIR" ] && [ -f "$TARGET_DIR/manifest.json" ]; then
+              echo "Success: Provider files verified in venv."
+            else
+              echo "Error: Provider files missing from expected site-packages path!" >&2
+              exit 1
+            fi
+          '

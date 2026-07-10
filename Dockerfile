@@ -2,12 +2,22 @@
 ARG MA_VERSION=latest
 FROM ghcr.io/music-assistant/server:${MA_VERSION}
 
+# Add OCI labels for basic image introspection
+LABEL org.opencontainers.image.source="https://github.com/sproft/music-assistant-ytmusic" \
+      org.opencontainers.image.description="Music Assistant Server with pre-installed ytmusic_free provider"
+
 # Copy the provider directory from the repository context into the image
 COPY ytmusic_free/ /tmp/ytmusic_free/
 
 # Detect the active Python version and move files to the correct site-packages folder.
-# Dependencies from manifest.json will be installed automatically by Music Assistant on first setup.
-RUN PYVER=$(ls /app/venv/lib | grep -m1 '^python3') && \
+RUN PYVER="" && \
+    for d in /app/venv/lib/python3.*/; do \
+        if [ -d "$d" ]; then \
+            PYVER=$(basename "$d"); \
+            break; \
+        fi; \
+    done && \
+    if [ -z "$PYVER" ]; then PYVER="python3.13"; fi && \
     DST_DIR="/app/venv/lib/$PYVER/site-packages/music_assistant/providers/ytmusic_free" && \
     rm -rf "$DST_DIR" && \
     mv /tmp/ytmusic_free "$DST_DIR"
