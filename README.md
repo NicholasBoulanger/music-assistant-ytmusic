@@ -47,7 +47,9 @@ services:
 ```
 
 > [!NOTE]
-> The `:latest`, `:stable` and `:beta` tags are rolling builds synced with the upstream Music Assistant releases.
+> The `:latest` and `:beta` tags are rolling builds synced with the upstream Music Assistant releases.
+>
+> For reproducible deployments, pin to an immutable tag such as `:latest-<run_id>`, `:beta-<run_id>`, or a specific `@sha256:` digest.
 
 ## Installation: Home Assistant OS
 
@@ -270,6 +272,9 @@ These are installed automatically by the provider on first run via MA's `install
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp)
 - [`ytmusicapi`](https://github.com/sigma67/ytmusicapi)
 - [`duration-parser`](https://pypi.org/project/duration-parser/)
+
+> [!NOTE]
+> The first run requires outbound network access and a writable virtual environment (`/app/venv`) because the dependencies above are `pip`-installed at setup time. Subsequent starts use the cached packages.
 
 ---
 
