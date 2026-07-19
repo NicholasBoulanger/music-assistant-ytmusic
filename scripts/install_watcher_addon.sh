@@ -74,6 +74,12 @@ while [ $# -gt 0 ]; do
     shift || true
 done
 
+# URL of this script, used in re-run hints (including the one baked into the
+# generated run.sh) so they are copy-pasteable. Honors --repo-owner / --ref, and
+# shows the "sh -s --" pipe form: the documented install is "curl ... | sh",
+# where a bare "--flag" is parsed by sh itself and fails with "sh: bad option".
+SCRIPT_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/$REF/scripts/install_watcher_addon.sh"
+
 # --- Preflight ---------------------------------------------------------------
 
 log "Preflight checks..."
@@ -123,7 +129,7 @@ if [ -z "$ADDONS_DIR" ]; then
         log "WARN: $_cand exists but is not writable; skipping."
     done
     if [ -z "$ADDONS_DIR" ]; then
-        die "could not find a writable local add-ons directory (probed /addons, /data/{apps,addons}/local, /mnt/data/supervisor/{apps,addons}/local, /var/lib/homeassistant/{apps,addons}/local, /usr/share/hassio/{apps,addons}/local). Pass --addons-dir explicitly. Inside the SSH/Samba add-on use --addons-dir /addons; on the HAOS host console use --addons-dir /mnt/data/supervisor/apps/local."
+        die "could not find a writable local add-ons directory (probed /addons, /data/{apps,addons}/local, /mnt/data/supervisor/{apps,addons}/local, /var/lib/homeassistant/{apps,addons}/local, /usr/share/hassio/{apps,addons}/local). Pass --addons-dir explicitly. Inside the SSH/Samba add-on use --addons-dir /addons; on the HAOS host console use --addons-dir /mnt/data/supervisor/apps/local. Re-run e.g.: curl -fsSL $SCRIPT_URL | sh -s -- --addons-dir /addons"
     fi
 else
     [ -d "$ADDONS_DIR" ] || die "add-ons directory does not exist: $ADDONS_DIR"
@@ -136,13 +142,15 @@ ADDON_DIR="$ADDONS_DIR/$ADDON_SLUG"
 if [ -z "$MA_ID" ]; then
     if command -v docker >/dev/null 2>&1; then
         MA_ID="$(docker ps --format '{{.Names}}' 2>/dev/null \
-                 | grep -E '^addon_[0-9a-f]+_music_assistant$' \
+                 | grep -E '^addon_[0-9a-f]+_music_assistant(_beta|_nightly|_dev)?$' \
                  | head -n1 || true)"
     fi
     if [ -z "$MA_ID" ]; then
         MA_ID="addon_d5369777_music_assistant"
         log "WARN: could not auto-detect MA container; using fallback '$MA_ID'."
-        log "      Verify with: docker ps | grep music   then re-run with --ma-id ID"
+        log "      Verify with: docker ps | grep music"
+        log "      then re-run with the right id, e.g.:"
+        log "        curl -fsSL $SCRIPT_URL | sh -s -- --ma-id <ID>"
     else
         log "Detected MA container: $MA_ID"
     fi
@@ -283,7 +291,8 @@ warn_if_ma_misconfigured() {
     if [ -n "\$found" ]; then
         echo "[\$(date)] HINT: containers with 'music' in the name on this host:"
         printf '%s\n' "\$found" | sed "s/^/[\$(date)]   /"
-        echo "[\$(date)] HINT: re-run install_watcher_addon.sh with --ma-id <name> --force using one of those, then restart this add-on."
+        echo "[\$(date)] HINT: re-run the installer with the right --ma-id, then restart this add-on:"
+        echo "[\$(date)]   curl -fsSL $SCRIPT_URL | sh -s -- --ma-id <name> --force"
     else
         echo "[\$(date)] HINT: docker ps shows no container with 'music' in the name. Is the Music Assistant add-on installed and running?"
     fi
@@ -346,5 +355,5 @@ add-on still uses the old value, Rebuild it (step 2) -- "Check for updates"
 alone does not rebuild a cached local add-on image.
 
 If MA container ID or Python version was wrong, re-run with:
-  sh install_watcher_addon.sh --force --ma-id <ID> --python-version <pythonX.Y>
+  curl -fsSL $SCRIPT_URL | sh -s -- --force --ma-id <ID> --python-version <pythonX.Y>
 EOF

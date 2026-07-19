@@ -1726,7 +1726,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
     async def _install_packages(self) -> None:
         """Install required packages if not already present."""
-        for pkg in ("yt-dlp[default]", "ytmusicapi", "duration-parser"):
+        for pkg in ("yt-dlp[default]", "ytmusicapi"):
             await install_package(pkg)
         try:
             await asyncio.to_thread(importlib.import_module, "yt_dlp")

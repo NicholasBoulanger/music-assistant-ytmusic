@@ -77,6 +77,58 @@ else
     fail "no obvious bashisms in installer" "$bashisms"
 fi
 
+# --- MA container auto-detect regex (issue #35) -----------------------------
+
+printf '\n== MA container auto-detect regex ==\n'
+
+# Beta/nightly/dev MA installs name their container e.g.
+# "addon_d5369777_music_assistant_beta"; auto-detect must match those, not only
+# the stable "..._music_assistant" name (issue #35). Extract the exact pattern
+# the script uses so this test tracks the real code, then exercise it (this also
+# proves the ERE is portable to the dash/BusyBox grep the CI runs under).
+MA_PAT="$(sed -n "s/.*grep -E '\(\^addon_[^']*\)'.*/\1/p" "$SCRIPT" | head -n1)"
+
+if [ -n "$MA_PAT" ]; then
+    pass "extracted MA-detect regex from script"
+    assert_contains "MA-detect regex allows a channel suffix" "music_assistant(" "$MA_PAT"
+    for _name in addon_d5369777_music_assistant \
+                 addon_d5369777_music_assistant_beta \
+                 addon_ff_music_assistant_nightly \
+                 addon_ff_music_assistant_dev; do
+        if printf '%s\n' "$_name" | grep -qE "$MA_PAT"; then
+            pass "MA-detect regex matches $_name"
+        else
+            fail "MA-detect regex matches $_name" "expected a match"
+        fi
+    done
+    for _name in addon_ff_ma_provider_watcher \
+                 addon_ff_music_assistant_watcher \
+                 addon_ff_some_music_assistant_x \
+                 music_assistant; do
+        if printf '%s\n' "$_name" | grep -qE "$MA_PAT"; then
+            fail "MA-detect regex rejects $_name" "unexpected match"
+        else
+            pass "MA-detect regex rejects $_name"
+        fi
+    done
+else
+    fail "extracted MA-detect regex from script" "could not find the grep -E '^addon_...' line"
+fi
+
+# Recovery hints must use the pipe-safe "sh -s --" form: the documented install
+# is "curl ... | sh", where a bare "--flag" is parsed by sh itself and fails
+# with "sh: bad option" (issue #35). Guard the fix against regressing.
+src="$(cat "$SCRIPT")"
+assert_contains "re-run hints use the sh -s -- separator" "sh -s --" "$src"
+case "$src" in
+    *"then re-run with --ma-id ID"*) fail "no bare 're-run with --ma-id ID' hint remains" ;;
+    *) pass "no bare 're-run with --ma-id ID' hint remains" ;;
+esac
+case "$src" in
+    *"sh install_provider.sh --force --ma-id"*) fail "no bare 'sh install_provider.sh --force --ma-id' hint remains" ;;
+    *) pass "no bare 'sh install_provider.sh --force --ma-id' hint remains" ;;
+esac
+
 printf '\n== Usage / error paths ==\n'
 
 help_out="$(sh "$SCRIPT" --help 2>&1)"; help_rc=$?
