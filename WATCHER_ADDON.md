@@ -18,9 +18,11 @@ Optionally, the watcher can also keep the provider **up to date**: enable `auto_
 
 ```
 /mnt/data/supervisor/apps/local/ma_provider_watcher/   # HAOS 18+; older HAOS: .../addons/local/
+├── build.yaml
 ├── config.yaml
 ├── Dockerfile
 ├── run.sh
+├── watcher_lib.sh       # sourced by run.sh: read_options / provider_src / fetch_latest
 ├── translations/
 │   └── en.yaml          # friendly names/descriptions for the options below
 └── ytmusic_free/

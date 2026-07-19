@@ -37,27 +37,41 @@ LIB="$ADDON/watcher_lib.sh"; RUNSH="$ADDON/run.sh"
 bash -n "$RUNSH" 2>/dev/null && pass "run.sh parses" || fail "run.sh parses"
 bash -n "$LIB" 2>/dev/null && pass "watcher_lib.sh parses" || fail "watcher_lib.sh parses"
 if command -v shellcheck >/dev/null 2>&1; then
-    shellcheck -S warning "$RUNSH" "$LIB" >/dev/null 2>&1 && pass "shellcheck clean (generated run.sh + lib)" \
-        || fail "shellcheck reported issues" "run: shellcheck $RUNSH $LIB"
+    # Lint run.sh with -x so the 'source=watcher_lib.sh' directive is followed
+    # (otherwise the variables shared across the source boundary are flagged as
+    # unused SC2034 false positives), and -a so the sourced lib is itself linted.
+    # Must run from the add-on dir so the relative source directive resolves.
+    ( cd "$ADDON" && shellcheck -x -a -S warning run.sh ) >/dev/null 2>&1 \
+        && pass "shellcheck clean (generated run.sh + sourced lib)" \
+        || fail "shellcheck reported issues" "run: (cd $ADDON && shellcheck -x -a -S warning run.sh)"
 else
     skip "shellcheck not installed"
 fi
 
 # --- read_options (the blocker + clamp) ---
-opt(){ printf '%s' "$1" > "$TMP_ADDONS/o.json"; ( . "$LIB"; read_options "$TMP_ADDONS/o.json"; printf '%s %s' "$AUTO_UPDATE" "$UPDATE_INTERVAL_HOURS" ); }
-assert_eq "auto_update:false yields AUTO_UPDATE=false (the blocker)" "false 24" "$(opt '{"auto_update":false}')"
-assert_eq "auto_update:true yields true"                              "true 24"  "$(opt '{"auto_update":true}')"
-assert_eq "missing auto_update yields false (opt-in default)"         "false 24" "$(opt '{}')"
-assert_eq "interval 0 clamps to 1"        "true 1"   "$(opt '{"auto_update":true,"update_interval_hours":0}')"
-assert_eq "interval negative clamps to 1" "true 1"   "$(opt '{"auto_update":true,"update_interval_hours":-5}')"
-assert_eq "interval non-numeric -> 24"    "true 24"  "$(opt '{"auto_update":true,"update_interval_hours":"x"}')"
-assert_eq "interval null -> 24"           "true 24"  "$(opt '{"auto_update":true,"update_interval_hours":null}')"
-assert_eq "interval 168 kept"             "true 168" "$(opt '{"auto_update":true,"update_interval_hours":168}')"
+# read_options parses /data/options.json with jq (installed in the add-on image).
+# On a runner without jq the parse degrades every input to the defaults, so skip
+# these assertions rather than emit misleading failures (mirrors the sha256sum
+# shim above; the alpine CI job installs jq so it exercises them for real).
+if command -v jq >/dev/null 2>&1; then
+    opt(){ printf '%s' "$1" > "$TMP_ADDONS/o.json"; ( . "$LIB"; read_options "$TMP_ADDONS/o.json"; printf '%s %s' "$AUTO_UPDATE" "$UPDATE_INTERVAL_HOURS" ); }
+    assert_eq "auto_update:false yields AUTO_UPDATE=false (the blocker)" "false 24" "$(opt '{"auto_update":false}')"
+    assert_eq "auto_update:true yields true"                              "true 24"  "$(opt '{"auto_update":true}')"
+    assert_eq "missing auto_update yields false (opt-in default)"         "false 24" "$(opt '{}')"
+    assert_eq "interval 0 clamps to 1"        "true 1"   "$(opt '{"auto_update":true,"update_interval_hours":0}')"
+    assert_eq "interval negative clamps to 1" "true 1"   "$(opt '{"auto_update":true,"update_interval_hours":-5}')"
+    assert_eq "interval non-numeric -> 24"    "true 24"  "$(opt '{"auto_update":true,"update_interval_hours":"x"}')"
+    assert_eq "interval null -> 24"           "true 24"  "$(opt '{"auto_update":true,"update_interval_hours":null}')"
+    assert_eq "interval 168 kept"             "true 168" "$(opt '{"auto_update":true,"update_interval_hours":168}')"
+else
+    skip "jq not installed -- read_options assertions skipped"
+fi
 
 # --- provider_src precedence + fetch_latest change detection ---
 W="$(mktemp -d)"
 result="$(
     . "$LIB"
+    AUTO_UPDATE=true
     CACHE="$W/cache"; BUNDLED="$W/bundled"; HASHFILE="$W/hash"
     mkdir -p "$BUNDLED"; echo bundled > "$BUNDLED/x"
     src1="$(provider_src)"                                   # no cache -> bundled
@@ -65,13 +79,15 @@ result="$(
     ( cd "$W" && tar -czf pkg.tgz ytmusic_free )
     TARBALL_URL="file://$W/pkg.tgz"
     fetch_latest >/dev/null 2>&1; r1=$?                      # new -> 0
-    src2="$(provider_src)"                                   # now -> cache
+    src2="$(provider_src)"                                   # auto-update on + cache -> cache
+    # Opting OUT must revert to the bundled copy even with a cache present.
+    AUTO_UPDATE=false; src_off="$(provider_src)"; AUTO_UPDATE=true
     fetch_latest >/dev/null 2>&1; r2=$?                      # unchanged -> 2
     echo v2 > "$W/ytmusic_free/__init__.py"; ( cd "$W" && tar -czf pkg.tgz ytmusic_free )
     fetch_latest >/dev/null 2>&1; r3=$?                      # changed -> 0
-    [ "$src1" = "$BUNDLED" ] && [ "$src2" = "$CACHE" ] && echo "$r1 $r2 $r3"
+    [ "$src1" = "$BUNDLED" ] && [ "$src2" = "$CACHE" ] && [ "$src_off" = "$BUNDLED" ] && echo "$r1 $r2 $r3"
 )"
-assert_eq "provider_src bundled->cache, fetch_latest new/unchanged/changed = 0/2/0" "0 2 0" "$result"
+assert_eq "provider_src bundled->cache, off->bundled, fetch_latest new/unchanged/changed = 0/2/0" "0 2 0" "$result"
 
 printf '\n== Summary ==\n  passed: %s\n  failed: %s\n  skipped: %s\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -gt 0 ] && exit 1 || exit 0
