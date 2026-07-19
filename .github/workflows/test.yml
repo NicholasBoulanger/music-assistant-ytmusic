@@ -23,11 +23,13 @@ jobs:
         run: |
           dash tests/test_install_watcher_addon.sh
           dash tests/test_install_provider.sh
+          dash tests/test_watcher_autoupdate.sh
 
       - name: Run installer test suite (bash, for parity)
         run: |
           bash tests/test_install_watcher_addon.sh
           bash tests/test_install_provider.sh
+          bash tests/test_watcher_autoupdate.sh
 
   busybox:
     # Runs the suite inside Alpine, which uses BusyBox ash + BusyBox utilities
@@ -44,11 +46,12 @@ jobs:
           docker run --rm \
             -v "$PWD:/work" -w /work \
             alpine:3.20 \
-            sh -c 'apk add --no-cache curl ca-certificates >/dev/null \
+            sh -c 'apk add --no-cache curl ca-certificates jq bash >/dev/null \
                    && echo "shell: $(readlink -f /bin/sh)" \
                    && busybox --help 2>&1 | head -1 \
                    && sh tests/test_install_watcher_addon.sh \
-                   && sh tests/test_install_provider.sh'
+                   && sh tests/test_install_provider.sh \
+                   && sh tests/test_watcher_autoupdate.sh'
 
   python:
     runs-on: ubuntu-latest

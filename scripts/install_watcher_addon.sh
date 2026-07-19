@@ -313,9 +313,12 @@ read_options() {
     UPDATE_INTERVAL=$((UPDATE_INTERVAL_HOURS * 3600))
 }
 
-# Inject source: the auto-updated cache in /data if present, else the copy baked
-# into the image at build time. /data survives add-on rebuilds.
-provider_src() { [ -d "$CACHE" ] && printf '%s' "$CACHE" || printf '%s' "$BUNDLED"; }
+# Inject source: the auto-updated cache in /data when auto-update is ENABLED and a
+# cache exists, else the copy baked into the image at build time. Disabling
+# auto-update reverts to the bundled copy (the cache is kept for re-enabling), so
+# opting out actually stops running fetched branch-head code. /data survives
+# add-on rebuilds.
+provider_src() { if [ "${AUTO_UPDATE:-false}" = "true" ] && [ -d "$CACHE" ]; then printf '%s' "$CACHE"; else printf '%s' "$BUNDLED"; fi; }
 
 # Fetch the latest provider from GitHub into $CACHE.
 # Return: 0 = updated (changed), 2 = unchanged, 1 = fetch/parse failed.
@@ -386,6 +389,10 @@ install_provider() {
     src="\$(provider_src)"
     echo "[\$(date)] Installing ytmusic_free provider from \$src ..."
     sleep 3
+    # Clear any stale in-place copy so docker cp is a clean replace, not a merge:
+    # files deleted upstream would otherwise linger across periodic auto-updates
+    # (docker restart keeps the container filesystem). Mirrors install_provider.sh.
+    docker exec "\$MA" rm -rf "\$DST/ytmusic_free" 2>/dev/null || true
     docker cp "\$src" "\$MA:\$DST/" && echo "[\$(date)] Copied OK" || { echo "[\$(date)] ERROR: cp failed"; return 1; }
     docker restart "\$MA" && echo "[\$(date)] MA restarted" || echo "[\$(date)] ERROR: restart failed"
 }
