@@ -296,6 +296,8 @@ These are installed automatically by the provider on first run via MA's `install
 
 Built and maintained by [@sproft](https://github.com/sproft), with features and fixes contributed by the community:
 
+- **[@jojo141185](https://github.com/jojo141185):** automated Docker image builds published to GHCR, so standalone Docker and Compose users can run Music Assistant with the provider baked in ([#33](https://github.com/sproft/music-assistant-ytmusic/pull/33)).
+- **[@bygadd](https://github.com/bygadd):** opt-in auto-update for the MA Provider Watcher add-on, keeping the provider current from GitHub without a manual reinstall ([#32](https://github.com/sproft/music-assistant-ytmusic/pull/32)).
 - **[@gusjengis](https://github.com/gusjengis):** resolving a pasted YouTube or YTM link directly from the search box, plus the `@start-end` video trimming feature ([#29](https://github.com/sproft/music-assistant-ytmusic/pull/29)).
 - **[@bsny](https://github.com/bsny):** correct parsing of artists from search results, plus the `--repo-owner` option for the install scripts so forks can install from their own copy ([#26](https://github.com/sproft/music-assistant-ytmusic/pull/26)).
 
