@@ -140,6 +140,8 @@ The installer auto-detects the local add-ons folder across the common layouts: t
 > ```
 > Inside the SSH/Samba add-on use `--addons-dir /addons`. After re-running, **Rebuild** the add-on (three-dot menu) so the new files are baked into its image, then **Start** it.
 
+The watcher can also **keep the provider up to date automatically**. Enable the `auto_update` option in the add-on's Configuration tab (opt-in, off by default) and it periodically checks GitHub and reinstalls the provider only when the code actually changed, so you don't have to re-run the installer on every upstream change. Turning it back off pins to the version baked into the add-on image. See [Auto-update](WATCHER_ADDON.md#auto-update) for the options and details.
+
 See **[WATCHER_ADDON.md](WATCHER_ADDON.md)** for the manual procedure, troubleshooting, and the available installer flags.
 
 > **If the automatic installer doesn't work on your system,** the [`v0.1.0-beta.1` pre-release](https://github.com/sproft/music-assistant-ytmusic/releases/tag/v0.1.0-beta.1) is a known-good checkpoint of the manual install path. Pin to it (the manual procedure in `WATCHER_ADDON.md` from that tag was the only documented option at the time and works on HAOS and Supervised installs) and please [open an issue](https://github.com/sproft/music-assistant-ytmusic/issues/new) so the installer can be fixed.
