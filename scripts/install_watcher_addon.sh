@@ -368,7 +368,6 @@ MISSING_GRACE_SECONDS=60
 
 # Add-on options (Configuration tab): opt-in auto-update from GitHub. Parsing +
 # interval clamp live in a sourceable helper so they can be unit-tested.
-# shellcheck source=watcher_lib.sh
 . /watcher_lib.sh
 read_options
 

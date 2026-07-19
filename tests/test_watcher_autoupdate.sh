@@ -37,13 +37,15 @@ LIB="$ADDON/watcher_lib.sh"; RUNSH="$ADDON/run.sh"
 bash -n "$RUNSH" 2>/dev/null && pass "run.sh parses" || fail "run.sh parses"
 bash -n "$LIB" 2>/dev/null && pass "watcher_lib.sh parses" || fail "watcher_lib.sh parses"
 if command -v shellcheck >/dev/null 2>&1; then
-    # Lint run.sh with -x so the 'source=watcher_lib.sh' directive is followed
-    # (otherwise the variables shared across the source boundary are flagged as
-    # unused SC2034 false positives), and -a so the sourced lib is itself linted.
-    # Must run from the add-on dir so the relative source directive resolves.
-    ( cd "$ADDON" && shellcheck -x -a -S warning run.sh ) >/dev/null 2>&1 \
-        && pass "shellcheck clean (generated run.sh + sourced lib)" \
-        || fail "shellcheck reported issues" "run: (cd $ADDON && shellcheck -x -a -S warning run.sh)"
+    # Lint both generated files, excluding SC2034 only: run.sh sets
+    # CACHE/BUNDLED/HASHFILE/TARBALL_URL that are used by the sourced lib, and the
+    # lib sets AUTO_UPDATE/UPDATE_INTERVAL used by run.sh, so each looks "unused"
+    # when the files are analysed separately. Every other check still applies.
+    # (-x source-following behaves differently across shellcheck versions -- e.g.
+    # CI's 0.9.0 -- so exclude the one check that can't work per-file instead.)
+    sc_out="$(shellcheck -S warning -e SC2034 "$RUNSH" "$LIB" 2>&1)" \
+        && pass "shellcheck clean (generated run.sh + lib)" \
+        || fail "shellcheck reported issues" "$sc_out"
 else
     skip "shellcheck not installed"
 fi
