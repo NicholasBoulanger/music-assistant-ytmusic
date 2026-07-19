@@ -49,7 +49,7 @@ services:
 > [!NOTE]
 > The `:latest` and `:beta` tags are rolling builds synced with the upstream Music Assistant releases.
 >
-> For reproducible deployments, pin to an immutable tag such as `:latest-<run_id>`, `:beta-<run_id>`, or a specific `@sha256:` digest.
+> For reproducible deployments, pin to a specific build. The `:latest-<run_id>` / `:beta-<run_id>` tags identify a single build and are stable in normal use, but a manual workflow re-run reuses the run id and can republish different bits under the same tag. For a guaranteed-immutable pin, use the `@sha256:` digest.
 
 ## Installation: Home Assistant OS
 
@@ -57,13 +57,21 @@ Music Assistant runs as a Docker container (HA add-on). The provider files must 
 
 ### Quick install (recommended)
 
-One-line install from a shell with **host Docker access**. On Home Assistant OS that means the **Advanced SSH & Web Terminal** community add-on with **Protection mode off** (the official Terminal & SSH add-on is sandboxed and cannot reach Docker, so the script aborts with `required command not found: docker`). On a Supervised install, a normal root SSH session works:
+One-line install from a shell with **host Docker access**. On Home Assistant OS that means the **Advanced SSH & Web Terminal** community add-on with **Protection mode off** (the official Terminal & SSH add-on is sandboxed and cannot reach Docker, so the script aborts with a `the 'docker' command was not found` error explaining how to proceed). On a Supervised install, a normal root SSH session works:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main/scripts/install_provider.sh | sh
 ```
 
-The script auto-detects your MA container ID, Python version, and `/config` path, downloads the latest provider, stages it under `/config/custom_components/mass/providers/`, copies it into the MA container, and restarts MA. Re-run anytime to upgrade.
+The script auto-detects your MA container ID, Python version, and `/config` path, downloads the latest provider, stages it under `/config/custom_components/mass/providers/`, copies it into the MA container, and restarts MA.
+
+To upgrade later, re-run with `--force` so the already-staged provider is overwritten without stalling on the interactive prompt (a `curl | sh` pipe has no terminal to answer it):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main/scripts/install_provider.sh | sh -s -- --force
+```
+
+Note the `sh -s --` separator, as with the watcher installer below; `curl ... | sh --force` makes the shell parse `--force` as its own option and fail.
 
 > **Installing from a fork?** Both install scripts accept `--repo-owner OWNER` to download from your own fork instead of the default `sproft`. For example: `curl -fsSL .../install_provider.sh | sh -s -- --repo-owner youruser`.
 
@@ -276,7 +284,6 @@ These are installed automatically by the provider on first run via MA's `install
 
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp)
 - [`ytmusicapi`](https://github.com/sigma67/ytmusicapi)
-- [`duration-parser`](https://pypi.org/project/duration-parser/)
 
 > [!NOTE]
 > The first run requires outbound network access and a writable virtual environment (`/app/venv`) because the dependencies above are `pip`-installed at setup time. Subsequent starts use the cached packages.

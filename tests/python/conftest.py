@@ -367,18 +367,6 @@ def _install_music_assistant() -> None:
     pkg.models = models
 
 
-def _install_duration_parser() -> None:
-    if "duration_parser" in sys.modules:
-        return
-    mod = _new_module("duration_parser")
-
-    def _parse(value: str) -> int:
-        return int(value) if str(value).isdigit() else 0
-
-    mod.parse = _parse
-
-
-_install_duration_parser()
 _install_music_assistant_models()
 _install_music_assistant()
 

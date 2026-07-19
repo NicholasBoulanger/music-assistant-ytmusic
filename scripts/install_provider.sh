@@ -94,6 +94,12 @@ while [ $# -gt 0 ]; do
     shift || true
 done
 
+# URL of this script, used in re-run hints so they are copy-pasteable. Honors
+# --repo-owner / --ref, and (crucially) shows the "sh -s --" pipe form: the
+# documented install is "curl ... | sh", where a bare "--flag" is parsed by sh
+# itself and fails with "sh: bad option".
+SCRIPT_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/$REF/scripts/install_provider.sh"
+
 # --- Preflight ---------------------------------------------------------------
 
 log "Preflight checks..."
@@ -108,12 +114,14 @@ need_docker
 
 if [ -z "$MA_ID" ]; then
     MA_ID="$(docker ps --format '{{.Names}}' 2>/dev/null \
-             | grep -E '^addon_[0-9a-f]+_music_assistant$' \
+             | grep -E '^addon_[0-9a-f]+_music_assistant(_beta|_nightly|_dev)?$' \
              | head -n1 || true)"
     if [ -z "$MA_ID" ]; then
         MA_ID="addon_d5369777_music_assistant"
         log "WARN: could not auto-detect MA container; using fallback '$MA_ID'."
-        log "      Verify with: docker ps | grep music   then re-run with --ma-id ID"
+        log "      Verify with: docker ps | grep music"
+        log "      then re-run with the right id, e.g.:"
+        log "        curl -fsSL $SCRIPT_URL | sh -s -- --ma-id <ID>"
     else
         log "Detected MA container: $MA_ID"
     fi
@@ -121,7 +129,8 @@ fi
 
 # Confirm the MA container actually exists before we go further.
 docker inspect "$MA_ID" >/dev/null 2>&1 \
-    || die "MA container '$MA_ID' not found. Pass --ma-id ID with the right name."
+    || die "MA container '$MA_ID' not found. Re-run with the right name, e.g.:
+  curl -fsSL $SCRIPT_URL | sh -s -- --ma-id <ID>"
 
 # --- Detect Python version ---------------------------------------------------
 
@@ -233,6 +242,7 @@ Next steps:
   3. To survive Home Assistant restarts, install the watcher add-on:
      sh install_watcher_addon.sh
 
-Re-run anytime to upgrade. If autodetect picked wrong values, override with:
-  sh install_provider.sh --force --ma-id <ID> --python-version <pythonX.Y>
+Re-run anytime to upgrade (pass --force so the overwrite prompt does not stall a
+curl-pipe run). If autodetect picked wrong values, override with:
+  curl -fsSL $SCRIPT_URL | sh -s -- --force --ma-id <ID> --python-version <pythonX.Y>
 EOF
