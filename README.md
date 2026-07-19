@@ -31,7 +31,27 @@ Keeping these reports here respects the Music Assistant team's wishes and keeps 
 
 ---
 
-## Installation
+## Installation: Standalone Docker Compose
+
+If you are running Music Assistant via standalone Docker Compose instead of the Home Assistant OS Add-on, you can use our pre-built custom image which comes with the `ytmusic_free` provider pre-installed.
+
+Replace the default upstream image (`ghcr.io/music-assistant/server:latest`) with this image in your `docker-compose.yml`:
+
+```yaml
+services:
+  music-assistant:
+    image: ghcr.io/sproft/music-assistant-ytmusic:latest
+    container_name: music-assistant
+    restart: unless-stopped
+    # ... keep your existing volumes, network, devices, and ports settings here
+```
+
+> [!NOTE]
+> The `:latest` and `:beta` tags are rolling builds synced with the upstream Music Assistant releases.
+>
+> For reproducible deployments, pin to an immutable tag such as `:latest-<run_id>`, `:beta-<run_id>`, or a specific `@sha256:` digest.
+
+## Installation: Home Assistant OS
 
 Music Assistant runs as a Docker container (HA add-on). The provider files must be copied **inside the container**. Placing them in `/config/` is not sufficient.
 
@@ -257,6 +277,9 @@ These are installed automatically by the provider on first run via MA's `install
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp)
 - [`ytmusicapi`](https://github.com/sigma67/ytmusicapi)
 - [`duration-parser`](https://pypi.org/project/duration-parser/)
+
+> [!NOTE]
+> The first run requires outbound network access and a writable virtual environment (`/app/venv`) because the dependencies above are `pip`-installed at setup time. Subsequent starts use the cached packages.
 
 ---
 
