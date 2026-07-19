@@ -222,6 +222,11 @@ playlist links.)
 - yt-dlp may need updating: run `pip install -U yt-dlp` inside the MA container.
 - Some tracks are region-locked or removed and cannot be streamed.
 
+**Tracks skipped with `ytmusic is not available`**
+- Some third-party tools (for example [Beatify](https://github.com/mholzi/beatify)) hand Music Assistant links in the form `ytmusic://track/<id>`. Music Assistant routes a media link by its scheme prefix, and `ytmusic://` belongs to the official premium YouTube Music provider. When that provider is not installed, the queue drops the item and logs `Skipping ytmusic://track/<id>: ytmusic is not available`.
+- Rewrite the prefix to this provider's scheme, `ytmusic_free://track/<id>`, and the link resolves here. A track id is the raw YouTube video id and is identical on both providers, so the swap points at the same song. This is safe for `track/` links only. Album, artist, and playlist ids live in separate namespaces and will not map across.
+- A provider cannot claim another provider's scheme, since Music Assistant core owns that routing, so the lasting fix belongs in the tool that emits the link. Background and discussion: [#31](https://github.com/sproft/music-assistant-ytmusic/issues/31).
+
 **Playlist shows "No playable items found"**
 - Ensure you are on the latest version of this provider (playlist support uses a yt-dlp fallback added after the initial release).
 - Very large playlists may take a few seconds to load as yt-dlp fetches the track list.
