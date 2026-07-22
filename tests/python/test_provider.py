@@ -246,6 +246,48 @@ def test_build_auth_headers_returns_a_fresh_dict_each_call(provider, monkeypatch
     assert first is not second
 
 
+def test_instance_name_postfix_is_never_none_or_empty():
+    """MA formats this property directly, so None renders as a literal "[None]".
+
+    `Provider.default_name` builds a numeric fallback into a local variable
+    and then interpolates `self.instance_name_postfix` instead, so the
+    fallback never reaches the name. The postfix also lands in library data,
+    since playlist owners fall back to the provider name.
+    """
+    instance = _make_provider("ytmusic_free--abcdef123456")
+    instance.config = _StubConfig({})
+    postfix = instance.instance_name_postfix
+    assert postfix
+    assert postfix is not None
+    assert "None" not in postfix
+
+
+def test_instance_name_postfix_differs_between_instances():
+    first = _make_provider("ytmusic_free--aaaaaaaa1111")
+    second = _make_provider("ytmusic_free--bbbbbbbb2222")
+    first.config = _StubConfig({})
+    second.config = _StubConfig({})
+    assert first.instance_name_postfix != second.instance_name_postfix
+
+
+def test_instance_name_postfix_prefers_the_brand_account():
+    instance = _make_provider("ytmusic_free--abcdef123456")
+    instance.config = _StubConfig({ytm.CONF_BRAND_ACCOUNT: "112233445566"})
+    assert instance.instance_name_postfix == "112233445566"
+
+
+def test_instance_name_postfix_uses_the_account_index_when_set():
+    instance = _make_provider("ytmusic_free--abcdef123456")
+    instance.config = _StubConfig({ytm.CONF_AUTH_USER: 2})
+    assert instance.instance_name_postfix == "account 2"
+
+
+def test_instance_name_postfix_survives_a_missing_config():
+    instance = _make_provider("ytmusic_free--abcdef123456")
+    instance.config = None
+    assert instance.instance_name_postfix
+
+
 def test_library_seen_nonempty_is_not_shared_between_instances():
     """A class-level `= {}` default here would cross-contaminate accounts."""
     assert "_library_seen_nonempty" not in vars(ytm.YoutubeMusicFreeProvider)

@@ -118,7 +118,7 @@ Go to **Settings → Apps → Add** in the MA UI. You should see **"YouTube Musi
 
 ### Adding more than one account
 
-The provider is multi-instance, so you can add it several times and give each entry its own cookie, brand account ID, and audio quality setting. Repeat the step above once per account. Music Assistant lets you rename each instance, which is worth doing straight away because the default name is the same for all of them.
+The provider is multi-instance, so you can add it several times and give each entry its own cookie, brand account ID, and audio quality setting. Repeat the step above once per account. Music Assistant labels the entries automatically once there is more than one, using the brand account ID where you set one, and you can rename any of them in its settings.
 
 Typical reasons to run more than one:
 

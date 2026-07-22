@@ -396,6 +396,26 @@ class YoutubeMusicFreeProvider(MusicProvider):
             return ytmusicapi.YTMusic(auth=auth, user=user)
         return ytmusicapi.YTMusic()
 
+    @property
+    def instance_name_postfix(self) -> str | None:
+        """Return a per-instance label so two entries can be told apart.
+
+        Never returns None or an empty string. Music Assistant's
+        `default_name` computes a numeric fallback into a local variable but
+        then formats `self.instance_name_postfix`, so a None here renders
+        literally as "YouTube Music (Free) [None]" on every instance. The
+        name is not only cosmetic: playlist owners fall back to it, so it
+        would be written into library metadata.
+        """
+        brand_account = self.config.get_value(CONF_BRAND_ACCOUNT) if self.config else None
+        if brand_account:
+            return str(brand_account)
+        if self.config and (auth_user := self._configured_auth_user()):
+            return f"account {auth_user}"
+        # Last resort, but always distinct: MA builds instance ids as
+        # "<domain>--<uuid>", so the trailing fragment is unique per instance.
+        return self.instance_id.rsplit("--", 1)[-1][:8]
+
     def _configured_auth_user(self) -> int:
         """Return the configured X-Goog-AuthUser index, defaulting to 0."""
         raw = self.config.get_value(CONF_AUTH_USER)
