@@ -116,6 +116,24 @@ docker restart addon_d5369777_music_assistant
 
 Go to **Settings → Apps → Add** in the MA UI. You should see **"YouTube Music (Free)"** listed. No credentials are required for basic playback.
 
+### Adding more than one account
+
+The provider is multi-instance, so you can add it several times and give each entry its own cookie, brand account ID, and audio quality setting. Repeat the step above once per account. Music Assistant lets you rename each instance, which is worth doing straight away because the default name is the same for all of them.
+
+Typical reasons to run more than one:
+
+| Setup | What each instance holds |
+|-------|--------------------------|
+| Personal plus brand account | The same cookie in both, with the **Brand account ID** field set on one of them |
+| Two people in one household | A separate cookie per Google account, captured in separate incognito windows |
+| Authenticated plus anonymous | One instance with your library, one without auth |
+
+Each instance authenticates on its own and syncs only the account its own cookie resolves to. Music Assistant then merges what they sync into its single library, tagging every item with the instance it came from.
+
+> **Capturing two cookies?** Use a separate incognito window per account. A browser signed in to several Google accounts at once sends one identical cookie for all of them, and the **Account index** field (the `X-Goog-AuthUser` header value) is then the only thing that tells them apart. Two separate incognito sessions avoid the problem entirely, since each has a single account at index 0.
+
+> **Upgrading from an earlier version?** Your existing entry keeps working and needs no changes. On first start after the upgrade, the provider deletes the old `/data/ytmusic_browser_auth.json` file that previous releases used to store your cookie in plaintext.
+
 ### Keeping the provider across HA restarts
 
 If you restart HA (not just MA), the container is recreated and the provider files are lost. The recommended fix is the **MA Provider Watcher** local add-on, which re-copies the provider whenever the MA container is recreated. One-line install from a host shell:
@@ -158,7 +176,7 @@ Authentication is **not required** for search, browse, and playback. However, ad
 
 ### Setup
 
-1. In the MA UI, go to **Settings → Music sources → YouTube Music (Free)**
+1. In the MA UI, go to **Settings → Music sources** and open the **YouTube Music (Free)** entry you want to authenticate (if you added several, each one holds its own cookie)
 2. Set **Authentication** to **Browser cookie**
 3. Get your cookie (do this in a fresh **incognito / private window**, see the tip below):
    - Open a new incognito/private window and log in to `music.youtube.com`
@@ -173,6 +191,8 @@ Authentication is **not required** for search, browse, and playback. However, ad
 6. Click **Save**
 
 The cookie must contain `__Secure-3PAPISID`, `SID`, `HSID`, and `SSID`. Cookies are valid for approximately 2 years unless you log out.
+
+Your cookie is stored by Music Assistant itself, in the encrypted provider config it keeps for every provider, so it survives restarts and provider updates. You never need to re-enter it after an upgrade. The provider keeps the auth headers in memory for as long as the instance runs and writes no copy of its own; earlier releases also dropped a plaintext copy at `/data/ytmusic_browser_auth.json`, which is now removed automatically.
 
 ---
 
@@ -191,6 +211,7 @@ The cookie must contain `__Secure-3PAPISID`, `SID`, `HSID`, and `SSID`. Cookies 
 | Library artists (subscriptions + liked) | ❌ | ✅ |
 | Personalized recommendations | ❌ | ✅ |
 | Library editing (add/remove) | ❌ | ✅ |
+| Multiple accounts side by side | ✅ | ✅ |
 | Podcast support | ❌ | ❌ |
 
 ### Adding an arbitrary YouTube link
@@ -273,6 +294,11 @@ playlist links.)
 **Library is empty after auth**
 - Your YouTube Music library only shows content you've explicitly liked, saved, or subscribed to.
 - If your library is on a brand account, make sure the brand account ID is set.
+- Running several instances? Check that you authenticated the one you are looking at. Each entry holds its own cookie, and an entry left on **Authentication: None** syncs nothing.
+
+**Two instances show the same library**
+- The usual cause is capturing both cookies from one browser that has several Google accounts signed in. Google sends the **same** cookie for every account in that session, and only the `X-Goog-AuthUser` index says which account a request means, so recapturing the cookie "for the other account" changes nothing. Either capture each cookie in a separate incognito window signed in to one account only, or set the **Account index** field on the second instance to that account's `X-Goog-AuthUser` value (visible on any `youtubei/v1/...` request in DevTools).
+- If both entries point at the same personal account on purpose, set the **Brand account ID** on one of them to split them apart.
 
 **Files disappear after restarting Home Assistant**
 - Only use `docker restart addon_d5369777_music_assistant` to restart MA.

@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import os
 import re
 import time
 from collections.abc import AsyncGenerator
@@ -103,9 +104,16 @@ SEARCH_FILTER_BY_TYPE = {
 CONF_AUTH_TYPE = "auth_type"
 CONF_COOKIE = "cookie_header"
 CONF_BRAND_ACCOUNT = "brand_account"
+CONF_AUTH_USER = "auth_user"
 CONF_PREFER_AUDIO_QUALITY = "prefer_audio_quality"
 AUTH_TYPE_NONE = "none"
 AUTH_TYPE_COOKIE = "cookie"
+
+# Releases before multi-instance support wrote the browser auth headers to this
+# fixed path inside the MA container and handed ytmusicapi the filename. Auth is
+# now kept in memory, so the file is dead weight holding a plaintext cookie.
+# Deleted on setup so an upgrade cleans up after the old code. See issue #40.
+LEGACY_AUTH_FILE = "/data/ytmusic_browser_auth.json"
 
 # Cookie names that __Secure-3PAPISID alone cannot replace. A cookie capture
 # that passes the hard check but is missing these often validates at init
@@ -291,6 +299,20 @@ async def get_config_entries(
             "X-Goog-PageId header in browser DevTools on music.youtube.com.",
         ),
         ConfigEntry(
+            key=CONF_AUTH_USER,
+            type=ConfigEntryType.INTEGER,
+            label="Account index (advanced)",
+            default_value=0,
+            required=False,
+            depends_on=CONF_AUTH_TYPE,
+            depends_on_value=[AUTH_TYPE_COOKIE],
+            description="Which signed-in Google account the cookie should resolve to, "
+            "taken from the X-Goog-AuthUser request header on music.youtube.com. "
+            "Leave at 0 unless you captured the cookie from a browser with several "
+            "Google accounts signed in: those accounts all share one cookie, and this "
+            "index is the only thing that tells them apart.",
+        ),
+        ConfigEntry(
             key=CONF_PREFER_AUDIO_QUALITY,
             type=ConfigEntryType.BOOLEAN,
             label="Prefer highest audio quality",
@@ -313,13 +335,21 @@ class YoutubeMusicFreeProvider(MusicProvider):
     # Per-category flag: True once we've seen a non-empty sync. Used to tell a
     # genuinely empty library apart from a partial-auth HTTP 200 response that
     # ytmusicapi unwraps to []. See issue #10.
+    # Annotation only, deliberately. Giving this a `= {}` default here would
+    # make one dict shared by every instance, so a populated account would make
+    # a second, genuinely empty account raise a false partial-auth error.
     _library_seen_nonempty: dict[str, bool]
 
     async def handle_async_init(self) -> None:
         """Set up the YTMusicFree provider."""
         logging.getLogger("yt_dlp").setLevel(logging.WARNING)
         await self._install_packages()
-        self._prefer_quality = self.config.get_value(CONF_PREFER_AUDIO_QUALITY) or True
+        await self._purge_legacy_auth_file()
+        self._library_seen_nonempty = {}
+        # Explicit None check: a plain `or True` would swallow a configured
+        # False and pin every instance to the high-quality selector.
+        prefer_quality = self.config.get_value(CONF_PREFER_AUDIO_QUALITY)
+        self._prefer_quality = True if prefer_quality is None else bool(prefer_quality)
 
         auth_type = self.config.get_value(CONF_AUTH_TYPE) or AUTH_TYPE_NONE
         if auth_type == AUTH_TYPE_COOKIE:
@@ -327,9 +357,11 @@ class YoutubeMusicFreeProvider(MusicProvider):
             if cookie:
                 try:
                     brand_account = self.config.get_value(CONF_BRAND_ACCOUNT) or None
-                    auth_file = self._build_auth_file(cookie)
+                    auth_headers = self._build_auth_headers(
+                        cookie, self._configured_auth_user()
+                    )
                     self._ytmusic = await asyncio.to_thread(
-                        self._create_ytmusic_client, auth=auth_file, user=brand_account
+                        self._create_ytmusic_client, auth=auth_headers, user=brand_account
                     )
                     # Validate auth by making a lightweight library call
                     await asyncio.to_thread(self._ytmusic.get_library_songs, limit=1)
@@ -355,17 +387,64 @@ class YoutubeMusicFreeProvider(MusicProvider):
         if not self._authenticated:
             self.logger.info("YouTube Music (Free) initialized — anonymous mode")
 
-    def _create_ytmusic_client(self, auth: str | None = None, user: str | None = None):
+    def _create_ytmusic_client(
+        self, auth: dict[str, str] | None = None, user: str | None = None
+    ):
         """Create a YTMusic client, optionally with authentication."""
         ytmusicapi = importlib.import_module("ytmusicapi")
         if auth:
             return ytmusicapi.YTMusic(auth=auth, user=user)
         return ytmusicapi.YTMusic()
 
-    def _build_auth_file(self, cookie: str) -> str:
-        """Create a browser auth file and return the path."""
+    def _configured_auth_user(self) -> int:
+        """Return the configured X-Goog-AuthUser index, defaulting to 0."""
+        raw = self.config.get_value(CONF_AUTH_USER)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 0
+        return value if value >= 0 else 0
+
+    async def _purge_legacy_auth_file(self) -> None:
+        """Delete the pre-multi-instance auth file if an older version left one.
+
+        Best effort: a missing file is the normal case, and a read-only or
+        absent /data must never keep the provider from starting.
+        """
+
+        def _remove() -> bool:
+            if not os.path.exists(LEGACY_AUTH_FILE):
+                return False
+            os.remove(LEGACY_AUTH_FILE)
+            return True
+
+        try:
+            removed = await asyncio.to_thread(_remove)
+        except OSError as err:
+            self.logger.debug("Could not remove legacy auth file %s: %s", LEGACY_AUTH_FILE, err)
+            return
+        if removed:
+            self.logger.info(
+                "Removed the legacy auth file %s. Credentials are now held in "
+                "memory per provider instance and no longer written to disk.",
+                LEGACY_AUTH_FILE,
+            )
+
+    def _build_auth_headers(self, cookie: str, auth_user: int = 0) -> dict[str, str]:
+        """Build the browser auth headers for this instance, in memory.
+
+        ytmusicapi takes a headers dict directly, so nothing is written to
+        disk. That is what makes several instances safe to run side by side:
+        a shared file would let two accounts overwrite each other's cookie,
+        and whichever instance was mid-construction could authenticate as the
+        wrong account. See issue #40.
+
+        ``auth_user`` is the X-Goog-AuthUser index. It matters because a
+        browser signed in to several Google accounts sends one identical
+        cookie for all of them, so the cookie alone cannot say which account
+        is meant. Config is read by the caller, keeping this method pure.
+        """
         import hashlib
-        import json
 
         if "__Secure-3PAPISID" not in cookie:
             raise ValueError("Cookie must contain __Secure-3PAPISID")
@@ -401,7 +480,13 @@ class YoutubeMusicFreeProvider(MusicProvider):
         timestamp = str(int(time.time()))
         hash_input = f"{timestamp} {sapisid} {YTM_DOMAIN}"
         sapisid_hash = hashlib.sha1(hash_input.encode()).hexdigest()
-        headers = {
+        # Three of these keys are load-bearing for ytmusicapi and must stay:
+        # "authorization" (containing SAPISIDHASH) is the only thing
+        # determine_auth_type inspects to classify the session as BROWSER,
+        # "cookie" must carry __Secure-3PAPISID, and one of "origin" /
+        # "x-origin" is read once at construction. A fresh dict per call, so
+        # instances never share a mutable headers object.
+        return {
             "cookie": cookie,
             "user-agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -410,15 +495,11 @@ class YoutubeMusicFreeProvider(MusicProvider):
             "accept": "*/*",
             "accept-language": "en-US,en;q=0.5",
             "content-type": "application/json",
-            "x-goog-authuser": "0",
+            "x-goog-authuser": str(auth_user),
             "x-origin": YTM_DOMAIN,
             "origin": YTM_DOMAIN,
             "authorization": f"SAPISIDHASH {timestamp}_{sapisid_hash}",
         }
-        auth_path = "/data/ytmusic_browser_auth.json"
-        with open(auth_path, "w") as f:
-            json.dump(headers, f)
-        return auth_path
 
     async def search(
         self,
@@ -1125,6 +1206,10 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
     def _record_library_count(self, category: str, count: int) -> bool:
         """Track per-category populated state; return True if previously populated."""
+        # handle_async_init seeds this, but guard anyway: the attribute is
+        # deliberately not a class-level default (that would share one dict
+        # across instances), so any path reaching a library call without a
+        # full init would otherwise hit AttributeError.
         if not hasattr(self, "_library_seen_nonempty"):
             self._library_seen_nonempty = {}
         prev = self._library_seen_nonempty.get(category, False)
