@@ -48,3 +48,10 @@ def test_manifest_requirements_pin_known_libs(manifest):
 
 def test_manifest_documentation_url_present(manifest):
     assert manifest.get("documentation", "").startswith("https://")
+
+
+def test_manifest_declares_multi_instance(manifest):
+    # Identity check, not truthiness: Music Assistant reads this straight into
+    # ProviderManifest, and the string "true" would be just as truthy in a test
+    # while meaning nothing to the config flow. See issue #40.
+    assert manifest["multi_instance"] is True

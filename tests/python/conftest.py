@@ -41,6 +41,7 @@ def _install_music_assistant_models() -> None:
         STRING = "string"
         SECURE_STRING = "secure_string"
         BOOLEAN = "boolean"
+        INTEGER = "integer"
 
     @dataclass
     class _ConfigValueOption:

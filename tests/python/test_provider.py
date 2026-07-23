@@ -78,50 +78,43 @@ def test_yt_playlist_url_strips_vl_prefix(playlist_id, expected):
 
 
 # ---------------------------------------------------------------------------
-# Cookie / auth file building
+# Cookie / auth header building
 # ---------------------------------------------------------------------------
 
 
-def test_build_auth_file_rejects_cookie_without_secure_3papisid(provider, tmp_path, monkeypatch):
-    monkeypatch.setattr(ytm, "open", lambda *a, **kw: pytest.fail("must not write file"), raising=False)
+def _forbid_open(monkeypatch):
+    """Fail the test if anything tries to open a file.
+
+    Auth headers are built in memory so several provider instances can hold
+    different credentials at once (issue #40). Writing them to disk is the
+    exact regression these tests guard against.
+    """
+    monkeypatch.setattr(
+        "builtins.open",
+        lambda *a, **kw: pytest.fail("auth headers must not be written to disk"),
+    )
+
+
+def test_build_auth_headers_rejects_cookie_without_secure_3papisid(provider, monkeypatch):
+    _forbid_open(monkeypatch)
     with pytest.raises(ValueError, match="__Secure-3PAPISID"):
-        provider._build_auth_file("SID=abc; HSID=def")
+        provider._build_auth_headers("SID=abc; HSID=def")
 
 
-def test_build_auth_file_rejects_cookie_with_no_extractable_sapisid(provider, monkeypatch):
+def test_build_auth_headers_rejects_cookie_with_no_extractable_sapisid(provider, monkeypatch):
     # __Secure-3PAPISID present in the string but only as a substring,
     # never as its own `name=value` pair.
-    monkeypatch.setattr(ytm, "open", lambda *a, **kw: pytest.fail("must not write file"), raising=False)
+    _forbid_open(monkeypatch)
     with pytest.raises(ValueError, match="SAPISID"):
-        provider._build_auth_file("note=__Secure-3PAPISID-mention; SID=abc")
+        provider._build_auth_headers("note=__Secure-3PAPISID-mention; SID=abc")
 
 
-def test_build_auth_file_extracts_sapisid_when_present(provider, tmp_path, monkeypatch):
-    captured = {}
-
-    class _DummyFile:
-        def __init__(self, path):
-            captured["path"] = path
-            captured["buffer"] = []
-
-        def write(self, data):
-            captured["buffer"].append(data)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    def _open(path, *a, **kw):
-        return _DummyFile(path)
-
-    monkeypatch.setattr("builtins.open", _open)
+def test_build_auth_headers_extracts_sapisid_when_present(provider, monkeypatch):
+    _forbid_open(monkeypatch)
     cookie = "SAPISID=mySapisid; __Secure-3PAPISID=otherValue; SID=foo"
-    path = provider._build_auth_file(cookie)
+    headers = provider._build_auth_headers(cookie)
 
-    assert path == "/data/ytmusic_browser_auth.json"
-    headers = json.loads("".join(captured["buffer"]))
+    assert isinstance(headers, dict)
     assert headers["cookie"] == cookie
     assert headers["origin"] == ytm.YTM_DOMAIN
     assert headers["x-origin"] == ytm.YTM_DOMAIN
@@ -133,31 +126,398 @@ def test_build_auth_file_extracts_sapisid_when_present(provider, tmp_path, monke
     assert len(hash_str) == 40  # sha1 hex digest
 
 
-def test_build_auth_file_falls_back_to_secure_3papisid_when_sapisid_missing(
+def test_build_auth_headers_falls_back_to_secure_3papisid_when_sapisid_missing(
     provider, monkeypatch
 ):
-    captured = {}
-
-    class _DummyFile:
-        def __init__(self, *_):
-            captured["buffer"] = []
-
-        def write(self, data):
-            captured["buffer"].append(data)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    monkeypatch.setattr("builtins.open", lambda *a, **kw: _DummyFile())
+    _forbid_open(monkeypatch)
     cookie = "__Secure-3PAPISID=fallbackValue; SID=foo"
-    provider._build_auth_file(cookie)
-    headers = json.loads("".join(captured["buffer"]))
+    headers = provider._build_auth_headers(cookie)
     # The hash uses the extracted SAPISID — we can't see the secret, but we can
     # confirm the same input produces a stable-shape header.
     assert headers["authorization"].startswith("SAPISIDHASH ")
+
+
+def test_build_auth_headers_json_serializable(provider, monkeypatch):
+    """ytmusicapi copies the dict into a CaseInsensitiveDict; keep it plain."""
+    _forbid_open(monkeypatch)
+    headers = provider._build_auth_headers("__Secure-3PAPISID=a; SAPISID=b")
+    assert all(isinstance(k, str) and isinstance(v, str) for k, v in headers.items())
+    json.loads(json.dumps(headers))
+
+
+def test_build_auth_headers_satisfies_ytmusicapi_browser_contract(provider, monkeypatch):
+    """The three keys ytmusicapi actually reads at construction time.
+
+    `determine_auth_type` classifies the session as BROWSER only when an
+    `authorization` header contains "SAPISIDHASH"; `sapisid_from_cookie` needs
+    `__Secure-3PAPISID` in `cookie`; and one of `origin` / `x-origin` is read
+    for the per-request hash. Drop any of them and auth degrades silently.
+    """
+    _forbid_open(monkeypatch)
+    headers = provider._build_auth_headers("__Secure-3PAPISID=a; SAPISID=b")
+    assert "SAPISIDHASH" in headers["authorization"]
+    assert "__Secure-3PAPISID" in headers["cookie"]
+    assert headers.get("origin") or headers.get("x-origin")
+
+
+# ---------------------------------------------------------------------------
+# Multi-instance isolation (issue #40)
+# ---------------------------------------------------------------------------
+
+
+def _make_provider(instance_id):
+    """Build a second provider instance the way the `provider` fixture does."""
+    instance = ytm.YoutubeMusicFreeProvider(mass=None, manifest=None, config=None)
+    instance.instance_id = instance_id
+    instance._ytmusic = None
+    instance._authenticated = False
+    return instance
+
+
+def test_two_instances_build_independent_auth_headers(monkeypatch):
+    """Two accounts must never end up sharing a credentials object."""
+    _forbid_open(monkeypatch)
+    alice = _make_provider("inst_alice")
+    bob = _make_provider("inst_bob")
+
+    alice_cookie = "__Secure-3PAPISID=alice; SAPISID=alice2"
+    bob_cookie = "__Secure-3PAPISID=bob; SAPISID=bob2"
+    alice_headers = alice._build_auth_headers(alice_cookie)
+    bob_headers = bob._build_auth_headers(bob_cookie)
+
+    assert alice_headers is not bob_headers
+    assert alice_headers["cookie"] == alice_cookie
+    assert bob_headers["cookie"] == bob_cookie
+    # Mutating one must not reach the other.
+    alice_headers["cookie"] = "tampered"
+    assert bob_headers["cookie"] == bob_cookie
+
+
+def test_build_auth_headers_defaults_to_account_index_zero(provider, monkeypatch):
+    _forbid_open(monkeypatch)
+    headers = provider._build_auth_headers("__Secure-3PAPISID=a; SAPISID=b")
+    assert headers["x-goog-authuser"] == "0"
+
+
+def test_build_auth_headers_honors_the_account_index(provider, monkeypatch):
+    """A browser signed in to several Google accounts sends one shared cookie.
+
+    X-Goog-AuthUser is the only thing that says which of those accounts a
+    request resolves to, so two instances must be able to differ here.
+    """
+    _forbid_open(monkeypatch)
+    headers = provider._build_auth_headers("__Secure-3PAPISID=a; SAPISID=b", 2)
+    assert headers["x-goog-authuser"] == "2"
+
+
+def test_two_instances_can_target_different_accounts_of_one_cookie(monkeypatch):
+    _forbid_open(monkeypatch)
+    shared_cookie = "__Secure-3PAPISID=shared; SAPISID=shared2"
+    first = _make_provider("inst_first")._build_auth_headers(shared_cookie, 0)
+    second = _make_provider("inst_second")._build_auth_headers(shared_cookie, 1)
+
+    assert first["cookie"] == second["cookie"]  # same browser session
+    assert first["x-goog-authuser"] == "0"
+    assert second["x-goog-authuser"] == "1"
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        (None, 0),
+        (0, 0),
+        (1, 1),
+        ("2", 2),
+        ("", 0),
+        ("not_a_number", 0),
+        (-1, 0),
+    ],
+)
+def test_configured_auth_user_coerces_safely(provider, configured, expected):
+    provider.config = _StubConfig({ytm.CONF_AUTH_USER: configured})
+    assert provider._configured_auth_user() == expected
+
+
+def test_build_auth_headers_returns_a_fresh_dict_each_call(provider, monkeypatch):
+    _forbid_open(monkeypatch)
+    cookie = "__Secure-3PAPISID=a; SAPISID=b"
+    first = provider._build_auth_headers(cookie)
+    second = provider._build_auth_headers(cookie)
+    assert first is not second
+
+
+def test_instance_name_postfix_is_never_none_or_empty():
+    """MA formats this property directly, so None renders as a literal "[None]".
+
+    `Provider.default_name` builds a numeric fallback into a local variable
+    and then interpolates `self.instance_name_postfix` instead, so the
+    fallback never reaches the name. The postfix also lands in library data,
+    since playlist owners fall back to the provider name.
+    """
+    instance = _make_provider("ytmusic_free--abcdef123456")
+    instance.config = _StubConfig({})
+    postfix = instance.instance_name_postfix
+    assert postfix
+    assert postfix is not None
+    assert "None" not in postfix
+
+
+def test_instance_name_postfix_differs_between_instances():
+    first = _make_provider("ytmusic_free--aaaaaaaa1111")
+    second = _make_provider("ytmusic_free--bbbbbbbb2222")
+    first.config = _StubConfig({})
+    second.config = _StubConfig({})
+    assert first.instance_name_postfix != second.instance_name_postfix
+
+
+def test_instance_name_postfix_prefers_the_brand_account():
+    instance = _make_provider("ytmusic_free--abcdef123456")
+    instance.config = _StubConfig({ytm.CONF_BRAND_ACCOUNT: "112233445566"})
+    assert instance.instance_name_postfix == "112233445566"
+
+
+def test_instance_name_postfix_uses_the_account_index_when_set():
+    instance = _make_provider("ytmusic_free--abcdef123456")
+    instance.config = _StubConfig({ytm.CONF_AUTH_USER: 2})
+    assert instance.instance_name_postfix == "account 2"
+
+
+def test_instance_name_postfix_survives_a_missing_config():
+    instance = _make_provider("ytmusic_free--abcdef123456")
+    instance.config = None
+    assert instance.instance_name_postfix
+
+
+def test_library_seen_nonempty_is_not_shared_between_instances():
+    """A class-level `= {}` default here would cross-contaminate accounts."""
+    assert "_library_seen_nonempty" not in vars(ytm.YoutubeMusicFreeProvider)
+
+    alice = _make_provider("inst_alice")
+    bob = _make_provider("inst_bob")
+    alice._record_library_count("tracks", 5)
+
+    assert alice._library_seen_nonempty == {"tracks": True}
+    # Bob's library is genuinely empty; Alice having tracks must not make
+    # Bob look like a partial-auth lapse (issue #10).
+    assert bob._record_library_count("tracks", 0) is False
+
+
+def test_create_ytmusic_client_passes_headers_and_brand_account_through(provider, monkeypatch):
+    """The headers dict reaches YTMusic untouched, alongside the brand account."""
+    captured = {}
+
+    class _FakeYTMusic:
+        def __init__(self, auth=None, user=None):
+            captured["auth"] = auth
+            captured["user"] = user
+
+    fake_module = MagicMock()
+    fake_module.YTMusic = _FakeYTMusic
+    monkeypatch.setattr(ytm.importlib, "import_module", lambda name: fake_module)
+
+    headers = {"cookie": "__Secure-3PAPISID=a", "authorization": "SAPISIDHASH x_y"}
+    provider._create_ytmusic_client(auth=headers, user="brand123")
+
+    assert captured["auth"] == headers
+    assert captured["user"] == "brand123"
+
+
+def test_create_ytmusic_client_anonymous_passes_no_auth(provider, monkeypatch):
+    captured = {}
+
+    class _FakeYTMusic:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            captured["called_with"] = kwargs
+
+    fake_module = MagicMock()
+    fake_module.YTMusic = _FakeYTMusic
+    monkeypatch.setattr(ytm.importlib, "import_module", lambda name: fake_module)
+
+    provider._create_ytmusic_client()
+    assert captured["called_with"] == {}
+
+
+class _StubConfig:
+    """Minimal stand-in for MA's ProviderConfig."""
+
+    def __init__(self, values):
+        self._values = values
+
+    def get_value(self, key):
+        return self._values.get(key)
+
+
+def _setup_instance(monkeypatch, instance_id, values):
+    """Run handle_async_init against stubs and return the provider.
+
+    Package installation and client construction are stubbed out: neither
+    yt-dlp nor ytmusicapi is installed in the test environment.
+    """
+    instance = _make_provider(instance_id)
+    instance.config = _StubConfig(values)
+    _forbid_open(monkeypatch)
+    created = []
+
+    async def _noop():
+        return None
+
+    def _fake_client(auth=None, user=None):
+        created.append({"auth": auth, "user": user})
+        return MagicMock()
+
+    monkeypatch.setattr(instance, "_install_packages", _noop)
+    monkeypatch.setattr(instance, "_purge_legacy_auth_file", _noop)
+    monkeypatch.setattr(instance, "_create_ytmusic_client", _fake_client)
+    asyncio.run(instance.handle_async_init())
+    instance._created_clients = created
+    return instance
+
+
+def test_prefer_quality_false_is_honored(monkeypatch):
+    """A configured False must survive; `or True` used to swallow it."""
+    instance = _setup_instance(
+        monkeypatch, "inst_low", {ytm.CONF_PREFER_AUDIO_QUALITY: False}
+    )
+    assert instance._prefer_quality is False
+
+
+def test_prefer_quality_defaults_to_true_when_unset(monkeypatch):
+    instance = _setup_instance(monkeypatch, "inst_default", {})
+    assert instance._prefer_quality is True
+
+
+def test_two_instances_keep_independent_quality_settings(monkeypatch):
+    """Per-instance config is the point of multi-instance support."""
+    high = _setup_instance(
+        monkeypatch, "inst_high", {ytm.CONF_PREFER_AUDIO_QUALITY: True}
+    )
+    low = _setup_instance(
+        monkeypatch, "inst_low", {ytm.CONF_PREFER_AUDIO_QUALITY: False}
+    )
+    assert high._prefer_quality is True
+    assert low._prefer_quality is False
+
+
+def test_anonymous_instance_builds_client_without_auth(monkeypatch):
+    instance = _setup_instance(
+        monkeypatch, "inst_anon", {ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_NONE}
+    )
+    assert instance._authenticated is False
+    assert instance._created_clients == [{"auth": None, "user": None}]
+
+
+def test_cookie_instance_passes_headers_dict_not_a_path(monkeypatch):
+    """The regression guard for issue #40: no filename ever reaches ytmusicapi."""
+    instance = _setup_instance(
+        monkeypatch,
+        "inst_cookie",
+        {
+            ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_COOKIE,
+            ytm.CONF_COOKIE: "__Secure-3PAPISID=a; SAPISID=b",
+            ytm.CONF_BRAND_ACCOUNT: "brand42",
+        },
+    )
+    call = instance._created_clients[0]
+    assert isinstance(call["auth"], dict)
+    assert call["user"] == "brand42"
+    assert "SAPISIDHASH" in call["auth"]["authorization"]
+    assert instance._authenticated is True
+
+
+def test_two_cookie_instances_do_not_share_credentials(monkeypatch):
+    """Different accounts, different headers, no shared file to overwrite."""
+    alice = _setup_instance(
+        monkeypatch,
+        "inst_alice",
+        {
+            ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_COOKIE,
+            ytm.CONF_COOKIE: "__Secure-3PAPISID=alice; SAPISID=alice2",
+        },
+    )
+    bob = _setup_instance(
+        monkeypatch,
+        "inst_bob",
+        {
+            ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_COOKIE,
+            ytm.CONF_COOKIE: "__Secure-3PAPISID=bob; SAPISID=bob2",
+            ytm.CONF_BRAND_ACCOUNT: "brand_bob",
+        },
+    )
+    alice_auth = alice._created_clients[0]["auth"]
+    bob_auth = bob._created_clients[0]["auth"]
+
+    assert "alice" in alice_auth["cookie"]
+    assert "bob" in bob_auth["cookie"]
+    assert alice_auth["cookie"] != bob_auth["cookie"]
+    assert alice._created_clients[0]["user"] is None
+    assert bob._created_clients[0]["user"] == "brand_bob"
+
+
+def test_configured_account_index_reaches_the_client(monkeypatch):
+    """Two household members sharing one browser need this to differ."""
+    instance = _setup_instance(
+        monkeypatch,
+        "inst_second_user",
+        {
+            ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_COOKIE,
+            ytm.CONF_COOKIE: "__Secure-3PAPISID=a; SAPISID=b",
+            ytm.CONF_AUTH_USER: 1,
+        },
+    )
+    assert instance._created_clients[0]["auth"]["x-goog-authuser"] == "1"
+
+
+def test_cookie_instance_falls_back_to_anonymous_on_bad_cookie(monkeypatch):
+    """An unusable cookie must not take the instance down."""
+    instance = _setup_instance(
+        monkeypatch,
+        "inst_bad",
+        {
+            ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_COOKIE,
+            ytm.CONF_COOKIE: "SID=no_papisid_here",
+        },
+    )
+    assert instance._authenticated is False
+    # Second call is the anonymous retry after _build_auth_headers raised.
+    assert instance._created_clients[-1] == {"auth": None, "user": None}
+
+
+# ---------------------------------------------------------------------------
+# Legacy auth file cleanup (issue #40)
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_auth_file_constant_is_the_old_hardcoded_path():
+    assert ytm.LEGACY_AUTH_FILE == "/data/ytmusic_browser_auth.json"
+
+
+def test_purge_legacy_auth_file_removes_a_leftover_file(provider, tmp_path, monkeypatch):
+    stale = tmp_path / "ytmusic_browser_auth.json"
+    stale.write_text('{"cookie": "secret"}', encoding="utf-8")
+    monkeypatch.setattr(ytm, "LEGACY_AUTH_FILE", str(stale))
+
+    asyncio.run(provider._purge_legacy_auth_file())
+
+    assert not stale.exists()
+
+
+def test_purge_legacy_auth_file_is_a_noop_when_absent(provider, tmp_path, monkeypatch):
+    monkeypatch.setattr(ytm, "LEGACY_AUTH_FILE", str(tmp_path / "not_here.json"))
+    # Must not raise.
+    asyncio.run(provider._purge_legacy_auth_file())
+
+
+def test_purge_legacy_auth_file_survives_an_unremovable_file(provider, monkeypatch):
+    """A read-only or missing /data must never block provider setup."""
+    monkeypatch.setattr(ytm.os.path, "exists", lambda _p: True)
+
+    def _boom(_path):
+        raise PermissionError("read-only file system")
+
+    monkeypatch.setattr(ytm.os, "remove", _boom)
+    # Must not raise.
+    asyncio.run(provider._purge_legacy_auth_file())
 
 
 # ---------------------------------------------------------------------------
@@ -577,11 +937,20 @@ def test_get_config_entries_returns_expected_keys():
         ytm.CONF_AUTH_TYPE,
         ytm.CONF_COOKIE,
         ytm.CONF_BRAND_ACCOUNT,
+        ytm.CONF_AUTH_USER,
         ytm.CONF_PREFER_AUDIO_QUALITY,
     ]
     cookie_entry = next(e for e in entries if e.key == ytm.CONF_COOKIE)
     assert cookie_entry.depends_on == ytm.CONF_AUTH_TYPE
     assert cookie_entry.depends_on_value == [ytm.AUTH_TYPE_COOKIE]
+
+
+def test_auth_user_entry_is_cookie_only_and_defaults_to_zero():
+    entries = asyncio.run(ytm.get_config_entries(mass=None))
+    entry = next(e for e in entries if e.key == ytm.CONF_AUTH_USER)
+    assert entry.default_value == 0
+    assert entry.depends_on == ytm.CONF_AUTH_TYPE
+    assert entry.depends_on_value == [ytm.AUTH_TYPE_COOKIE]
 
 
 # ---------------------------------------------------------------------------
@@ -1517,32 +1886,12 @@ def _attach_capture(provider):
     return handler
 
 
-def _silent_open(monkeypatch):
-    captured = {"buffer": []}
-
-    class _DummyFile:
-        def __init__(self, *_):
-            pass
-
-        def write(self, data):
-            captured["buffer"].append(data)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    monkeypatch.setattr("builtins.open", lambda *a, **kw: _DummyFile())
-    return captured
-
-
-def test_build_auth_file_warns_when_recommended_cookies_missing(provider, monkeypatch):
-    _silent_open(monkeypatch)
+def test_build_auth_headers_warns_when_recommended_cookies_missing(provider, monkeypatch):
+    _forbid_open(monkeypatch)
     handler = _attach_capture(provider)
 
     # Has the hard requirement but none of the recommended session cookies.
-    provider._build_auth_file("__Secure-3PAPISID=onlythis; SAPISID=foo")
+    provider._build_auth_headers("__Secure-3PAPISID=onlythis; SAPISID=foo")
 
     messages = handler.messages()
     assert any("missing recommended" in m for m in messages), messages
@@ -1551,26 +1900,26 @@ def test_build_auth_file_warns_when_recommended_cookies_missing(provider, monkey
     assert "__Secure-3PSID" in joined
 
 
-def test_build_auth_file_no_warning_when_full_cookie_present(provider, monkeypatch):
-    _silent_open(monkeypatch)
+def test_build_auth_headers_no_warning_when_full_cookie_present(provider, monkeypatch):
+    _forbid_open(monkeypatch)
     handler = _attach_capture(provider)
 
     cookie = (
         "__Secure-3PAPISID=a; SAPISID=b; "
         "__Secure-1PSID=c; __Secure-3PSID=d; HSID=e"
     )
-    provider._build_auth_file(cookie)
+    provider._build_auth_headers(cookie)
 
     assert not any("missing recommended" in m for m in handler.messages())
 
 
-def test_build_auth_file_substring_only_does_not_satisfy_recommendation(provider, monkeypatch):
+def test_build_auth_headers_substring_only_does_not_satisfy_recommendation(provider, monkeypatch):
     """A bare mention like '__Secure-1PSID-other=v' must not count as having that cookie."""
-    _silent_open(monkeypatch)
+    _forbid_open(monkeypatch)
     handler = _attach_capture(provider)
     # The cookie names parsed are the bit before '=' — make sure we match exactly.
     cookie = "__Secure-3PAPISID=a; __Secure-1PSID-typo=oops; SAPISID=b"
-    provider._build_auth_file(cookie)
+    provider._build_auth_headers(cookie)
     joined = " ".join(handler.messages())
     assert "__Secure-1PSID" in joined  # listed as missing
 
