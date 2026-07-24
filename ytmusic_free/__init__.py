@@ -318,8 +318,11 @@ async def get_config_entries(
             label="Prefer highest audio quality",
             default_value=True,
             required=False,
-            description="When enabled, selects the best available audio format (m4a/webm). "
-            "Disable to use a more compatible but potentially lower-quality format.",
+            description="When enabled, selects the highest-bitrate audio stream, which on a "
+            "free account is Opus at around 160 kbps. Disable only if a player in your setup "
+            "cannot handle Opus: that restricts playback to AAC, and the sole AAC stream a "
+            "free account is offered is 48 kbps, which is audibly worse. Leave enabled unless "
+            "you have a specific reason not to.",
         ),
     )
 
@@ -1153,11 +1156,19 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 expiration = int(expire_ts) - int(time.time())
 
         audio_ext = stream_format.get("audio_ext") or stream_format.get("ext", "m4a")
+        content_type = ContentType.try_parse(audio_ext)
+        if content_type == ContentType.UNKNOWN:
+            # Music Assistant's ContentType knows codecs but not every container:
+            # it has no WEBM member, so an Opus stream reports as "?" if we hand it
+            # the container. Fall back to the codec, which it does understand. Only
+            # on the unknown path, so m4a keeps reporting as M4A rather than MP4A.
+            if acodec := stream_format.get("acodec"):
+                content_type = ContentType.try_parse(acodec)
         stream_details = StreamDetails(
             provider=self.instance_id,
             item_id=item_id,
             audio_format=AudioFormat(
-                content_type=ContentType.try_parse(audio_ext),
+                content_type=content_type,
             ),
             stream_type=StreamType.HTTP,
             path=url,
@@ -1171,6 +1182,13 @@ class YoutubeMusicFreeProvider(MusicProvider):
         if sample_rate := stream_format.get("asr"):
             with suppress(ValueError, TypeError):
                 stream_details.audio_format.sample_rate = int(sample_rate)
+        # Report the bitrate yt-dlp already told us. Without this the provider
+        # never sets one, ffmpeg cannot recover it from a WebM/Opus stream, and
+        # the UI shows nothing — which is why issue #41 went unnoticed for so
+        # long: the number that would have exposed it was never displayed.
+        if (abr := stream_format.get("abr")) is not None:
+            with suppress(ValueError, TypeError):
+                stream_details.audio_format.bit_rate = int(float(abr))
 
         # Apply the trim window via ffmpeg input args. -ss as an *input* option
         # seeks before decoding (fast & accurate enough for audio); -t bounds the
@@ -1491,9 +1509,13 @@ class YoutubeMusicFreeProvider(MusicProvider):
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
-                # The iOS client doesn't require PO tokens or cookies and
-                # works without a YouTube account — same technique used by
-                # open-source players like SimpMusic / NewPipe.
+                # Deliberately no "player_client" pin. It is tempting to name the
+                # clients that work without an account, but no single list is valid
+                # across the yt-dlp range the manifest allows: android_vr does not
+                # exist in 2024.01, and android_music was removed by 2026.07, where
+                # the remaining android/ios clients are GVS PO-token gated and yield
+                # no usable anonymous formats at all. yt-dlp's own defaults track
+                # that moving target for us, so let them. See PR #44.
                 "extractor_args": {
                     "youtube": {
                         "skip": ["translated_subs", "dash"]
@@ -1509,8 +1531,18 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 if not info or "formats" not in info:
                     raise UnplayableMediaError(f"No formats found for {video_id}")
 
-                # Build format selector: prefer m4a for best quality, fallback to any audio
-                fmt_selector_str = "bestaudio/best" if prefer_quality else "worstaudio/worst"
+                # Rank by bitrate, never by container. A bare container name like
+                # "m4a" outranks bitrate in a yt-dlp selector, and on a free account
+                # the only m4a is itag 139 at 48 kbps, so "m4a/bestaudio/best" picked
+                # 48 kbps over the 160 kbps Opus sitting next to it. That was issue
+                # #41. The compatibility branch still asks for m4a, but as a filter on
+                # bestaudio rather than ahead of it, so it takes the best AAC stream
+                # available instead of the worst audio of any kind.
+                fmt_selector_str = (
+                    "bestaudio/best"
+                    if prefer_quality
+                    else "bestaudio[ext=m4a]/bestaudio/best"
+                )
                 try:
                     format_selector = ydl.build_format_selector(fmt_selector_str)
                     stream_format = next(

@@ -322,6 +322,7 @@ These are installed automatically by the provider on first run via MA's `install
 
 Built and maintained by [@sproft](https://github.com/sproft), with features and fixes contributed by the community:
 
+- **[@mawoka-myblock](https://github.com/mawoka-myblock):** noticing that every track was streaming at 48 kbps and fixing the format selector to rank audio by bitrate rather than by container, which also restored audio-only extraction on current yt-dlp ([#44](https://github.com/sproft/music-assistant-ytmusic/pull/44)).
 - **[@jojo141185](https://github.com/jojo141185):** automated Docker image builds published to GHCR, so standalone Docker and Compose users can run Music Assistant with the provider baked in ([#33](https://github.com/sproft/music-assistant-ytmusic/pull/33)).
 - **[@bygadd](https://github.com/bygadd):** opt-in auto-update for the MA Provider Watcher add-on, keeping the provider current from GitHub without a manual reinstall ([#32](https://github.com/sproft/music-assistant-ytmusic/pull/32)).
 - **[@gusjengis](https://github.com/gusjengis):** resolving a pasted YouTube or YTM link directly from the search box, plus the `@start-end` video trimming feature ([#29](https://github.com/sproft/music-assistant-ytmusic/pull/29)).
