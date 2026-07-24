@@ -1496,8 +1496,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 # open-source players like SimpMusic / NewPipe.
                 "extractor_args": {
                     "youtube": {
-                        "skip": ["translated_subs", "dash"],
-                        "player_client": ["android_music", "android", "ios"],
+                        "skip": ["translated_subs", "dash"]
                     },
                 },
             }
@@ -1511,7 +1510,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     raise UnplayableMediaError(f"No formats found for {video_id}")
 
                 # Build format selector: prefer m4a for best quality, fallback to any audio
-                fmt_selector_str = "m4a/bestaudio/best" if prefer_quality else "worstaudio/worst"
+                fmt_selector_str = "bestaudio/best" if prefer_quality else "worstaudio/worst"
                 try:
                     format_selector = ydl.build_format_selector(fmt_selector_str)
                     stream_format = next(
