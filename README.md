@@ -7,9 +7,9 @@ A custom Music Assistant provider that streams YouTube Music **without a premium
 | Component | Role |
 |-----------|------|
 | `ytmusicapi` | Search, metadata, and library sync (optional auth) |
-| `yt-dlp` (android_music client) | Extract direct audio stream URLs and playlist tracks |
+| `yt-dlp` | Extract direct audio stream URLs and playlist tracks |
 
-YouTube's Android Music client API does not require a PO token or login session, so audio streams can be resolved for free-tier content. This is the same method used by NewPipe and SimpMusic on Android.
+Audio stream URLs are resolved without a login. Which of YouTube's internal clients does that resolving is left to yt-dlp's own defaults rather than pinned here, because the client that works anonymously keeps moving: the Android Music client this provider originally named has since been removed from yt-dlp entirely, and the Android and iOS clients now require a PO token, which an anonymous session cannot supply. yt-dlp tracks that target for us. This is the same general approach used by NewPipe and SimpMusic on Android.
 
 For playlists, `yt-dlp` is used as a fallback when `ytmusicapi` cannot parse the unauthenticated playlist response from YouTube, ensuring playlists work without a login.
 
