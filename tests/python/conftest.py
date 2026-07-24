@@ -75,19 +75,30 @@ def _install_music_assistant_models() -> None:
         UNKNOWN = "unknown"
 
     class _ContentType(str, Enum):
+        # Mirrors music_assistant_models.enums.ContentType. Keep it faithful:
+        # there is deliberately no WEBM member, because upstream has none, and
+        # UNKNOWN is "?" not "unknown". An earlier stub invented ContentType.WEBM,
+        # which made the suite pass while real Music Assistant reported every Opus
+        # stream as "?". A test double that is kinder than reality tests nothing.
         M4A = "m4a"
+        MP4 = "mp4"
+        MP4A = "mp4a"
+        AAC = "aac"
         MP3 = "mp3"
-        WEBM = "webm"
         OGG = "ogg"
         OPUS = "opus"
-        UNKNOWN = "unknown"
+        VORBIS = "vorbis"
+        FLAC = "flac"
+        UNKNOWN = "?"
 
         @classmethod
         def try_parse(cls, value: str) -> "_ContentType":
             if not value:
                 return cls.UNKNOWN
+            # Upstream strips codec profile suffixes, so "mp4a.40.2" -> MP4A.
+            candidate = str(value).lower().split(".")[0].split(";")[0].strip()
             try:
-                return cls(value.lower())
+                return cls(candidate)
             except ValueError:
                 return cls.UNKNOWN
 
@@ -216,8 +227,10 @@ def _install_music_assistant_models() -> None:
     @dataclass
     class _AudioFormat:
         content_type: object | None = None
+        codec_type: object | None = None
         channels: int | None = None
         sample_rate: int | None = None
+        bit_rate: int | None = None
 
     @dataclass
     class _MetaData:
