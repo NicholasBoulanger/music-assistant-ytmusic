@@ -350,11 +350,11 @@ async def get_config_entries(
             label="Prefer highest audio quality",
             default_value=True,
             required=False,
-            description="When enabled, selects the highest-bitrate audio stream, which on a "
-            "free account is Opus at around 160 kbps. Disable only if a player in your setup "
-            "cannot handle Opus: that restricts playback to AAC, and the sole AAC stream a "
-            "free account is offered is 48 kbps, which is audibly worse. Leave enabled unless "
-            "you have a specific reason not to.",
+            description="When enabled, selects the highest-bitrate audio stream available, "
+            "which is usually Opus at roughly 130 to 160 kbps. Disable only if a player in "
+            "your setup cannot handle Opus: that restricts playback to AAC, normally around "
+            "128 kbps, though some accounts and regions are offered nothing better than a "
+            "48 kbps AAC stream. Leave enabled unless you have a specific reason not to.",
         ),
     )
 

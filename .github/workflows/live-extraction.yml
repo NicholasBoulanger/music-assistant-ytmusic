@@ -10,9 +10,15 @@ name: live-extraction
 # reason.
 #
 # Deliberately NOT run on pull requests. GitHub runner IPs are frequently
-# rate-limited or bot-blocked by YouTube, so a red run here is a prompt to go
-# look, not a verdict on someone's diff. Keeping it off PRs is what stops that
-# noise from training everyone to ignore a failing check.
+# rate-limited or bot-blocked by YouTube, and that noise would gate unrelated
+# diffs and train everyone to ignore a failing check.
+#
+# The scheduled run does fail loudly, though. A canary that always concludes
+# green sends no notification, and its step summary is only seen by someone who
+# already went looking, which defeats the point of having one. Because it never
+# runs on a pull request, a red run here blocks nothing. To keep the signal
+# trustworthy the check is retried once before the job gives up, which absorbs
+# the transient blocks without hiding a real breakage.
 
 on:
   schedule:
@@ -45,12 +51,26 @@ jobs:
 
       - name: Resolve a real stream anonymously
         id: live
-        # Never fails the workflow. A failure here is a signal to investigate,
-        # and the summary below says which it was.
+        # continue-on-error lets the summary step below run and describe what
+        # happened. The final step then fails the job, so the run goes red and
+        # GitHub actually notifies someone.
         continue-on-error: true
         run: |
           set -o pipefail
-          python -m pytest tests/python -m live -v 2>&1 | tee live.log
+          for attempt in 1 2; do
+            echo "::group::attempt $attempt"
+            if python -m pytest tests/python -m live -v 2>&1 | tee live.log; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            if [ "$attempt" -eq 1 ]; then
+              echo "Attempt 1 failed. Retrying in 60s, in case this runner's IP"
+              echo "is transiently rate-limited or bot-blocked by YouTube."
+              sleep 60
+            fi
+          done
+          exit 1
 
       - name: Summarise the outcome
         run: |
@@ -68,9 +88,11 @@ jobs:
               echo "- the YouTube extractor is broken in the installed yt-dlp release"
               echo "- this runner's IP is rate-limited or bot-blocked by YouTube"
               echo
-              echo "Re-run the job first: a blocked runner IP is the most common cause"
-              echo "and is not a problem with the provider. If it fails repeatedly,"
-              echo "check yt-dlp's issue tracker before changing anything here."
+              echo "This already retried once, so a one-off block has been ruled out."
+              echo "A blocked runner IP remains the most likely cause and says nothing"
+              echo "about the provider, so re-run the job before changing any code. If it"
+              echo "keeps failing, check yt-dlp's issue tracker next, and only then treat"
+              echo "it as a provider problem."
               echo
               echo '<details><summary>pytest output</summary>'
               echo
@@ -81,3 +103,11 @@ jobs:
               echo '</details>'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail the run if extraction is broken
+        # The whole point of the canary. Without this the job concludes green,
+        # GitHub sends nothing, and the summary above is read by nobody.
+        if: steps.live.outcome == 'failure'
+        run: |
+          echo "::error title=Anonymous extraction failed::yt-dlp could not resolve an audio stream for any known video, after a retry. See the job summary for what to check."
+          exit 1

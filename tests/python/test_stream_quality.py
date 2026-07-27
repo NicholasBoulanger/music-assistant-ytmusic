@@ -44,9 +44,12 @@ def _audio(itag: int, ext: str, acodec: str, abr: float) -> dict:
     }
 
 
-# What an anonymous/free account is actually offered: itag 141 (256 kbps m4a)
-# is premium-only and absent, so 139 is the *only* m4a and it is the worst
-# stream in the list. This table is the whole point of issue #41.
+# The worst case an anonymous account can be served, taken from the format
+# table reported in issue #41: itag 141 (256 kbps m4a) is premium-only and
+# absent, and 140 (128 kbps m4a) was not offered either, so 139 is the *only*
+# m4a and it is the worst stream in the list. Many accounts do get 140, which
+# is why compatibility mode is usually fine in practice, but a regression test
+# should encode the case where the container preference did maximum damage.
 FREE_ACCOUNT_FORMATS = [
     _audio(139, "m4a", "mp4a.40.5", 48),
     _audio(249, "webm", "opus", 50),

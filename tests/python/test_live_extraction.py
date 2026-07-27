@@ -32,9 +32,10 @@ pytestmark = pytest.mark.live
 # "anonymous extraction is broken".
 KNOWN_VIDEO_IDS = ("dQw4w9WgXcQ", "kJQP7kiw5Fk", "9bZkp7q19f0")
 
-# The regression from issue #41 was a 48 kbps stream. A free account is offered
-# Opus at ~160 kbps. Anything at or above this is unambiguously not the bad
-# stream, with room for YouTube to change its tiers.
+# The regression from issue #41 was a 48 kbps stream. Anonymous playback is
+# normally offered Opus somewhere around 130 to 160 kbps, varying by video,
+# region and account. Anything at or above this floor is unambiguously clear of
+# the bad stream, with room left for YouTube to shift its tiers.
 MIN_ACCEPTABLE_BITRATE = 96
 
 
