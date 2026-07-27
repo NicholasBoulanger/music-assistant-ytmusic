@@ -1,0 +1,83 @@
+name: live-extraction
+
+# Early warning that anonymous YouTube extraction still works.
+#
+# Since PR #44 the provider pins no player_client and inherits yt-dlp's
+# defaults, so what users actually get can change without a commit in this
+# repo. Nothing in the offline suite can see that: every other test feeds
+# synthetic format tables to the selector and stays green regardless of what
+# YouTube is really serving. Issue #41 went unnoticed for months for that
+# reason.
+#
+# Deliberately NOT run on pull requests. GitHub runner IPs are frequently
+# rate-limited or bot-blocked by YouTube, so a red run here is a prompt to go
+# look, not a verdict on someone's diff. Keeping it off PRs is what stops that
+# noise from training everyone to ignore a failing check.
+
+on:
+  schedule:
+    # 05:17 UTC daily. Off the hour on purpose: scheduled jobs at :00 queue
+    # behind everyone else's cron and get delayed.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install test dependencies
+        run: pip install -r tests/python/requirements.txt
+
+      - name: Record the yt-dlp version under test
+        run: |
+          python -m yt_dlp --version | sed 's/^/yt-dlp /' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve a real stream anonymously
+        id: live
+        # Never fails the workflow. A failure here is a signal to investigate,
+        # and the summary below says which it was.
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python -m pytest tests/python -m live -v 2>&1 | tee live.log
+
+      - name: Summarise the outcome
+        run: |
+          {
+            if [ "${{ steps.live.outcome }}" = "success" ]; then
+              echo "## Anonymous extraction is working"
+              echo
+              echo "yt-dlp resolved an audio-only stream above the bitrate floor."
+            else
+              echo "## Anonymous extraction FAILED"
+              echo
+              echo "This usually means one of:"
+              echo
+              echo "- yt-dlp's default clients now require a PO token for anonymous playback"
+              echo "- the YouTube extractor is broken in the installed yt-dlp release"
+              echo "- this runner's IP is rate-limited or bot-blocked by YouTube"
+              echo
+              echo "Re-run the job first: a blocked runner IP is the most common cause"
+              echo "and is not a problem with the provider. If it fails repeatedly,"
+              echo "check yt-dlp's issue tracker before changing anything here."
+              echo
+              echo '<details><summary>pytest output</summary>'
+              echo
+              echo '```'
+              tail -n 60 live.log || echo "no output captured"
+              echo '```'
+              echo
+              echo '</details>'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

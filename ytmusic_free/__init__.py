@@ -245,6 +245,38 @@ def _format_trim_label(start: int | None, end: int | None) -> str:
     return f"{start_str}\u2013{end_str}"
 
 
+def _rank_audio_format(fmt: dict[str, Any], prefer_quality: bool) -> tuple[float, float]:
+    """Sort key for audio-only yt-dlp formats. Higher is better.
+
+    Mirrors the yt-dlp selector used in ``_get_stream_format`` so the manual
+    fallback and the selector cannot disagree about what "best" means:
+
+    * quality mode ranks purely on bitrate, matching ``bestaudio``
+    * compatibility mode puts AAC ahead of everything else and only then
+      ranks on bitrate, matching ``bestaudio[ext=m4a]/bestaudio``
+
+    Bitrate comes from ``abr`` and falls back to ``tbr``; for an audio-only
+    format the two are equivalent, and a missing value sorts last rather than
+    raising. Anything unparseable is treated as 0 for the same reason.
+    """
+    raw_bitrate = fmt.get("abr")
+    if raw_bitrate is None:
+        raw_bitrate = fmt.get("tbr")
+    try:
+        bitrate = float(raw_bitrate)
+    except (TypeError, ValueError):
+        bitrate = 0.0
+
+    if prefer_quality:
+        return (0.0, bitrate)
+
+    # ``ext`` alone is not enough: a format can be AAC in an mp4 container, so
+    # check the codec too. yt-dlp spells AAC as "mp4a.40.x".
+    acodec = str(fmt.get("acodec") or "").lower()
+    is_aac = fmt.get("ext") == "m4a" or acodec.startswith(("mp4a", "aac"))
+    return (1.0 if is_aac else 0.0, bitrate)
+
+
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ProviderInstanceType:
@@ -1553,15 +1585,49 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     stream_format = None
 
                 if not stream_format:
-                    # Last resort: pick first audio-only format
+                    # Last resort: the selector produced nothing, so rank the
+                    # audio-only formats ourselves. The previous code took
+                    # audio_formats[-1] and relied on yt-dlp listing formats
+                    # worst-to-best. That ordering is a convention, not a
+                    # contract, and trusting an implicit ordering instead of the
+                    # bitrate is the same mistake that produced issue #41 in the
+                    # selector. Rank explicitly, mirroring the selector above so
+                    # both paths agree on what "best" means.
                     audio_formats = [
                         f for f in info["formats"] if f.get("vcodec") == "none"
                     ]
-                    stream_format = audio_formats[-1] if audio_formats else info["formats"][-1]
+                    if audio_formats:
+                        stream_format = max(
+                            audio_formats,
+                            key=lambda fmt: _rank_audio_format(fmt, prefer_quality),
+                        )
+                    else:
+                        # No audio-only format at all. Anything here is a video
+                        # format and a poor stream, but it is still better than
+                        # failing outright, which is what the original code did.
+                        stream_format = info["formats"][-1]
 
                 return stream_format
 
         return await asyncio.to_thread(_extract)
+
+    def _catalog_audio_format(self) -> AudioFormat:
+        """Format a catalog entry advertises before any stream is resolved.
+
+        This is necessarily nominal: the real container is only known once
+        ``_get_stream_format`` has run. It still has to be broadly right,
+        because Music Assistant surfaces it in the UI and uses it to order
+        providers when the same track resolves through more than one.
+
+        Every mapping used to claim M4A. Since the issue #41 fix the quality
+        branch selects ``bestaudio``, which on a free account is Opus, so the
+        advertised format contradicted every stream the provider actually
+        handed back. Follow the configured preference instead: Opus when
+        ranking by bitrate, M4A when the compatibility toggle pins us to AAC.
+        """
+        return AudioFormat(
+            content_type=ContentType.OPUS if self._prefer_quality else ContentType.M4A,
+        )
 
     def _minimal_track(self, track_id: str) -> Track:
         """Return a bare-minimum Track so playback can still proceed.
@@ -1581,7 +1647,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
                     url=f"{YTM_DOMAIN}/watch?v={video_id}",
-                    audio_format=AudioFormat(content_type=ContentType.M4A),
+                    audio_format=self._catalog_audio_format(),
                 )
             },
             artists=[
@@ -1613,7 +1679,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     provider_instance=self.instance_id,
                     available=track_obj.get("isAvailable", True),
                     url=f"{YTM_DOMAIN}/watch?v={track_id}",
-                    audio_format=AudioFormat(content_type=ContentType.M4A),
+                    audio_format=self._catalog_audio_format(),
                 )
             },
             disc_number=0,

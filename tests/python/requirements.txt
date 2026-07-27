@@ -1,4 +1,6 @@
 pytest>=8.0
 # Needed by test_stream_quality.py, which evaluates the real yt-dlp format
 # selector against synthetic format tables. No network access is involved.
-yt-dlp>=2024.1.0
+# Kept in step with the floor in ytmusic_free/manifest.json so CI exercises a
+# version the provider actually claims to support.
+yt-dlp>=2025.1.12

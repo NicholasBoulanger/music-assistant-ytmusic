@@ -75,6 +75,33 @@ jobs:
       - name: Run provider unit tests
         run: python -m pytest tests/python -v
 
+  models-contract:
+    # The unit suite above replaces music_assistant_models with hand-written
+    # stubs, so it can only ever be as correct as those stubs are. This job
+    # installs the real package and checks the upstream facts the provider
+    # depends on (tests/ma_contract.py). It is the half of that contract the
+    # stubbed suite structurally cannot verify.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install the real music_assistant_models
+        run: |
+          pip install pytest music_assistant_models
+          pip show music_assistant_models | head -2
+
+      - name: Run model contract tests
+        # MA_MODELS_REQUIRED turns a missing package from a skip into a
+        # failure, so a broken install cannot pass as a green all-skipped run.
+        env:
+          MA_MODELS_REQUIRED: "1"
+        run: python -m pytest tests/python_integration -v
+
   docker-lint-and-test:
     runs-on: ubuntu-latest
     timeout-minutes: 20

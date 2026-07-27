@@ -922,7 +922,63 @@ def test_minimal_track_returns_playable_stub(provider):
     assert track.artists[0].name == "Unknown Artist"
     mapping = next(iter(track.provider_mappings))
     assert mapping.url == f"{ytm.YTM_DOMAIN}/watch?v=vid42"
-    assert mapping.audio_format.content_type == ContentType.M4A
+    # The fixture leaves the quality toggle on, so the advertised format has to
+    # match what bestaudio actually yields on a free account: Opus, not M4A.
+    assert mapping.audio_format.content_type == ContentType.OPUS
+
+
+# ---------------------------------------------------------------------------
+# Advertised catalog format (must not contradict the resolved stream)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("prefer_quality", "expected"),
+    [(True, ContentType.OPUS), (False, ContentType.M4A)],
+)
+def test_catalog_audio_format_follows_the_quality_toggle(provider, prefer_quality, expected):
+    """The mapping has to advertise whatever the selector will actually pick.
+
+    Quality mode asks for ``bestaudio`` and gets Opus on a free account;
+    compatibility mode filters to ``[ext=m4a]`` and gets AAC. Hardcoding M4A
+    made every quality-mode mapping disagree with its own stream.
+    """
+    provider._prefer_quality = prefer_quality
+    assert provider._catalog_audio_format().content_type == expected
+
+
+@pytest.mark.parametrize("prefer_quality", [True, False])
+def test_parsed_and_minimal_tracks_agree_on_advertised_format(provider, prefer_quality):
+    """Both track builders must advertise the same thing, not drift apart."""
+    provider._prefer_quality = prefer_quality
+    parsed = provider._parse_track(
+        {"videoId": "vid42", "title": "Song", "artists": [{"id": "a1", "name": "A"}]}
+    )
+    minimal = provider._minimal_track("vid42")
+    expected = provider._catalog_audio_format().content_type
+    assert next(iter(parsed.provider_mappings)).audio_format.content_type == expected
+    assert next(iter(minimal.provider_mappings)).audio_format.content_type == expected
+
+
+def test_advertised_format_matches_the_resolved_stream(provider):
+    """Close the loop: the advertisement and the real stream must not diverge.
+
+    This is the regression the hardcoded M4A represented. It asserts against
+    the actual stream resolution rather than restating the constant, so a
+    future change to either side that breaks the agreement fails here.
+    """
+    import test_stream_quality as tsq
+
+    for prefer_quality in (True, False):
+        module, _ = tsq._stub_yt_dlp_module(tsq.FREE_ACCOUNT_FORMATS)
+        provider._yt_dlp_module = module
+        provider._prefer_quality = prefer_quality
+        details = asyncio.run(provider.get_stream_details("vid42", MediaType.TRACK))
+        advertised = provider._catalog_audio_format().content_type
+        assert advertised == details.audio_format.content_type, (
+            f"catalog advertises {advertised} but the stream resolves as "
+            f"{details.audio_format.content_type} (prefer_quality={prefer_quality})"
+        )
 
 
 # ---------------------------------------------------------------------------
