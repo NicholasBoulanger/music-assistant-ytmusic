@@ -8,7 +8,7 @@
   "documentation": "https://github.com/sproft/music-assistant-ytmusic/blob/main/README.md",
   "requirements": [
     "ytmusicapi>=1.7.0",
-    "yt-dlp[default]>=2024.1.0"
+    "yt-dlp[default]>=2025.1.12"
   ],
   "multi_instance": true
 }
