@@ -111,3 +111,31 @@ def test_compatibility_mode_still_resolves_something_playable(provider):
     video_id, fmt = _resolve_first_available(provider, prefer_quality=False)
     assert fmt.get("url", "").startswith("http"), f"{video_id}: no usable stream url"
     assert fmt.get("vcodec") == "none", f"{video_id}: compatibility mode picked video"
+
+
+def test_radio_playlist_still_resolves_tracks(provider):
+    """Issue #47: auto-generated mixes resolve through the watch endpoint.
+
+    Song radio is the only member of that family reachable without an account,
+    so it stands in for "My Supermix" here. Before the fix this returned zero
+    tracks, because ``playlist?list=RD...`` is answered with "This playlist
+    type is unviewable" and the failure was discarded silently.
+
+    Only the offline routing is unit-tested. Whether YouTube still answers the
+    watch endpoint anonymously is exactly the kind of thing that changes under
+    us without a commit here, which is what this suite is for.
+    """
+    ytmusicapi = pytest.importorskip("ytmusicapi", reason="needed to reach the radio endpoint")
+    provider._ytmusic = ytmusicapi.YTMusic()
+
+    tracks = asyncio.run(provider.get_playlist_tracks("RDdQw4w9WgXcQ"))
+
+    assert tracks, (
+        "song radio resolved to no tracks. Either the watch endpoint stopped "
+        "answering anonymously, or a radio id is being requested as a plain "
+        "playlist again (issue #47)."
+    )
+    assert all(t.item_id for t in tracks)
+    # Durations come from a clock string that needs reshaping; without it every
+    # track renders as 0:00 in Music Assistant.
+    assert any(t.duration for t in tracks), "no track carried a duration"
