@@ -1631,7 +1631,11 @@ def test_get_playlist_tracks_uses_ytdlp_when_ytmusicapi_is_partial(provider):
     )
     provider._ytmusic = mock
 
-    async def _fallback(_playlist_id):
+    seen = {}
+
+    async def _fallback(playlist_id, seed_video_id=None):
+        seen["playlist_id"] = playlist_id
+        seen["seed"] = seed_video_id
         return [
             provider._minimal_track(track_id)
             for track_id in ("ytm_1", "ytm_2", "dlp_3")
@@ -1643,6 +1647,10 @@ def test_get_playlist_tracks_uses_ytdlp_when_ytmusicapi_is_partial(provider):
 
     assert [track.item_id for track in tracks] == ["ytm_1", "ytm_2", "dlp_3"]
     assert [track.name for track in tracks] == ["First", "Second", "dlp_3"]
+    # The fallback is handed the first already-parsed track as a seed, which is
+    # the only thing that makes a radio id openable at all (issue #47).
+    assert seen["playlist_id"] == "PLpartial"
+    assert seen["seed"] == "ytm_1"
 
 
 def test_get_playlist_tracks_keeps_ytmusicapi_when_complete(provider):

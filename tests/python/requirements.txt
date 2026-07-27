@@ -4,3 +4,6 @@ pytest>=8.0
 # Kept in step with the floor in ytmusic_free/manifest.json so CI exercises a
 # version the provider actually claims to support.
 yt-dlp>=2025.1.12
+# Only the live suite needs this, to reach the radio/watch endpoint that serves
+# auto-generated mixes. The offline tests stub the client out entirely.
+ytmusicapi>=1.7.0

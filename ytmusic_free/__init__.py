@@ -70,6 +70,9 @@ if TYPE_CHECKING:
 YTM_DOMAIN = "https://music.youtube.com"
 VARIOUS_ARTISTS_YTM_ID = "UCUTXlgdcKU5vfzFqHOWIvkA"
 DEFAULT_STREAM_URL_EXPIRATION = 3600  # 1 hour
+# Auto-generated mixes are effectively endless, so a full fetch has no natural
+# stopping point. Ask for a queue's worth and let MA request more if it needs to.
+RADIO_PLAYLIST_LIMIT = 100
 
 # Features that work without a YTM account
 BASE_FEATURES = {
@@ -137,6 +140,19 @@ _YT_HOST_TOKEN = re.compile(r"(?:^|[^\w.])(?:music\.|m\.|www\.)?youtube\.com(?:[
 _YT_SHORT_TOKEN = re.compile(r"(?:^|[^\w.])youtu\.be[/\s]+([\w-]{11})", re.I)
 _YT_VIDEO_ID = re.compile(r"[?&\s]v=([\w-]{11})", re.I)
 _YT_LIST_ID = re.compile(r"[?&\s]list=([\w-]{10,})", re.I)
+
+# YouTube Music's auto-generated mixes ("My Supermix" RDTMAK5uy_..., "Discover
+# Mix" RDCLAK5uy_..., song radio RD<videoId>) are radio endpoints rather than
+# stored playlists, and nothing that works for a normal playlist works on them:
+# youtube.com/playlist?list=RD... answers "This playlist type is unviewable",
+# and ytmusicapi's get_playlist raises a KeyError parsing the response. They
+# have to be requested through a watch URL or via get_watch_playlist. Issue #47.
+_YT_RADIO_PREFIX = "RD"
+# Song radio embeds its seed video id ("RD<videoId>", "RDAMVM<videoId>"); the
+# curated mixes do not, so they need a seed supplied from elsewhere. The
+# trailing {11} anchor is what tells the two apart: RDTMAK5uy_kset8Dis... is far
+# longer than a video id, so it correctly fails to match.
+_YT_RADIO_SEED_RE = re.compile(r"^RD(?:AMVM)?([\w-]{11})$")
 
 # Trim spec: an optional "@start-end" suffix a user appends to a pasted link to
 # play only part of a video (e.g. to skip an intro or an unrelated end-card).
@@ -243,6 +259,46 @@ def _format_trim_label(start: int | None, end: int | None) -> str:
     start_str = _fmt(start) if start is not None else ""
     end_str = _fmt(end) if end is not None else ""
     return f"{start_str}\u2013{end_str}"
+
+
+def _strip_browse_prefix(playlist_id: str) -> str:
+    """Drop ytmusicapi's "VL" browse prefix (e.g. "VLPLxxx" -> "PLxxx")."""
+    return playlist_id[2:] if playlist_id.startswith("VL") else playlist_id
+
+
+def _is_radio_playlist_id(playlist_id: str) -> bool:
+    """Is this one of YouTube Music's auto-generated mixes or a song radio?"""
+    return _strip_browse_prefix(playlist_id).startswith(_YT_RADIO_PREFIX)
+
+
+def _radio_seed_video_id(playlist_id: str) -> str | None:
+    """Return the video id a song-radio id is built from, when it carries one.
+
+    Curated mixes (``RDTMAK5uy_...``, ``RDCLAK5uy_...``) carry no seed and
+    return None; a caller that needs one has to take it from the mix's first
+    track instead.
+    """
+    match = _YT_RADIO_SEED_RE.match(_strip_browse_prefix(playlist_id))
+    return match.group(1) if match else None
+
+
+def _normalize_watch_track(track_obj: dict[str, Any]) -> dict[str, Any]:
+    """Reshape a watch/radio track into the shape ``_parse_track`` expects.
+
+    ``get_watch_playlist`` spells duration as a clock string under ``length``
+    and puts artwork under ``thumbnail`` (singular). ``_parse_track`` only
+    understands a numeric ``duration``/``duration_seconds`` and a
+    ``thumbnails`` list, so without this every mix track renders with no
+    duration and no artwork.
+    """
+    normalized = dict(track_obj)
+    if "duration" not in normalized and "duration_seconds" not in normalized:
+        seconds = _parse_timestamp(str(normalized.get("length") or ""))
+        if seconds:
+            normalized["duration"] = seconds
+    if not normalized.get("thumbnails") and (thumb := normalized.get("thumbnail")):
+        normalized["thumbnails"] = thumb if isinstance(thumb, list) else [thumb]
+    return normalized
 
 
 def _rank_audio_format(fmt: dict[str, Any], prefer_quality: bool) -> tuple[float, float]:
@@ -961,17 +1017,64 @@ class YoutubeMusicFreeProvider(MusicProvider):
             return self._parse_playlist(playlist_obj)
         except MediaNotFoundError:
             raise
-        except Exception:
+        except Exception as err:  # noqa: BLE001 - degrade to the yt-dlp fallback
             # ytmusicapi requires auth for some playlist types — fall back to yt-dlp
             self.logger.debug(
-                "ytmusicapi get_playlist failed for %s, using yt-dlp fallback", prov_playlist_id
+                "ytmusicapi get_playlist failed for %s (%s: %s), using yt-dlp fallback",
+                prov_playlist_id,
+                type(err).__name__,
+                err,
             )
             return await self._get_playlist_via_ytdlp(prov_playlist_id)
+
+    async def _get_radio_playlist_tracks(self, playlist_id: str) -> list[Track]:
+        """Return the tracks of an auto-generated mix or song radio.
+
+        These ids only answer on the watch/radio endpoint, which is what
+        YouTube Music itself uses for them. ``get_playlist`` raises a KeyError
+        on the response shape, and the yt-dlp fallback behind it cannot open
+        them either, so before this existed a mix resolved to zero tracks and
+        playback simply had nothing to start (issue #47).
+        """
+        bare_id = _strip_browse_prefix(playlist_id)
+        try:
+            watch_playlist = await asyncio.to_thread(
+                self._ytmusic.get_watch_playlist,
+                playlistId=bare_id,
+                limit=RADIO_PLAYLIST_LIMIT,
+            )
+        except Exception as err:  # noqa: BLE001 - any failure means "no tracks"
+            self.logger.warning(
+                "get_watch_playlist failed for mix %s: %s", playlist_id, err
+            )
+            return []
+
+        tracks_raw = (watch_playlist or {}).get("tracks") or []
+        result = []
+        for index, track_obj in enumerate(tracks_raw, 1):
+            with suppress(InvalidDataError, KeyError, TypeError):
+                track = self._parse_track(_normalize_watch_track(track_obj))
+                if track:
+                    track.position = index
+                    result.append(track)
+        if not result:
+            self.logger.warning(
+                "mix %s returned no usable tracks (%d raw entries)",
+                playlist_id,
+                len(tracks_raw),
+            )
+        return result
 
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """Return playlist tracks for the given playlist id."""
         if page > 0:
             return []
+        if _is_radio_playlist_id(prov_playlist_id):
+            # Try the radio endpoint first. Falling through on an empty result
+            # keeps the old behaviour available for anything RD-prefixed that
+            # turns out to be readable as an ordinary playlist.
+            if radio_tracks := await self._get_radio_playlist_tracks(prov_playlist_id):
+                return radio_tracks
         try:
             playlist_obj = await asyncio.to_thread(
                 self._ytmusic.get_playlist, prov_playlist_id, limit=None
@@ -992,17 +1095,28 @@ class YoutubeMusicFreeProvider(MusicProvider):
             if not tracks_raw or (
                 expected_count is not None and len(tracks_raw) < expected_count
             ):
-                ytdlp_result = await self._get_playlist_tracks_via_ytdlp(prov_playlist_id)
+                # A radio id cannot be opened without a seed video. When we
+                # already parsed a track, hand its id over so the fallback has
+                # a usable URL instead of a guaranteed failure.
+                seed = _split_track_id(result[0].item_id)[0] if result else None
+                ytdlp_result = await self._get_playlist_tracks_via_ytdlp(
+                    prov_playlist_id, seed
+                )
                 if len(ytdlp_result) > len(result):
                     return self._merge_playlist_track_results(result, ytdlp_result)
             return result
         except (MediaNotFoundError, UnplayableMediaError):
             raise
-        except Exception:
-            # ytmusicapi requires auth for some playlist types — fall back to yt-dlp
+        except Exception as err:  # noqa: BLE001 - degrade to the yt-dlp fallback
+            # ytmusicapi requires auth for some playlist types, and raises a
+            # KeyError outright on radio ids, so a fallback here is expected.
+            # Include the error: without it this line cannot tell an
+            # auth problem apart from an unparseable response.
             self.logger.debug(
-                "ytmusicapi get_playlist_tracks failed for %s, using yt-dlp fallback",
+                "ytmusicapi get_playlist_tracks failed for %s (%s: %s), using yt-dlp fallback",
                 prov_playlist_id,
+                type(err).__name__,
+                err,
             )
             return await self._get_playlist_tracks_via_ytdlp(prov_playlist_id)
 
@@ -1035,11 +1149,23 @@ class YoutubeMusicFreeProvider(MusicProvider):
         return merged
 
     @staticmethod
-    def _yt_playlist_url(playlist_id: str) -> str:
-        """Build a plain youtube.com playlist URL, stripping ytmusicapi's VL browse prefix."""
-        # ytmusicapi browse IDs are prefixed with "VL" (e.g. "VLPLxxx").
-        # yt-dlp and youtube.com expect the bare ID ("PLxxx").
-        bare_id = playlist_id[2:] if playlist_id.startswith("VL") else playlist_id
+    def _yt_playlist_url(playlist_id: str, seed_video_id: str | None = None) -> str:
+        """Build the youtube.com URL yt-dlp needs for this playlist id.
+
+        Radio ids need the watch form. ``playlist?list=RD...`` is rejected by
+        YouTube with "This playlist type is unviewable", so a mix requested that
+        way yields nothing at all (issue #47). The watch form needs a seed video
+        id: song radio embeds one, and for a curated mix the caller passes the
+        first track it already knows about.
+
+        A radio id with no seed still falls through to the plain form. It will
+        fail, but the caller now logs that failure rather than discarding it.
+        """
+        bare_id = _strip_browse_prefix(playlist_id)
+        if bare_id.startswith(_YT_RADIO_PREFIX):
+            seed = seed_video_id or _radio_seed_video_id(playlist_id)
+            if seed:
+                return f"https://www.youtube.com/watch?v={seed}&list={bare_id}"
         return f"https://www.youtube.com/playlist?list={bare_id}"
 
     async def _get_playlist_via_ytdlp(self, playlist_id: str) -> Playlist:
@@ -1059,7 +1185,18 @@ class YoutubeMusicFreeProvider(MusicProvider):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 try:
                     return ydl.extract_info(url, download=False)
-                except Exception:
+                except Exception as err:  # noqa: BLE001 - reported, then degraded
+                    # Never swallow this silently. yt-dlp is built quiet, its
+                    # logger is pinned to WARNING, and this used to discard the
+                    # error too, so a failure here produced no log line
+                    # anywhere. That is why issue #47 was unreportable: the
+                    # user saw a stall with an empty log.
+                    self.logger.warning(
+                        "yt-dlp could not read playlist %s (%s): %s",
+                        playlist_id,
+                        url,
+                        err,
+                    )
                     return None
 
         info = await asyncio.to_thread(_extract)
@@ -1085,14 +1222,21 @@ class YoutubeMusicFreeProvider(MusicProvider):
             playlist.metadata.images = self._parse_thumbnails(thumbnails)
         return playlist
 
-    async def _get_playlist_tracks_via_ytdlp(self, playlist_id: str) -> list[Track]:
-        """Get playlist tracks via yt-dlp flat extraction (no auth required)."""
+    async def _get_playlist_tracks_via_ytdlp(
+        self, playlist_id: str, seed_video_id: str | None = None
+    ) -> list[Track]:
+        """Get playlist tracks via yt-dlp flat extraction (no auth required).
+
+        ``seed_video_id`` is only meaningful for radio ids, which cannot be
+        opened without one. Callers that already hold a track from the mix
+        should pass it; see ``_yt_playlist_url``.
+        """
 
         def _extract() -> dict | None:
             if self._yt_dlp_module is None:
                 self._yt_dlp_module = importlib.import_module("yt_dlp")
             yt_dlp = self._yt_dlp_module
-            url = self._yt_playlist_url(playlist_id)
+            url = self._yt_playlist_url(playlist_id, seed_video_id)
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
@@ -1101,7 +1245,15 @@ class YoutubeMusicFreeProvider(MusicProvider):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 try:
                     return ydl.extract_info(url, download=False)
-                except Exception:
+                except Exception as err:  # noqa: BLE001 - reported, then degraded
+                    # See the note in _get_playlist_via_ytdlp: this swallow is
+                    # the reason a broken mix produced an empty log (issue #47).
+                    self.logger.warning(
+                        "yt-dlp could not read tracks for playlist %s (%s): %s",
+                        playlist_id,
+                        url,
+                        err,
+                    )
                     return None
 
         info = await asyncio.to_thread(_extract)
@@ -1162,7 +1314,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
         tracks = []
         for track_obj in watch_playlist["tracks"]:
             with suppress(InvalidDataError, KeyError, TypeError):
-                track = self._parse_track(track_obj)
+                # Same reshaping as the mix path: this endpoint reports duration
+                # as a clock string and artwork under a differently named key.
+                track = self._parse_track(_normalize_watch_track(track_obj))
                 if track:
                     tracks.append(track)
         return tracks
