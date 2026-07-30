@@ -1383,7 +1383,7 @@ def test_search_with_url_resolution_failure_returns_empty(provider):
     provider._ytmusic = mock
 
     # yt-dlp fallback path also fails -> _search_by_url swallows and returns empty.
-    async def _boom(_playlist_id):
+    async def _boom(_playlist_id, _seed=None):
         raise RuntimeError("boom")
 
     provider._get_playlist_via_ytdlp = _boom

@@ -70,8 +70,20 @@ if TYPE_CHECKING:
 YTM_DOMAIN = "https://music.youtube.com"
 VARIOUS_ARTISTS_YTM_ID = "UCUTXlgdcKU5vfzFqHOWIvkA"
 DEFAULT_STREAM_URL_EXPIRATION = 3600  # 1 hour
-# Auto-generated mixes are effectively endless, so a full fetch has no natural
-# stopping point. Ask for a queue's worth and let MA request more if it needs to.
+# Song radio and the personal mixes are effectively endless, so a full fetch has
+# no natural stopping point. Ask for a queue's worth and stop there.
+#
+# This is a floor, not a ceiling: ytmusicapi documents the argument as the
+# minimum to return, and stops requesting continuations once it holds that
+# many, so a real result overshoots by whatever the last batch contained. 100
+# here measured 147 tracks for song radio.
+#
+# It is also the whole fetch rather than a first page. get_watch_playlist takes
+# a limit but exposes no offset, so a second page could only be had by
+# refetching from the start and slicing off what we already returned, and radio
+# does not hand back a stable sequence across calls, so those slices would
+# duplicate some tracks and skip others. get_playlist_tracks accordingly
+# returns nothing for page > 0.
 RADIO_PLAYLIST_LIMIT = 100
 
 # Features that work without a YTM account
@@ -141,15 +153,26 @@ _YT_SHORT_TOKEN = re.compile(r"(?:^|[^\w.])youtu\.be[/\s]+([\w-]{11})", re.I)
 _YT_VIDEO_ID = re.compile(r"[?&\s]v=([\w-]{11})", re.I)
 _YT_LIST_ID = re.compile(r"[?&\s]list=([\w-]{10,})", re.I)
 
-# YouTube Music's auto-generated mixes ("My Supermix" RDTMAK5uy_..., "Discover
-# Mix" RDCLAK5uy_..., song radio RD<videoId>) are radio endpoints rather than
-# stored playlists, and nothing that works for a normal playlist works on them:
-# youtube.com/playlist?list=RD... answers "This playlist type is unviewable",
-# and ytmusicapi's get_playlist raises a KeyError parsing the response. They
-# have to be requested through a watch URL or via get_watch_playlist. Issue #47.
+# "RD" covers two different things, and the difference decides which endpoint
+# can answer for an id. Issue #47.
+#
+# Radio proper: song radio ("RD<videoId>", "RDAMVM<videoId>") and the
+# auto-generated personal mixes ("My Supermix" RDTMAK5uy_...). Nothing that
+# works for a normal playlist works on song radio: youtube.com/playlist?list=RD
+# answers "This playlist type is unviewable", and ytmusicapi's get_playlist
+# raises a KeyError parsing the response. Only a watch URL or
+# get_watch_playlist will do.
+#
+# Editorial playlists: "RDCLAK5uy_..." is not radio at all. These are YouTube
+# Music's own curated playlists ("'80s Pop", "Happy Pop Hits"), they answer
+# get_playlist normally, and they are most of what the home feed hands out. The
+# watch endpoint does answer for them, but it stops at a queue's length, so
+# sending them there loses tracks: measured live, "'80s Pop" is 200 tracks
+# through get_playlist and 101 through the watch endpoint.
 _YT_RADIO_PREFIX = "RD"
+_YT_EDITORIAL_PREFIX = "RDCLAK5uy_"
 # Song radio embeds its seed video id ("RD<videoId>", "RDAMVM<videoId>"); the
-# curated mixes do not, so they need a seed supplied from elsewhere. The
+# personal mixes do not, so they need a seed supplied from elsewhere. The
 # trailing {11} anchor is what tells the two apart: RDTMAK5uy_kset8Dis... is far
 # longer than a video id, so it correctly fails to match.
 _YT_RADIO_SEED_RE = re.compile(r"^RD(?:AMVM)?([\w-]{11})$")
@@ -267,16 +290,35 @@ def _strip_browse_prefix(playlist_id: str) -> str:
 
 
 def _is_radio_playlist_id(playlist_id: str) -> bool:
-    """Is this one of YouTube Music's auto-generated mixes or a song radio?"""
+    """Does this id carry the "RD" prefix, whatever kind of RD it turns out to be?
+
+    True for song radio, personal mixes and editorial playlists alike. Use
+    ``_is_watch_only_playlist_id`` to decide where to fetch tracks from; this
+    one answers the narrower question of whether a watch URL is even a
+    possibility, which is what seeding one depends on.
+    """
     return _strip_browse_prefix(playlist_id).startswith(_YT_RADIO_PREFIX)
+
+
+def _is_watch_only_playlist_id(playlist_id: str) -> bool:
+    """Is the watch endpoint the only one that will hand back this id's tracks?
+
+    Song radio and the personal mixes, yes. Editorial "RDCLAK5uy_..."
+    playlists, no: they read normally through ``get_playlist``, and that is the
+    route that returns all of their tracks rather than a queue's worth.
+    """
+    bare_id = _strip_browse_prefix(playlist_id)
+    return bare_id.startswith(_YT_RADIO_PREFIX) and not bare_id.startswith(
+        _YT_EDITORIAL_PREFIX
+    )
 
 
 def _radio_seed_video_id(playlist_id: str) -> str | None:
     """Return the video id a song-radio id is built from, when it carries one.
 
-    Curated mixes (``RDTMAK5uy_...``, ``RDCLAK5uy_...``) carry no seed and
-    return None; a caller that needs one has to take it from the mix's first
-    track instead.
+    Personal mixes (``RDTMAK5uy_...``) and editorial playlists
+    (``RDCLAK5uy_...``) carry no seed and return None; a caller that needs one
+    has to take it from the first track instead.
     """
     match = _YT_RADIO_SEED_RE.match(_strip_browse_prefix(playlist_id))
     return match.group(1) if match else None
@@ -1018,23 +1060,76 @@ class YoutubeMusicFreeProvider(MusicProvider):
         except MediaNotFoundError:
             raise
         except Exception as err:  # noqa: BLE001 - degrade to the yt-dlp fallback
-            # ytmusicapi requires auth for some playlist types — fall back to yt-dlp
+            # ytmusicapi requires auth for some playlist types, and raises a
+            # KeyError outright on song radio, so fall back to yt-dlp.
             self.logger.debug(
                 "ytmusicapi get_playlist failed for %s (%s: %s), using yt-dlp fallback",
                 prov_playlist_id,
                 type(err).__name__,
                 err,
             )
-            return await self._get_playlist_via_ytdlp(prov_playlist_id)
+            # Without a seed this builds the playlist?list=RD... URL YouTube
+            # refuses, so a personal mix resolved to "not found" here even after
+            # its tracks became reachable. Song radio survived only because its
+            # seed is embedded in the id. Issue #47 follow-up.
+            seed = await self._resolve_radio_seed(prov_playlist_id)
+            return await self._get_playlist_via_ytdlp(prov_playlist_id, seed)
+
+    async def _resolve_radio_seed(self, playlist_id: str) -> str | None:
+        """Return a video id able to seed the watch URL for a radio id.
+
+        Anything without the "RD" prefix returns None without a request. Song
+        radio carries its seed in the id itself ("RD<videoId>"), so that costs
+        nothing either. Everything else RD-prefixed carries no seed, and a watch
+        URL cannot be built without one, so the seed has to come from the first
+        track: one extra call to the endpoint that is willing to answer for
+        these ids at all.
+
+        Returns None on three paths besides the non-radio one: the request
+        failed, the response held no track with a video id, or the response was
+        not shaped as expected. Each is logged; the caller degrades to the plain
+        URL form.
+        """
+        if not _is_radio_playlist_id(playlist_id):
+            return None
+        if seed := _radio_seed_video_id(playlist_id):
+            return seed
+        try:
+            watch_playlist = await asyncio.to_thread(
+                self._ytmusic.get_watch_playlist,
+                playlistId=_strip_browse_prefix(playlist_id),
+                # One track is all a seed needs; anything more is wasted work.
+                limit=1,
+            )
+            # Inside the try on purpose. This runs from inside get_playlist's
+            # own except block, so anything raised here would replace the error
+            # being handled and skip the fallback entirely.
+            for track_obj in (watch_playlist or {}).get("tracks") or []:
+                if isinstance(track_obj, dict) and (video_id := track_obj.get("videoId")):
+                    return video_id
+        except Exception as err:  # noqa: BLE001 - no seed, caller degrades
+            self.logger.warning(
+                "could not read a seed track for mix %s: %s", playlist_id, err
+            )
+            return None
+        self.logger.warning(
+            "mix %s returned no seed track, so its details cannot be fetched",
+            playlist_id,
+        )
+        return None
 
     async def _get_radio_playlist_tracks(self, playlist_id: str) -> list[Track]:
-        """Return the tracks of an auto-generated mix or song radio.
+        """Return the tracks of a personal mix or song radio.
 
-        These ids only answer on the watch/radio endpoint, which is what
-        YouTube Music itself uses for them. ``get_playlist`` raises a KeyError
-        on the response shape, and the yt-dlp fallback behind it cannot open
-        them either, so before this existed a mix resolved to zero tracks and
-        playback simply had nothing to start (issue #47).
+        The watch/radio endpoint is what YouTube Music itself uses for these,
+        and for song radio it is the only thing that answers at all:
+        ``get_playlist`` raises a KeyError on the response shape and the yt-dlp
+        fallback behind it cannot open them either, so before this existed they
+        resolved to zero tracks and playback had nothing to start (issue #47).
+
+        Not for editorial ``RDCLAK5uy_`` playlists. This endpoint will answer
+        for those too, but only with a queue's worth, so they keep the ordinary
+        path and its full track list. See ``_is_watch_only_playlist_id``.
         """
         bare_id = _strip_browse_prefix(playlist_id)
         try:
@@ -1069,10 +1164,16 @@ class YoutubeMusicFreeProvider(MusicProvider):
         """Return playlist tracks for the given playlist id."""
         if page > 0:
             return []
-        if _is_radio_playlist_id(prov_playlist_id):
-            # Try the radio endpoint first. Falling through on an empty result
-            # keeps the old behaviour available for anything RD-prefixed that
-            # turns out to be readable as an ordinary playlist.
+        # Only ids that nothing else will answer for go to the radio endpoint
+        # first. Editorial RDCLAK5uy_ playlists are deliberately excluded: the
+        # watch endpoint does answer for them, so routing them here looked
+        # right, but it stops at a queue's length and silently drops the rest
+        # of the playlist ("'80s Pop": 200 tracks the ordinary way, 101 this
+        # way). Falling through on an empty result keeps the old behaviour
+        # available for anything RD-prefixed that reads as an ordinary
+        # playlist after all.
+        watch_first = _is_watch_only_playlist_id(prov_playlist_id)
+        if watch_first:
             if radio_tracks := await self._get_radio_playlist_tracks(prov_playlist_id):
                 return radio_tracks
         try:
@@ -1109,7 +1210,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             raise
         except Exception as err:  # noqa: BLE001 - degrade to the yt-dlp fallback
             # ytmusicapi requires auth for some playlist types, and raises a
-            # KeyError outright on radio ids, so a fallback here is expected.
+            # KeyError outright on song radio, so a fallback here is expected.
             # Include the error: without it this line cannot tell an
             # auth problem apart from an unparseable response.
             self.logger.debug(
@@ -1118,6 +1219,13 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 type(err).__name__,
                 err,
             )
+            # An RD id that is not watch-only got here without trying the radio
+            # endpoint, and an editorial playlist the ordinary path could not
+            # read may still answer there. Watch-only ids already tried it
+            # above, so this never repeats that call.
+            if not watch_first and _is_radio_playlist_id(prov_playlist_id):
+                if radio_tracks := await self._get_radio_playlist_tracks(prov_playlist_id):
+                    return radio_tracks
             return await self._get_playlist_tracks_via_ytdlp(prov_playlist_id)
 
     @staticmethod
@@ -1168,14 +1276,21 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 return f"https://www.youtube.com/watch?v={seed}&list={bare_id}"
         return f"https://www.youtube.com/playlist?list={bare_id}"
 
-    async def _get_playlist_via_ytdlp(self, playlist_id: str) -> Playlist:
-        """Get playlist metadata via yt-dlp flat extraction (no auth required)."""
+    async def _get_playlist_via_ytdlp(
+        self, playlist_id: str, seed_video_id: str | None = None
+    ) -> Playlist:
+        """Get playlist metadata via yt-dlp flat extraction (no auth required).
+
+        ``seed_video_id`` mirrors ``_get_playlist_tracks_via_ytdlp``: a radio id
+        can only be opened through a watch URL, and a curated mix carries no
+        seed of its own, so the caller supplies one. See ``_yt_playlist_url``.
+        """
 
         def _extract() -> dict | None:
             if self._yt_dlp_module is None:
                 self._yt_dlp_module = importlib.import_module("yt_dlp")
             yt_dlp = self._yt_dlp_module
-            url = self._yt_playlist_url(playlist_id)
+            url = self._yt_playlist_url(playlist_id, seed_video_id)
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
@@ -1307,7 +1422,12 @@ class YoutubeMusicFreeProvider(MusicProvider):
             # ytmusicapi can raise (e.g. KeyError 'endpoint') when the watch-playlist
             # response lacks the expected navigation structure. Degrade to an empty
             # radio list rather than failing the whole play_media command.
-            self.logger.debug("get_watch_playlist failed for %s: %s", video_id, err)
+            #
+            # Warning, not debug: this is the same endpoint and the same failure
+            # the mix path reports, and radio mode going quiet with nothing in
+            # the log at default level is exactly what made issue #47 take
+            # months to pin down.
+            self.logger.warning("get_watch_playlist failed for %s: %s", video_id, err)
             return []
         if not watch_playlist or "tracks" not in watch_playlist:
             return []
