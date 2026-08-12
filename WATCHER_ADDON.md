@@ -12,6 +12,18 @@ The public `ytmusic_free` files are baked into the watcher image. Private Monoch
 
 Optionally, the watcher can keep either provider **up to date** using separate `ytmusic_auto_update` and `monochrome_auto_update` controls. It reinstalls and restarts MA **only when code actually changed** (SHA-256 comparison). See [Auto-update](#auto-update) below.
 
+## Recommended UI installation
+
+1. In Home Assistant, open **Settings → Apps → App store → ⋮ → Repositories**.
+2. Add `https://github.com/NicholasBoulanger/music-assistant-ytmusic`.
+3. Install **MA Provider Watcher (Monochrome)**.
+4. Turn **Protection mode off**. Keep `ma_container` and `python_version` set to `auto` unless runtime discovery logs an error.
+5. Paste the private-repository PAT, select the provider update controls, save, and start the app.
+
+The committed app package lives in `ma_provider_watcher/` and has a fixed release version. Future version bumps appear through Home Assistant's normal Update UI and can use the Info page's **Auto update** switch. No curl or store-metadata reload is needed for repository-managed installations.
+
+The curl-generated local app remains documented below as a recovery and development fallback. Do not run the local and repository-managed watchers simultaneously because both would manage and restart the same Music Assistant container.
+
 ---
 
 ## File layout

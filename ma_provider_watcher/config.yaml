@@ -1,0 +1,35 @@
+name: MA Provider Watcher (Monochrome)
+version: "1.1.0"
+slug: ma_provider_watcher
+description: Keeps YouTube Music Free and private Monochrome providers installed and updated in Music Assistant.
+url: https://github.com/NicholasBoulanger/music-assistant-ytmusic/tree/main/ma_provider_watcher
+stage: experimental
+init: false
+boot: auto
+docker_api: true
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+options:
+  ytmusic_auto_update: false
+  monochrome_auto_update: false
+  ytmusic_active_version: current
+  monochrome_active_version: current
+  update_interval_hours: 24
+  monochrome_enabled: true
+  ma_container: auto
+  python_version: auto
+  github_token: ""
+schema:
+  ytmusic_auto_update: bool
+  monochrome_auto_update: bool
+  ytmusic_active_version: list(current|previous)
+  monochrome_active_version: list(current|previous)
+  update_interval_hours: int(1,)
+  monochrome_enabled: bool
+  ma_container: str
+  python_version: str
+  github_token: password

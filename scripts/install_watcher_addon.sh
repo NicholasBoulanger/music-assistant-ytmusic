@@ -254,6 +254,8 @@ options:
   monochrome_active_version: current
   update_interval_hours: 24
   monochrome_enabled: true
+  ma_container: auto
+  python_version: auto
   github_token: ""
 schema:
   ytmusic_auto_update: bool
@@ -262,6 +264,8 @@ schema:
   monochrome_active_version: list(current|previous)
   update_interval_hours: int(1,)
   monochrome_enabled: bool
+  ma_container: str
+  python_version: str
   github_token: password
 EOF
 
@@ -301,6 +305,16 @@ configuration:
     description: >-
       Keep the Monochrome provider installed and update it from its configured
       private GitHub repository.
+  ma_container:
+    name: Music Assistant container
+    description: >-
+      Use auto to discover the current app_ or legacy addon_ container name.
+      Enter an exact container name only when automatic discovery fails.
+  python_version:
+    name: Music Assistant Python version
+    description: >-
+      Use auto to inspect Music Assistant at startup. Enter a value such as
+      python3.14 only when automatic discovery fails.
   github_token:
     name: GitHub personal access token
     description: >-
@@ -353,6 +367,7 @@ read_options() {
     YTMUSIC_ACTIVE_VERSION="current"; MONOCHROME_ACTIVE_VERSION="current"
     UPDATE_INTERVAL_HOURS=24
     MONOCHROME_ENABLED="true"; GITHUB_TOKEN=""
+    MA_CONTAINER="auto"; MA_PYTHON_VERSION="auto"
     if [ -r "$f" ]; then
         YTMUSIC_AUTO_UPDATE="$(jq -r 'if has("ytmusic_auto_update") then (if .ytmusic_auto_update == true then "true" else "false" end) elif .auto_update == true then "true" else "false" end' "$f" 2>/dev/null || echo false)"
         MONOCHROME_AUTO_UPDATE="$(jq -r 'if has("monochrome_auto_update") then (if .monochrome_auto_update == true then "true" else "false" end) elif .auto_update == true then "true" else "false" end' "$f" 2>/dev/null || echo false)"
@@ -360,6 +375,8 @@ read_options() {
         MONOCHROME_ACTIVE_VERSION="$(jq -r 'if .monochrome_active_version == "previous" then "previous" else "current" end' "$f" 2>/dev/null || echo current)"
         UPDATE_INTERVAL_HOURS="$(jq -r 'if (.update_interval_hours|type)=="number" then (.update_interval_hours|floor) else 24 end' "$f" 2>/dev/null || echo 24)"
         MONOCHROME_ENABLED="$(jq -r 'if .monochrome_enabled == false then "false" else "true" end' "$f" 2>/dev/null || echo true)"
+        MA_CONTAINER="$(jq -r 'if (.ma_container|type)=="string" and (.ma_container|length)>0 then .ma_container else "auto" end' "$f" 2>/dev/null || echo auto)"
+        MA_PYTHON_VERSION="$(jq -r 'if (.python_version|type)=="string" and (.python_version|length)>0 then .python_version else "auto" end' "$f" 2>/dev/null || echo auto)"
         GITHUB_TOKEN="$(jq -r 'if (.github_token|type)=="string" then .github_token else "" end' "$f" 2>/dev/null || true)"
     fi
     case "$UPDATE_INTERVAL_HOURS" in ''|*[!0-9-]*) UPDATE_INTERVAL_HOURS=24 ;; esac   # non-integer -> default
@@ -493,7 +510,8 @@ log "Writing run.sh (MA=$MA_ID, $PYTHON_VERSION)"
 cat > "$ADDON_DIR/run.sh" <<EOF
 #!/usr/bin/env bash
 
-MA="$MA_ID"
+MA_DEFAULT="$MA_ID"
+PYTHON_DEFAULT="$PYTHON_VERSION"
 BUNDLED="/provider/ytmusic_free"
 CACHE="/data/ytmusic_free"
 HASHFILE="/data/ytmusic_free.sha256"
@@ -507,7 +525,6 @@ MONOCHROME_DATEFILE="/data/monochrome.fetched_at"
 MONOCHROME_PREVIOUS_CACHE="/data/monochrome.previous"
 MONOCHROME_PREVIOUS_HASHFILE="/data/monochrome.previous.sha256"
 MONOCHROME_PREVIOUS_DATEFILE="/data/monochrome.previous.fetched_at"
-DST="/app/venv/lib/$PYTHON_VERSION/site-packages/music_assistant/providers"
 # Where auto-update pulls the latest provider from. Baked from the installer's
 # --repo-owner/--ref so a fork self-updates from its own source.
 TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REF"
@@ -523,7 +540,6 @@ MISSING_GRACE_SECONDS=60
 read_options
 
 echo "[\$(date)] MA Provider Watcher starting..."
-echo "[\$(date)] Watching for container name: \$MA"
 
 if ! docker info > /dev/null 2>&1; then
     echo "[\$(date)] ERROR: No Docker socket (is Protection Mode off?)"
@@ -533,6 +549,33 @@ fi
 echo "[\$(date)] Docker OK"
 
 log() { echo "[\$(date)] \$*"; }
+
+if [ "\$MA_CONTAINER" = "auto" ]; then
+    MA="\$(docker ps --format '{{.Names}}' 2>/dev/null \
+        | grep -E '^(addon|app)_[0-9a-f]+_music_assistant(_beta|_nightly|_dev)?\$' \
+        | head -n1 || true)"
+    if [ -z "\$MA" ]; then
+        MA="\$MA_DEFAULT"
+        log "WARNING: MA container auto-detection failed; using fallback \$MA"
+    fi
+else
+    MA="\$MA_CONTAINER"
+fi
+case "\$MA" in ''|*[!A-Za-z0-9_.-]*) log "ERROR: invalid Music Assistant container name"; exit 1 ;; esac
+
+if [ "\$MA_PYTHON_VERSION" = "auto" ]; then
+    ACTIVE_PYTHON="\$(docker exec "\$MA" sh -c 'ls /app/venv/lib/ 2>/dev/null' \
+        | grep -E '^python3\.[0-9]+\$' | head -n1 || true)"
+    if [ -z "\$ACTIVE_PYTHON" ]; then
+        ACTIVE_PYTHON="\$PYTHON_DEFAULT"
+        log "WARNING: Python version auto-detection failed; using fallback \$ACTIVE_PYTHON"
+    fi
+else
+    ACTIVE_PYTHON="\$MA_PYTHON_VERSION"
+fi
+case "\$ACTIVE_PYTHON" in python3.[0-9]|python3.[0-9][0-9]) ;; *) log "ERROR: invalid Music Assistant Python version: \$ACTIVE_PYTHON"; exit 1 ;; esac
+DST="/app/venv/lib/\$ACTIVE_PYTHON/site-packages/music_assistant/providers"
+log "Watching container: \$MA (\$ACTIVE_PYTHON)"
 
 slot_value() { value="\$(cat "\$1" 2>/dev/null || true)"; [ -n "\$value" ] && printf '%s' "\$value" || printf '%s' unknown; }
 

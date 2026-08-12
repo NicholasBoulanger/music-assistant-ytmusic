@@ -55,6 +55,21 @@ assert_file_exists() {
 printf '\n== Script structure ==\n'
 
 assert_file_exists "installer script exists" "$SCRIPT"
+assert_file_exists "app repository metadata exists" "$REPO_ROOT/repository.yaml"
+assert_file_exists "committed app config exists" "$REPO_ROOT/ma_provider_watcher/config.yaml"
+assert_file_exists "committed app Dockerfile exists" "$REPO_ROOT/ma_provider_watcher/Dockerfile"
+assert_file_exists "committed app run.sh exists" "$REPO_ROOT/ma_provider_watcher/run.sh"
+assert_file_exists "committed app watcher_lib.sh exists" "$REPO_ROOT/ma_provider_watcher/watcher_lib.sh"
+
+repo_config="$(sed -n '1,200p' "$REPO_ROOT/ma_provider_watcher/config.yaml")"
+assert_contains "repository app has a fixed release version" 'version: "1.1.0"' "$repo_config"
+assert_contains "repository app discovers MA container at runtime" 'ma_container: auto' "$repo_config"
+assert_contains "repository app discovers Python at runtime" 'python_version: auto' "$repo_config"
+if bash -n "$REPO_ROOT/ma_provider_watcher/run.sh" "$REPO_ROOT/ma_provider_watcher/watcher_lib.sh" 2>/dev/null; then
+    pass "committed repository runtime passes bash -n"
+else
+    fail "committed repository runtime passes bash -n"
+fi
 
 shebang="$(head -n1 "$SCRIPT")"
 assert_eq "shebang is POSIX sh" "#!/bin/sh" "$shebang"
@@ -246,10 +261,10 @@ if [ "$network_ok" = "1" ]; then
     esac
 
     runsh="$(cat "$ADDON/run.sh")"
-    assert_contains "run.sh has substituted MA ID" 'MA="addon_TESTID_music_assistant"' "$runsh"
-    assert_contains "run.sh has substituted Python version" "/python3.99/" "$runsh"
+    assert_contains "run.sh has substituted fallback MA ID" 'MA_DEFAULT="addon_TESTID_music_assistant"' "$runsh"
+    assert_contains "run.sh has substituted fallback Python version" 'PYTHON_DEFAULT="python3.99"' "$runsh"
     assert_contains "run.sh shebang is bash" "#!/usr/bin/env bash" "$runsh"
-    assert_contains "run.sh logs the watched container name on start" "Watching for container name" "$runsh"
+    assert_contains "run.sh logs the discovered container and Python" "Watching container:" "$runsh"
     assert_contains "run.sh has misconfig diagnostic function" "warn_if_ma_misconfigured" "$runsh"
     assert_contains "run.sh references MISSING_GRACE_SECONDS" "MISSING_GRACE_SECONDS" "$runsh"
     assert_contains "run.sh diagnostic mentions --ma-id remedy" "--ma-id" "$runsh"
@@ -269,6 +284,26 @@ if [ "$network_ok" = "1" ]; then
     dockerfile="$(cat "$ADDON/Dockerfile")"
     assert_contains "Dockerfile copies provider" "COPY ytmusic_free/ /provider/ytmusic_free/" "$dockerfile"
     assert_contains "Dockerfile installs docker-cli" "docker-cli" "$dockerfile"
+
+    # The committed repository app and fallback installer must share one
+    # runtime implementation. Only the installer's machine-specific fallback
+    # values are allowed to differ.
+    if cmp -s "$ADDON/watcher_lib.sh" "$REPO_ROOT/ma_provider_watcher/watcher_lib.sh"; then
+        pass "committed watcher_lib matches generated fallback"
+    else
+        fail "committed watcher_lib matches generated fallback"
+    fi
+    sed -e 's/^MA_DEFAULT=.*/MA_DEFAULT="normalized"/' \
+        -e 's/^PYTHON_DEFAULT=.*/PYTHON_DEFAULT="normalized"/' \
+        "$ADDON/run.sh" > "$TMP_ADDONS/generated.normalized"
+    sed -e 's/^MA_DEFAULT=.*/MA_DEFAULT="normalized"/' \
+        -e 's/^PYTHON_DEFAULT=.*/PYTHON_DEFAULT="normalized"/' \
+        "$REPO_ROOT/ma_provider_watcher/run.sh" > "$TMP_ADDONS/committed.normalized"
+    if cmp -s "$TMP_ADDONS/generated.normalized" "$TMP_ADDONS/committed.normalized"; then
+        pass "committed run.sh matches generated fallback"
+    else
+        fail "committed run.sh matches generated fallback"
+    fi
 
     # --- Idempotency ---
     printf '\n== Idempotency ==\n'
@@ -297,8 +332,8 @@ if [ "$network_ok" = "1" ]; then
         fail "--force overwrites prior install (sentinel removed)"
     fi
     runsh2="$(cat "$ADDON/run.sh" 2>/dev/null || echo '')"
-    assert_contains "--force re-substitutes MA ID" 'MA="addon_FORCED_music_assistant"' "$runsh2"
-    assert_contains "--force re-substitutes Python version" "/python3.42/" "$runsh2"
+    assert_contains "--force re-substitutes fallback MA ID" 'MA_DEFAULT="addon_FORCED_music_assistant"' "$runsh2"
+    assert_contains "--force re-substitutes fallback Python version" 'PYTHON_DEFAULT="python3.42"' "$runsh2"
 
     # --- Auto-detection fallback ---
     # When no docker is present (or no MA-named container is running), the
@@ -315,7 +350,7 @@ if [ "$network_ok" = "1" ]; then
         pass "warns when MA container is not detected"
         runsh3="$(cat "$ADDON/run.sh" 2>/dev/null || echo '')"
         assert_contains "fallback MA ID baked into run.sh" \
-            'MA="app_d5369777_music_assistant"' "$runsh3"
+            'MA_DEFAULT="app_d5369777_music_assistant"' "$runsh3"
     else
         skip "test environment auto-detected an MA container -- warning path not exercised"
     fi
@@ -324,7 +359,7 @@ if [ "$network_ok" = "1" ]; then
         pass "warns when Python version is not detected"
         runsh3="$(cat "$ADDON/run.sh" 2>/dev/null || echo '')"
         assert_contains "fallback Python version baked into run.sh" \
-            "/python3.13/" "$runsh3"
+            'PYTHON_DEFAULT="python3.13"' "$runsh3"
     else
         skip "test environment auto-detected a Python version -- fallback path not exercised"
     fi

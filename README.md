@@ -136,13 +136,23 @@ Each instance authenticates on its own and syncs only the account its own cookie
 
 ### Keeping the provider across HA restarts
 
-> **Monochrome fork:** this fork also downloads and installs the private Monochrome provider. Install the forked watcher with:
-> ```bash
-> curl -fsSL https://raw.githubusercontent.com/NicholasBoulanger/music-assistant-ytmusic/main/scripts/install_watcher_addon.sh | sh -s -- --force
-> ```
-> Then open **MA Provider Watcher → Configuration**, paste a PAT with read access to `NicholasBoulanger/music-assistant-monochrome` into `github_token`, save, and restart the watcher. Enable `ytmusic_auto_update` and/or `monochrome_auto_update` as desired. The PAT is held in the app options and is never committed or logged.
+The recommended installation is fully UI-managed:
 
-If you restart HA (not just MA), the container is recreated and the provider files are lost. The recommended fix is the **MA Provider Watcher** local add-on, which re-copies the provider whenever the MA container is recreated. One-line install from a host shell:
+1. Open **Settings → Apps → App store → ⋮ → Repositories**.
+2. Add `https://github.com/NicholasBoulanger/music-assistant-ytmusic`.
+3. Install **MA Provider Watcher (Monochrome)** from that repository.
+4. Turn **Protection mode off**. Leave `ma_container` and `python_version` set to `auto`.
+5. In Configuration, paste a PAT with read access to `NicholasBoulanger/music-assistant-monochrome`, choose the independent update controls, save, and start the app.
+
+New watcher releases then appear as normal Home Assistant app updates; the Info page's **Auto update** switch can install them without terminal commands. The PAT remains in app options and is never committed or logged.
+
+If you restart HA (not just MA), the container is recreated and manually copied provider files are lost. The watcher app re-copies them whenever Music Assistant is recreated.
+
+> **Migrating the existing local watcher:** stop `local_ma_provider_watcher` before starting the repository-managed app. Re-enter its PAT and options in the new app; its `/data` cache and Previous history start fresh because Home Assistant isolates data by repository app ID. After the new watcher logs `Copied monochrome OK` and `MA restarted`, uninstall the old local watcher. Never run both simultaneously.
+
+One-line fallback install from a host shell:
+
+The curl installer below remains available as a development or recovery fallback. It creates a separate **local** app and therefore requires the manual source/schema refresh sequence described later.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main/scripts/install_watcher_addon.sh | sh

@@ -1,0 +1,28 @@
+configuration:
+  ytmusic_auto_update:
+    name: Auto-update YouTube Music Free
+    description: Periodically check the public upstream repository. Off pins the selected version.
+  monochrome_auto_update:
+    name: Auto-update Monochrome
+    description: Periodically check the private repository using the configured GitHub token.
+  ytmusic_active_version:
+    name: Active YouTube Music Free version
+    description: Previous rolls back and pauses updates until Current is selected again.
+  monochrome_active_version:
+    name: Active Monochrome version
+    description: Previous rolls back and pauses updates until Current is selected again.
+  update_interval_hours:
+    name: Check providers for updates every (hours)
+    description: Shared check interval. Minimum one hour.
+  monochrome_enabled:
+    name: Install the Monochrome provider
+    description: Keep the private Monochrome provider installed in Music Assistant.
+  ma_container:
+    name: Music Assistant container
+    description: Use auto unless automatic app_/addon_ container discovery fails.
+  python_version:
+    name: Music Assistant Python version
+    description: Use auto unless automatic discovery fails; an override looks like python3.14.
+  github_token:
+    name: GitHub personal access token
+    description: Used only to read the private Monochrome repository and never written to logs.

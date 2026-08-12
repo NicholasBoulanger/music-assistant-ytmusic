@@ -78,6 +78,11 @@ if command -v jq >/dev/null 2>&1; then
     assert_eq "active version selectors parse Previous independently" \
         "false|false|24|true||previous|current" \
         "$(opt '{"ytmusic_active_version":"previous","monochrome_active_version":"invalid"}')"
+    runtime_opt(){ printf '%s' "$1" > "$TMP_ADDONS/o.json"; ( . "$LIB"; read_options "$TMP_ADDONS/o.json"; printf '%s|%s' "$MA_CONTAINER" "$MA_PYTHON_VERSION" ); }
+    assert_eq "runtime targets default to automatic discovery" "auto|auto" "$(runtime_opt '{}')"
+    assert_eq "runtime targets accept explicit overrides" \
+        "app_custom_music_assistant|python3.14" \
+        "$(runtime_opt '{"ma_container":"app_custom_music_assistant","python_version":"python3.14"}')"
 else
     skip "jq not installed -- read_options assertions skipped"
 fi
