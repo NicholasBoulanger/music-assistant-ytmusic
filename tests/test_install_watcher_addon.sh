@@ -80,12 +80,11 @@ fi
 
 printf '\n== MA container auto-detect regex ==\n'
 
-# Beta/nightly/dev MA installs name their container e.g.
-# "addon_d5369777_music_assistant_beta"; auto-detect must match those, not only
-# the stable "..._music_assistant" name (issue #35). Extract the exact pattern
+# Current HAOS releases use an app_ prefix while older installations used
+# addon_. Beta/nightly/dev suffixes must also remain supported. Extract the exact pattern
 # the script uses so this test tracks the real code, then exercise it (this also
 # proves the ERE is portable to the dash/BusyBox grep the CI runs under).
-MA_PAT="$(sed -n "s/.*grep -E '\(\^addon_[^']*\)'.*/\1/p" "$SCRIPT" | head -n1)"
+MA_PAT="$(awk -F "'" '/grep -E.*music_assistant/{print $2; exit}' "$SCRIPT")"
 
 if [ -n "$MA_PAT" ]; then
     pass "extracted MA-detect regex from script"
@@ -93,7 +92,11 @@ if [ -n "$MA_PAT" ]; then
     for _name in addon_d5369777_music_assistant \
                  addon_d5369777_music_assistant_beta \
                  addon_ff_music_assistant_nightly \
-                 addon_ff_music_assistant_dev; do
+                 addon_ff_music_assistant_dev \
+                 app_d5369777_music_assistant \
+                 app_d5369777_music_assistant_beta \
+                 app_ff_music_assistant_nightly \
+                 app_ff_music_assistant_dev; do
         if printf '%s\n' "$_name" | grep -qE "$MA_PAT"; then
             pass "MA-detect regex matches $_name"
         else
@@ -103,6 +106,8 @@ if [ -n "$MA_PAT" ]; then
     for _name in addon_ff_ma_provider_watcher \
                  addon_ff_music_assistant_watcher \
                  addon_ff_some_music_assistant_x \
+                 app_ff_ma_provider_watcher \
+                 app_ff_music_assistant_watcher \
                  music_assistant; do
         if printf '%s\n' "$_name" | grep -qE "$MA_PAT"; then
             fail "MA-detect regex rejects $_name" "unexpected match"
@@ -111,7 +116,7 @@ if [ -n "$MA_PAT" ]; then
         fi
     done
 else
-    fail "extracted MA-detect regex from script" "could not find the grep -E '^addon_...' line"
+    fail "extracted MA-detect regex from script" "could not find the Music Assistant grep -E line"
 fi
 
 # Recovery hints (including the one baked into the generated run.sh) must use the
@@ -306,7 +311,7 @@ if [ "$network_ok" = "1" ]; then
         pass "warns when MA container is not detected"
         runsh3="$(cat "$ADDON/run.sh" 2>/dev/null || echo '')"
         assert_contains "fallback MA ID baked into run.sh" \
-            'MA="addon_d5369777_music_assistant"' "$runsh3"
+            'MA="app_d5369777_music_assistant"' "$runsh3"
     else
         skip "test environment auto-detected an MA container -- warning path not exercised"
     fi

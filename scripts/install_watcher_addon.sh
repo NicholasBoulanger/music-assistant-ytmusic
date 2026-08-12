@@ -16,6 +16,7 @@ set -eu
 
 REPO_OWNER="sproft"
 REPO_NAME="music-assistant-ytmusic"
+WATCHER_REPO_OWNER="NicholasBoulanger"
 ADDON_SLUG="ma_provider_watcher"
 ADDON_NAME="MA Provider Watcher"
 MONOCHROME_REPO="NicholasBoulanger/music-assistant-monochrome"
@@ -86,7 +87,7 @@ done
 # generated run.sh) so they are copy-pasteable. Honors --repo-owner / --ref, and
 # shows the "sh -s --" pipe form: the documented install is "curl ... | sh",
 # where a bare "--flag" is parsed by sh itself and fails with "sh: bad option".
-SCRIPT_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/$REF/scripts/install_watcher_addon.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/$WATCHER_REPO_OWNER/$REPO_NAME/$REF/scripts/install_watcher_addon.sh"
 
 # --- Preflight ---------------------------------------------------------------
 
@@ -150,11 +151,11 @@ ADDON_DIR="$ADDONS_DIR/$ADDON_SLUG"
 if [ -z "$MA_ID" ]; then
     if command -v docker >/dev/null 2>&1; then
         MA_ID="$(docker ps --format '{{.Names}}' 2>/dev/null \
-                 | grep -E '^addon_[0-9a-f]+_music_assistant(_beta|_nightly|_dev)?$' \
+                 | grep -E '^(addon|app)_[0-9a-f]+_music_assistant(_beta|_nightly|_dev)?$' \
                  | head -n1 || true)"
     fi
     if [ -z "$MA_ID" ]; then
-        MA_ID="addon_d5369777_music_assistant"
+        MA_ID="app_d5369777_music_assistant"
         log "WARN: could not auto-detect MA container; using fallback '$MA_ID'."
         log "      Verify with: docker ps | grep music"
         log "      then re-run with the right id, e.g.:"
