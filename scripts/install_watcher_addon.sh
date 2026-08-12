@@ -1,11 +1,13 @@
 #!/bin/sh
-# Install the MA Provider Watcher add-on for the ytmusic_free provider.
+# Install the MA Provider Watcher add-on for ytmusic_free and Monochrome.
 #
 # Portable across HAOS (BusyBox ash) and Supervised installs. Uses curl + tar
 # instead of git so it runs on HAOS, where git is not available.
 #
 # Usage:
-#   sh install_watcher_addon.sh [--force] [--repo-owner OWNER] [--ref REF] [--ma-id ID]
+#   sh install_watcher_addon.sh [--force] [--repo-owner OWNER] [--ref REF]
+#                               [--monochrome-repo OWNER/REPO]
+#                               [--monochrome-ref REF] [--ma-id ID]
 #                               [--python-version VER] [--addons-dir DIR]
 #
 # See WATCHER_ADDON.md for the underlying manual procedure.
@@ -16,6 +18,8 @@ REPO_OWNER="sproft"
 REPO_NAME="music-assistant-ytmusic"
 ADDON_SLUG="ma_provider_watcher"
 ADDON_NAME="MA Provider Watcher"
+MONOCHROME_REPO="NicholasBoulanger/music-assistant-monochrome"
+MONOCHROME_REF="main"
 # Stamp a fresh, strictly-increasing version on every run so Home Assistant sees
 # a newer version and rebuilds the add-on image. Without this the version stays
 # pinned, so re-running the installer (e.g. to fix the Python version or MA ID)
@@ -53,6 +57,8 @@ Options:
   --force, -f               Overwrite existing add-on directory without prompting
   --repo-owner OWNER        Repository owner (default: sproft)
   --ref REF                 Branch to download; auto-update follows this branch head (default: main)
+  --monochrome-repo O/R     Private Monochrome repository (default: $MONOCHROME_REPO)
+  --monochrome-ref REF      Monochrome branch to follow (default: $MONOCHROME_REF)
   --ma-id ID                Music Assistant container ID (default: auto-detect)
   --python-version VER      MA Python version, e.g. python3.13 (default: auto-detect)
   --addons-dir DIR          Local add-ons directory (default: auto-detect HAOS vs. Supervised)
@@ -65,6 +71,8 @@ while [ $# -gt 0 ]; do
         --force|-f) FORCE=1 ;;
         --repo-owner) shift; REPO_OWNER="${1:-}" ;;
         --ref) shift; REF="${1:-}" ;;
+        --monochrome-repo) shift; MONOCHROME_REPO="${1:-}" ;;
+        --monochrome-ref) shift; MONOCHROME_REF="${1:-}" ;;
         --ma-id) shift; MA_ID="${1:-}" ;;
         --python-version) shift; PYTHON_VERSION="${1:-}" ;;
         --addons-dir) shift; ADDONS_DIR="${1:-}" ;;
@@ -214,7 +222,9 @@ cp -R "$SRC_ROOT/ytmusic_free" "$ADDON_DIR/ytmusic_free"
 # Guard values that get interpolated into run.sh (unquoted heredoc) + TARBALL_URL
 # against shell metacharacters, so operator input can't inject code into the
 # root-run watcher. Conservative charset covers real owners/refs/ids/versions.
-for _pair in "repo-owner:$REPO_OWNER" "ref:$REF" "ma-id:$MA_ID" "python-version:$PYTHON_VERSION"; do
+for _pair in "repo-owner:$REPO_OWNER" "ref:$REF" \
+             "monochrome-repo:$MONOCHROME_REPO" "monochrome-ref:$MONOCHROME_REF" \
+             "ma-id:$MA_ID" "python-version:$PYTHON_VERSION"; do
     _val="${_pair#*:}"
     case "$_val" in
         ""|*[!A-Za-z0-9._/-]*) die "invalid --${_pair%%:*} value '$_val' (allowed: letters digits . _ / -)" ;;
@@ -224,7 +234,7 @@ done
 log "Writing config.yaml"
 cat > "$ADDON_DIR/config.yaml" <<EOF
 name: "$ADDON_NAME"
-description: "Re-installs the ytmusic_free provider into Music Assistant after every container restart."
+description: "Keeps YouTube Music Free and Monochrome installed in Music Assistant."
 version: "$ADDON_VERSION"
 slug: $ADDON_SLUG
 init: false
@@ -239,9 +249,13 @@ arch:
 options:
   auto_update: false
   update_interval_hours: 24
+  monochrome_enabled: true
+  github_token: ""
 schema:
   auto_update: bool
   update_interval_hours: int(1,)
+  monochrome_enabled: bool
+  github_token: password
 EOF
 
 log "Writing translations/en.yaml"
@@ -249,19 +263,30 @@ mkdir -p "$ADDON_DIR/translations"
 cat > "$ADDON_DIR/translations/en.yaml" <<'EOF'
 configuration:
   auto_update:
-    name: Keep the ytmusic_free provider up to date
+    name: Keep providers up to date
     description: >-
-      Off by default. When enabled, periodically check GitHub for a newer
-      ytmusic_free provider and reinstall it (restarting Music Assistant) only
-      when the code actually changed. Note this downloads and runs branch-head
-      code inside Music Assistant unattended. This is NOT the add-on's own "Auto
-      update" control on the Info tab, which updates the watcher add-on itself;
-      this option updates the music provider inside Music Assistant.
+      Off by default. When enabled, periodically check GitHub for newer
+      ytmusic_free and Monochrome providers and reinstall them (restarting Music
+      Assistant once) only when code changed. Note this downloads and runs
+      branch-head code inside Music Assistant unattended. This is NOT the
+      add-on's own "Auto update" control on the Info tab, which updates the
+      watcher add-on itself; this option updates the music providers.
   update_interval_hours:
     name: Check the provider for updates every (hours)
     description: >-
       How often to check GitHub for a newer provider, in hours. 24 = once a
       day, 168 = weekly, 1 = hourly. Minimum 1 hour.
+  monochrome_enabled:
+    name: Install the Monochrome provider
+    description: >-
+      Keep the Monochrome provider installed and update it from its configured
+      private GitHub repository.
+  github_token:
+    name: GitHub personal access token
+    description: >-
+      Token used only to read the private Monochrome repository. The token is
+      never written to logs. A classic token may also carry read:packages for
+      private GHCR pulls, but this watcher only uses repository access.
 EOF
 
 log "Writing build.yaml"
@@ -298,15 +323,18 @@ cat > "$ADDON_DIR/watcher_lib.sh" <<'LIBEOF'
 #!/usr/bin/env bash
 # Helpers for the MA Provider Watcher. Source this, then call read_options.
 
-# read_options [options.json path] -> sets AUTO_UPDATE, UPDATE_INTERVAL_HOURS, UPDATE_INTERVAL.
+# read_options [options.json path] -> sets update and Monochrome configuration.
 # Boolean is parsed WITHOUT jq's `//` (which coerces an explicit false to the
 # default); auto-update is opt-in, so anything but an explicit true is false.
 read_options() {
     f="${1:-/data/options.json}"
     AUTO_UPDATE="false"; UPDATE_INTERVAL_HOURS=24
+    MONOCHROME_ENABLED="true"; GITHUB_TOKEN=""
     if [ -r "$f" ]; then
         AUTO_UPDATE="$(jq -r 'if .auto_update == true then "true" else "false" end' "$f" 2>/dev/null || echo false)"
         UPDATE_INTERVAL_HOURS="$(jq -r 'if (.update_interval_hours|type)=="number" then (.update_interval_hours|floor) else 24 end' "$f" 2>/dev/null || echo 24)"
+        MONOCHROME_ENABLED="$(jq -r 'if .monochrome_enabled == false then "false" else "true" end' "$f" 2>/dev/null || echo true)"
+        GITHUB_TOKEN="$(jq -r 'if (.github_token|type)=="string" then .github_token else "" end' "$f" 2>/dev/null || true)"
     fi
     case "$UPDATE_INTERVAL_HOURS" in ''|*[!0-9-]*) UPDATE_INTERVAL_HOURS=24 ;; esac   # non-integer -> default
     [ "$UPDATE_INTERVAL_HOURS" -lt 1 ] 2>/dev/null && UPDATE_INTERVAL_HOURS=1          # 0/negative -> 1
@@ -320,32 +348,72 @@ read_options() {
 # add-on rebuilds.
 provider_src() { if [ "${AUTO_UPDATE:-false}" = "true" ] && [ -d "$CACHE" ]; then printf '%s' "$CACHE"; else printf '%s' "$BUNDLED"; fi; }
 
+# Monochrome is sourced from its persistent private-repository cache. There is
+# intentionally no baked copy: the watcher fork remains public and never
+# contains Monochrome source or credentials.
+monochrome_src() {
+    if [ "${MONOCHROME_ENABLED:-true}" = "true" ] && [ -d "$MONOCHROME_CACHE" ]; then
+        printf '%s' "$MONOCHROME_CACHE"
+    fi
+}
+
+# Fetch one provider directory from an archive into an atomic persistent cache.
+# Arguments: provider_dir archive_url cache_dir hash_file token log_label
+# Return: 0 = updated, 2 = unchanged, 1 = fetch/parse failed.
+fetch_provider() {
+    provider_dir="$1"; archive_url="$2"; cache_dir="$3"
+    hash_file="$4"; token="$5"; log_label="$6"
+    tmp="$(mktemp -d 2>/dev/null || mktemp -d -t maw)" || return 1
+    curl_args=(-fsSL --connect-timeout 10 --max-time 120)
+    if [ -n "$token" ]; then
+        curl_args+=(-H "Authorization: Bearer ${token}" -H "Accept: application/vnd.github+json")
+    fi
+    if ! curl "${curl_args[@]}" "$archive_url" -o "$tmp/p.tgz" 2>/dev/null; then
+        echo "$log_label update: download failed"
+        rm -rf "$tmp"
+        return 1
+    fi
+    if ! tar -xzf "$tmp/p.tgz" -C "$tmp" 2>/dev/null; then
+        echo "$log_label update: extract failed"
+        rm -rf "$tmp"
+        return 1
+    fi
+    nd="$(find "$tmp" -maxdepth 4 -type d -name "$provider_dir" 2>/dev/null | head -n1)"
+    if [ -z "$nd" ]; then
+        echo "$log_label update: $provider_dir not found in tarball"
+        rm -rf "$tmp"
+        return 1
+    fi
+    nh="$( (cd "$nd" && find . -type f -exec sha256sum {} \; 2>/dev/null | sort) | sha256sum | awk '{print $1}')"
+    oh="$(cat "$hash_file" 2>/dev/null || echo none)"
+    if [ "$nh" = "$oh" ] && [ -d "$cache_dir" ]; then
+        rm -rf "$tmp"
+        return 2
+    fi
+    rm -rf "$cache_dir.new"
+    mkdir -p "$cache_dir.new" && cp -a "$nd/." "$cache_dir.new/" \
+        || { rm -rf "$tmp" "$cache_dir.new"; return 1; }
+    rm -rf "$cache_dir" && mv "$cache_dir.new" "$cache_dir" \
+        || { rm -rf "$tmp"; return 1; }
+    printf '%s\n' "$nh" > "$hash_file"
+    echo "$log_label update: cached new provider ($nh)"
+    rm -rf "$tmp"
+    return 0
+}
+
 # Fetch the latest provider from GitHub into $CACHE.
 # Return: 0 = updated (changed), 2 = unchanged, 1 = fetch/parse failed.
 fetch_latest() {
-    tmp="$(mktemp -d 2>/dev/null || mktemp -d -t maw)" || return 1
-    if ! curl -fsSL --connect-timeout 10 --max-time 120 "$TARBALL_URL" -o "$tmp/p.tgz" 2>/dev/null; then
-        echo "auto-update: download failed"; rm -rf "$tmp"; return 1
+    fetch_provider ytmusic_free "$TARBALL_URL" "$CACHE" "$HASHFILE" "" "ytmusic_free"
+}
+
+fetch_monochrome() {
+    if [ -z "${GITHUB_TOKEN:-}" ]; then
+        echo "monochrome update: GitHub token is missing"
+        return 1
     fi
-    if ! tar -xzf "$tmp/p.tgz" -C "$tmp" 2>/dev/null; then
-        echo "auto-update: extract failed"; rm -rf "$tmp"; return 1
-    fi
-    nd="$(find "$tmp" -maxdepth 3 -type d -name ytmusic_free 2>/dev/null | head -n1)"
-    if [ -z "$nd" ]; then
-        echo "auto-update: ytmusic_free not found in tarball"; rm -rf "$tmp"; return 1
-    fi
-    # hash file contents by RELATIVE path (cd into $nd) so a random tmp dir name
-    # doesn't change the digest -> stable across fetches of identical code
-    nh="$( (cd "$nd" && find . -type f -exec sha256sum {} \; 2>/dev/null | sort) | sha256sum | awk '{print $1}')"
-    oh="$(cat "$HASHFILE" 2>/dev/null || echo none)"
-    if [ "$nh" = "$oh" ] && [ -d "$CACHE" ]; then rm -rf "$tmp"; return 2; fi
-    # stage-and-swap so a failed copy never wipes a good cache
-    rm -rf "$CACHE.new"
-    mkdir -p "$CACHE.new" && cp -a "$nd/." "$CACHE.new/" || { rm -rf "$tmp" "$CACHE.new"; return 1; }
-    rm -rf "$CACHE" && mv "$CACHE.new" "$CACHE" || { rm -rf "$tmp"; return 1; }
-    printf '%s\n' "$nh" > "$HASHFILE"
-    echo "auto-update: cached new provider ($nh)"
-    rm -rf "$tmp"; return 0
+    fetch_provider monochrome "$MONOCHROME_TARBALL_URL" "$MONOCHROME_CACHE" \
+        "$MONOCHROME_HASHFILE" "$GITHUB_TOKEN" "monochrome"
 }
 LIBEOF
 
@@ -357,10 +425,13 @@ MA="$MA_ID"
 BUNDLED="/provider/ytmusic_free"
 CACHE="/data/ytmusic_free"
 HASHFILE="/data/ytmusic_free.sha256"
+MONOCHROME_CACHE="/data/monochrome"
+MONOCHROME_HASHFILE="/data/monochrome.sha256"
 DST="/app/venv/lib/$PYTHON_VERSION/site-packages/music_assistant/providers"
 # Where auto-update pulls the latest provider from. Baked from the installer's
 # --repo-owner/--ref so a fork self-updates from its own source.
 TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REF"
+MONOCHROME_TARBALL_URL="https://api.github.com/repos/$MONOCHROME_REPO/tarball/$MONOCHROME_REF"
 # How long to wait for the configured MA container to appear before logging a
 # loud ERROR. Catches the case where the installer's auto-detect fallback
 # baked in a container name that does not exist on this host (issue #11).
@@ -383,18 +454,40 @@ echo "[\$(date)] Docker OK"
 
 log() { echo "[\$(date)] \$*"; }
 
-# provider_src() and fetch_latest() come from /watcher_lib.sh (sourced above).
+# Provider source and fetch helpers come from /watcher_lib.sh (sourced above).
 
-install_provider() {
-    src="\$(provider_src)"
-    echo "[\$(date)] Installing ytmusic_free provider from \$src ..."
-    sleep 3
+copy_provider() {
+    provider_name="\$1"
+    src="\$2"
+    echo "[\$(date)] Installing \$provider_name provider from \$src ..."
     # Clear any stale in-place copy so docker cp is a clean replace, not a merge:
     # files deleted upstream would otherwise linger across periodic auto-updates
     # (docker restart keeps the container filesystem). Mirrors install_provider.sh.
-    docker exec "\$MA" rm -rf "\$DST/ytmusic_free" 2>/dev/null || true
-    docker cp "\$src" "\$MA:\$DST/" && echo "[\$(date)] Copied OK" || { echo "[\$(date)] ERROR: cp failed"; return 1; }
-    docker restart "\$MA" && echo "[\$(date)] MA restarted" || echo "[\$(date)] ERROR: restart failed"
+    docker exec "\$MA" rm -rf "\$DST/\$provider_name" 2>/dev/null || true
+    docker cp "\$src" "\$MA:\$DST/" \
+        && echo "[\$(date)] Copied \$provider_name OK" \
+        || { echo "[\$(date)] ERROR: \$provider_name copy failed"; return 1; }
+}
+
+install_providers() {
+    sleep 3
+    failed=0
+    copy_provider ytmusic_free "\$(provider_src)" || failed=1
+    if [ "\$MONOCHROME_ENABLED" = "true" ]; then
+        mono_src="\$(monochrome_src)"
+        if [ -n "\$mono_src" ]; then
+            copy_provider monochrome "\$mono_src" || failed=1
+        else
+            log "WARNING: Monochrome is enabled but no cached provider is available."
+        fi
+    fi
+    if [ "\$failed" -ne 0 ]; then
+        log "ERROR: one or more provider copies failed; MA was not restarted."
+        return 1
+    fi
+    docker restart "\$MA" >/dev/null \
+        && echo "[\$(date)] MA restarted" \
+        || { echo "[\$(date)] ERROR: restart failed"; return 1; }
 }
 
 warn_if_ma_misconfigured() {
@@ -415,17 +508,28 @@ warn_if_ma_misconfigured() {
 
 # Prime the cache with the latest provider before the first inject (opt-in).
 if [ "\$AUTO_UPDATE" = "true" ]; then
-    log "auto-update enabled (checking every \${UPDATE_INTERVAL_HOURS}h); fetching latest..."
+    log "auto-update enabled (checking every \${UPDATE_INTERVAL_HOURS}h); fetching latest providers..."
     fetch_latest || true
 else
     log "auto-update disabled; using the bundled provider copy."
 fi
-log "provider source: \$(provider_src)"
+if [ "\$MONOCHROME_ENABLED" = "true" ]; then
+    # A first-time install always needs to populate Monochrome's private cache.
+    # With auto-update disabled, an existing cache is deliberately left pinned.
+    if [ "\$AUTO_UPDATE" = "true" ] || [ ! -d "\$MONOCHROME_CACHE" ]; then
+        fetch_monochrome || true
+    fi
+fi
+log "ytmusic_free source: \$(provider_src)"
+if [ "\$MONOCHROME_ENABLED" = "true" ]; then
+    mono_src="\$(monochrome_src)"
+    if [ -n "\$mono_src" ]; then log "monochrome source: \$mono_src"; fi
+fi
 
 LAST_ID=\$(docker ps -q --no-trunc --filter name="\$MA" 2>/dev/null)
 if [ -n "\$LAST_ID" ]; then
-    echo "[\$(date)] MA running (\${LAST_ID:0:12}), installing provider..."
-    install_provider
+    echo "[\$(date)] MA running (\${LAST_ID:0:12}), installing providers..."
+    install_providers
 else
     echo "[\$(date)] MA not running, waiting..."
 fi
@@ -439,9 +543,9 @@ while true; do
     sleep 10
     CUR_ID=\$(docker ps -q --no-trunc --filter name="\$MA" 2>/dev/null)
     if [ -n "\$CUR_ID" ] && [ "\$CUR_ID" != "\$LAST_ID" ]; then
-        echo "[\$(date)] New MA container (\${CUR_ID:0:12}), reinstalling..."
+        echo "[\$(date)] New MA container (\${CUR_ID:0:12}), reinstalling providers..."
         LAST_ID="\$CUR_ID"
-        install_provider
+        install_providers
         MISSING_SINCE=0
         MISSING_WARNED=0
     elif [ -z "\$CUR_ID" ] && [ -n "\$LAST_ID" ]; then
@@ -454,15 +558,21 @@ while true; do
             MISSING_WARNED=1
         fi
     fi
-    # Periodic auto-update: fetch latest; reinject + restart MA only on change.
+    # Periodic auto-update: fetch both providers, then reinject and restart MA
+    # once when either provider changed.
     if [ "\$AUTO_UPDATE" = "true" ]; then
         now=\$(date +%s)
         if [ \$((now - LAST_UPDATE)) -ge "\$UPDATE_INTERVAL" ]; then
             LAST_UPDATE=\$now
-            if fetch_latest; then
-                log "auto-update: new provider version detected -> reinstalling"
+            providers_changed=0
+            if fetch_latest; then providers_changed=1; fi
+            if [ "\$MONOCHROME_ENABLED" = "true" ]; then
+                if fetch_monochrome; then providers_changed=1; fi
+            fi
+            if [ "\$providers_changed" -eq 1 ]; then
+                log "auto-update: provider change detected -> reinstalling"
                 CUR_ID=\$(docker ps -q --no-trunc --filter name="\$MA" 2>/dev/null)
-                if [ -n "\$CUR_ID" ]; then LAST_ID="\$CUR_ID"; install_provider; fi
+                if [ -n "\$CUR_ID" ]; then LAST_ID="\$CUR_ID"; install_providers; fi
             fi
         fi
     fi

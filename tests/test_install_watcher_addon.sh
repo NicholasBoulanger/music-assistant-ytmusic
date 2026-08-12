@@ -140,6 +140,8 @@ assert_eq "--help exits 0" "0" "$help_rc"
 assert_contains "--help prints Usage:" "Usage:" "$help_out"
 assert_contains "--help mentions --force" "--force" "$help_out"
 assert_contains "--help mentions --ref" "--ref" "$help_out"
+assert_contains "--help mentions --monochrome-repo" "--monochrome-repo" "$help_out"
+assert_contains "--help mentions --monochrome-ref" "--monochrome-ref" "$help_out"
 assert_contains "--help mentions --ma-id" "--ma-id" "$help_out"
 assert_contains "--help mentions --python-version" "--python-version" "$help_out"
 
@@ -224,6 +226,8 @@ if [ "$network_ok" = "1" ]; then
     assert_contains "config.yaml has slug"      "slug: ma_provider_watcher" "$config"
     assert_contains "config.yaml has docker_api" "docker_api: true"          "$config"
     assert_contains "config.yaml has boot auto"  "boot: auto"                "$config"
+    assert_contains "config.yaml enables Monochrome" "monochrome_enabled: true" "$config"
+    assert_contains "config.yaml masks the GitHub token" "github_token: password" "$config"
     # Version must be build-stamped (1.0.<timestamp>), not the static "1.0.0",
     # so HA detects a change and rebuilds the cached image on re-run (issue #22).
     assert_contains "config.yaml version is build-stamped" 'version: "1.0.2' "$config"
@@ -240,6 +244,10 @@ if [ "$network_ok" = "1" ]; then
     assert_contains "run.sh has misconfig diagnostic function" "warn_if_ma_misconfigured" "$runsh"
     assert_contains "run.sh references MISSING_GRACE_SECONDS" "MISSING_GRACE_SECONDS" "$runsh"
     assert_contains "run.sh diagnostic mentions --ma-id remedy" "--ma-id" "$runsh"
+    assert_contains "run.sh follows the configured private repository" \
+        'MONOCHROME_TARBALL_URL="https://api.github.com/repos/NicholasBoulanger/music-assistant-monochrome/tarball/main"' "$runsh"
+    assert_contains "run.sh installs Monochrome" 'copy_provider monochrome' "$runsh"
+    assert_contains "run.sh restarts MA through the combined installer" 'install_providers' "$runsh"
 
     if bash -n "$ADDON/run.sh" 2>/dev/null; then
         pass "generated run.sh passes bash -n"

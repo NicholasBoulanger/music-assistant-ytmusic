@@ -136,6 +136,12 @@ Each instance authenticates on its own and syncs only the account its own cookie
 
 ### Keeping the provider across HA restarts
 
+> **Monochrome fork:** this fork also downloads and installs the private Monochrome provider. Install the forked watcher with:
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/NicholasBoulanger/music-assistant-ytmusic/main/scripts/install_watcher_addon.sh | sh -s -- --force
+> ```
+> Then open **MA Provider Watcher → Configuration**, paste a PAT with read access to `NicholasBoulanger/music-assistant-monochrome` into `github_token`, save, and restart the watcher. Enable `auto_update` to follow both providers continuously. The PAT is held in the add-on options and is never committed or logged.
+
 If you restart HA (not just MA), the container is recreated and the provider files are lost. The recommended fix is the **MA Provider Watcher** local add-on, which re-copies the provider whenever the MA container is recreated. One-line install from a host shell:
 
 ```bash
