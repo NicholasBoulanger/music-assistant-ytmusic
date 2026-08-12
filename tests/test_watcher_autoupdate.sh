@@ -57,17 +57,23 @@ fi
 # these assertions rather than emit misleading failures (mirrors the sha256sum
 # shim above; the alpine CI job installs jq so it exercises them for real).
 if command -v jq >/dev/null 2>&1; then
-    opt(){ printf '%s' "$1" > "$TMP_ADDONS/o.json"; ( . "$LIB"; read_options "$TMP_ADDONS/o.json"; printf '%s|%s|%s|%s' "$AUTO_UPDATE" "$UPDATE_INTERVAL_HOURS" "$MONOCHROME_ENABLED" "$GITHUB_TOKEN" ); }
-    assert_eq "auto_update:false yields AUTO_UPDATE=false (the blocker)" "false|24|true|" "$(opt '{"auto_update":false}')"
-    assert_eq "auto_update:true yields true"                              "true|24|true|"  "$(opt '{"auto_update":true}')"
-    assert_eq "missing auto_update yields false (opt-in default)"         "false|24|true|" "$(opt '{}')"
-    assert_eq "interval 0 clamps to 1"        "true|1|true|"   "$(opt '{"auto_update":true,"update_interval_hours":0}')"
-    assert_eq "interval negative clamps to 1" "true|1|true|"   "$(opt '{"auto_update":true,"update_interval_hours":-5}')"
-    assert_eq "interval non-numeric -> 24"    "true|24|true|"  "$(opt '{"auto_update":true,"update_interval_hours":"x"}')"
-    assert_eq "interval null -> 24"           "true|24|true|"  "$(opt '{"auto_update":true,"update_interval_hours":null}')"
-    assert_eq "interval 168 kept"             "true|168|true|" "$(opt '{"auto_update":true,"update_interval_hours":168}')"
+    opt(){ printf '%s' "$1" > "$TMP_ADDONS/o.json"; ( . "$LIB"; read_options "$TMP_ADDONS/o.json"; printf '%s|%s|%s|%s|%s' "$YTMUSIC_AUTO_UPDATE" "$MONOCHROME_AUTO_UPDATE" "$UPDATE_INTERVAL_HOURS" "$MONOCHROME_ENABLED" "$GITHUB_TOKEN" ); }
+    assert_eq "both provider updates default off" "false|false|24|true|" "$(opt '{}')"
+    assert_eq "YouTube update can be enabled independently" \
+        "true|false|24|true|" "$(opt '{"ytmusic_auto_update":true,"monochrome_auto_update":false}')"
+    assert_eq "Monochrome update can be enabled independently" \
+        "false|true|24|true|" "$(opt '{"ytmusic_auto_update":false,"monochrome_auto_update":true}')"
+    assert_eq "legacy auto_update:true migrates both providers to on" \
+        "true|true|24|true|" "$(opt '{"auto_update":true}')"
+    assert_eq "new explicit false overrides legacy true" \
+        "false|true|24|true|" "$(opt '{"auto_update":true,"ytmusic_auto_update":false}')"
+    assert_eq "interval 0 clamps to 1"        "true|true|1|true|"   "$(opt '{"auto_update":true,"update_interval_hours":0}')"
+    assert_eq "interval negative clamps to 1" "true|true|1|true|"   "$(opt '{"auto_update":true,"update_interval_hours":-5}')"
+    assert_eq "interval non-numeric -> 24"    "true|true|24|true|"  "$(opt '{"auto_update":true,"update_interval_hours":"x"}')"
+    assert_eq "interval null -> 24"           "true|true|24|true|"  "$(opt '{"auto_update":true,"update_interval_hours":null}')"
+    assert_eq "interval 168 kept"             "true|true|168|true|" "$(opt '{"auto_update":true,"update_interval_hours":168}')"
     assert_eq "Monochrome settings parse token and explicit false" \
-        "false|24|false|test-token" \
+        "false|false|24|false|test-token" \
         "$(opt '{"monochrome_enabled":false,"github_token":"test-token"}')"
 else
     skip "jq not installed -- read_options assertions skipped"
@@ -77,7 +83,7 @@ fi
 W="$(mktemp -d)"
 result="$(
     . "$LIB"
-    AUTO_UPDATE=true
+    YTMUSIC_AUTO_UPDATE=true
     CACHE="$W/cache"; BUNDLED="$W/bundled"; HASHFILE="$W/hash"
     mkdir -p "$BUNDLED"; echo bundled > "$BUNDLED/x"
     src1="$(provider_src)"                                   # no cache -> bundled
@@ -87,7 +93,7 @@ result="$(
     fetch_latest >/dev/null 2>&1; r1=$?                      # new -> 0
     src2="$(provider_src)"                                   # auto-update on + cache -> cache
     # Opting OUT must revert to the bundled copy even with a cache present.
-    AUTO_UPDATE=false; src_off="$(provider_src)"; AUTO_UPDATE=true
+    YTMUSIC_AUTO_UPDATE=false; src_off="$(provider_src)"; YTMUSIC_AUTO_UPDATE=true
     fetch_latest >/dev/null 2>&1; r2=$?                      # unchanged -> 2
     echo v2 > "$W/ytmusic_free/__init__.py"; ( cd "$W" && tar -czf pkg.tgz ytmusic_free )
     fetch_latest >/dev/null 2>&1; r3=$?                      # changed -> 0

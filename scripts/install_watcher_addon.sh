@@ -248,12 +248,14 @@ arch:
   - armv7
   - i386
 options:
-  auto_update: false
+  ytmusic_auto_update: false
+  monochrome_auto_update: false
   update_interval_hours: 24
   monochrome_enabled: true
   github_token: ""
 schema:
-  auto_update: bool
+  ytmusic_auto_update: bool
+  monochrome_auto_update: bool
   update_interval_hours: int(1,)
   monochrome_enabled: bool
   github_token: password
@@ -263,15 +265,16 @@ log "Writing translations/en.yaml"
 mkdir -p "$ADDON_DIR/translations"
 cat > "$ADDON_DIR/translations/en.yaml" <<'EOF'
 configuration:
-  auto_update:
-    name: Keep providers up to date
+  ytmusic_auto_update:
+    name: Auto-update YouTube Music Free
     description: >-
-      Off by default. When enabled, periodically check GitHub for newer
-      ytmusic_free and Monochrome providers and reinstall them (restarting Music
-      Assistant once) only when code changed. Note this downloads and runs
-      branch-head code inside Music Assistant unattended. This is NOT the
-      add-on's own "Auto update" control on the Info tab, which updates the
-      watcher add-on itself; this option updates the music providers.
+      Periodically check the public upstream repository for a newer
+      ytmusic_free provider. Off pins the copy bundled into this watcher image.
+  monochrome_auto_update:
+    name: Auto-update Monochrome
+    description: >-
+      Periodically check the private Monochrome repository using the configured
+      GitHub token. Off pins the last successfully cached Monochrome copy.
   update_interval_hours:
     name: Check the provider for updates every (hours)
     description: >-
@@ -325,14 +328,17 @@ cat > "$ADDON_DIR/watcher_lib.sh" <<'LIBEOF'
 # Helpers for the MA Provider Watcher. Source this, then call read_options.
 
 # read_options [options.json path] -> sets update and Monochrome configuration.
-# Boolean is parsed WITHOUT jq's `//` (which coerces an explicit false to the
-# default); auto-update is opt-in, so anything but an explicit true is false.
+# Booleans are parsed WITHOUT jq's `//` (which coerces an explicit false to the
+# default). The old combined auto_update key is honored only when a new per-
+# provider key is absent, making upgrades backward compatible.
 read_options() {
     f="${1:-/data/options.json}"
-    AUTO_UPDATE="false"; UPDATE_INTERVAL_HOURS=24
+    YTMUSIC_AUTO_UPDATE="false"; MONOCHROME_AUTO_UPDATE="false"
+    UPDATE_INTERVAL_HOURS=24
     MONOCHROME_ENABLED="true"; GITHUB_TOKEN=""
     if [ -r "$f" ]; then
-        AUTO_UPDATE="$(jq -r 'if .auto_update == true then "true" else "false" end' "$f" 2>/dev/null || echo false)"
+        YTMUSIC_AUTO_UPDATE="$(jq -r 'if has("ytmusic_auto_update") then (if .ytmusic_auto_update == true then "true" else "false" end) elif .auto_update == true then "true" else "false" end' "$f" 2>/dev/null || echo false)"
+        MONOCHROME_AUTO_UPDATE="$(jq -r 'if has("monochrome_auto_update") then (if .monochrome_auto_update == true then "true" else "false" end) elif .auto_update == true then "true" else "false" end' "$f" 2>/dev/null || echo false)"
         UPDATE_INTERVAL_HOURS="$(jq -r 'if (.update_interval_hours|type)=="number" then (.update_interval_hours|floor) else 24 end' "$f" 2>/dev/null || echo 24)"
         MONOCHROME_ENABLED="$(jq -r 'if .monochrome_enabled == false then "false" else "true" end' "$f" 2>/dev/null || echo true)"
         GITHUB_TOKEN="$(jq -r 'if (.github_token|type)=="string" then .github_token else "" end' "$f" 2>/dev/null || true)"
@@ -347,7 +353,7 @@ read_options() {
 # auto-update reverts to the bundled copy (the cache is kept for re-enabling), so
 # opting out actually stops running fetched branch-head code. /data survives
 # add-on rebuilds.
-provider_src() { if [ "${AUTO_UPDATE:-false}" = "true" ] && [ -d "$CACHE" ]; then printf '%s' "$CACHE"; else printf '%s' "$BUNDLED"; fi; }
+provider_src() { if [ "${YTMUSIC_AUTO_UPDATE:-false}" = "true" ] && [ -d "$CACHE" ]; then printf '%s' "$CACHE"; else printf '%s' "$BUNDLED"; fi; }
 
 # Monochrome is sourced from its persistent private-repository cache. There is
 # intentionally no baked copy: the watcher fork remains public and never
@@ -508,16 +514,16 @@ warn_if_ma_misconfigured() {
 }
 
 # Prime the cache with the latest provider before the first inject (opt-in).
-if [ "\$AUTO_UPDATE" = "true" ]; then
-    log "auto-update enabled (checking every \${UPDATE_INTERVAL_HOURS}h); fetching latest providers..."
+if [ "\$YTMUSIC_AUTO_UPDATE" = "true" ]; then
+    log "ytmusic_free auto-update enabled (checking every \${UPDATE_INTERVAL_HOURS}h); fetching latest..."
     fetch_latest || true
 else
-    log "auto-update disabled; using the bundled provider copy."
+    log "ytmusic_free auto-update disabled; using the bundled provider copy."
 fi
 if [ "\$MONOCHROME_ENABLED" = "true" ]; then
     # A first-time install always needs to populate Monochrome's private cache.
-    # With auto-update disabled, an existing cache is deliberately left pinned.
-    if [ "\$AUTO_UPDATE" = "true" ] || [ ! -d "\$MONOCHROME_CACHE" ]; then
+    # With its auto-update disabled, an existing cache is deliberately pinned.
+    if [ "\$MONOCHROME_AUTO_UPDATE" = "true" ] || [ ! -d "\$MONOCHROME_CACHE" ]; then
         fetch_monochrome || true
     fi
 fi
@@ -561,13 +567,16 @@ while true; do
     fi
     # Periodic auto-update: fetch both providers, then reinject and restart MA
     # once when either provider changed.
-    if [ "\$AUTO_UPDATE" = "true" ]; then
+    if [ "\$YTMUSIC_AUTO_UPDATE" = "true" ] || \
+       { [ "\$MONOCHROME_ENABLED" = "true" ] && [ "\$MONOCHROME_AUTO_UPDATE" = "true" ]; }; then
         now=\$(date +%s)
         if [ \$((now - LAST_UPDATE)) -ge "\$UPDATE_INTERVAL" ]; then
             LAST_UPDATE=\$now
             providers_changed=0
-            if fetch_latest; then providers_changed=1; fi
-            if [ "\$MONOCHROME_ENABLED" = "true" ]; then
+            if [ "\$YTMUSIC_AUTO_UPDATE" = "true" ]; then
+                if fetch_latest; then providers_changed=1; fi
+            fi
+            if [ "\$MONOCHROME_ENABLED" = "true" ] && [ "\$MONOCHROME_AUTO_UPDATE" = "true" ]; then
                 if fetch_monochrome; then providers_changed=1; fi
             fi
             if [ "\$providers_changed" -eq 1 ]; then

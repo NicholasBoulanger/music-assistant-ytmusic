@@ -140,7 +140,7 @@ Each instance authenticates on its own and syncs only the account its own cookie
 > ```bash
 > curl -fsSL https://raw.githubusercontent.com/NicholasBoulanger/music-assistant-ytmusic/main/scripts/install_watcher_addon.sh | sh -s -- --force
 > ```
-> Then open **MA Provider Watcher → Configuration**, paste a PAT with read access to `NicholasBoulanger/music-assistant-monochrome` into `github_token`, save, and restart the watcher. Enable `auto_update` to follow both providers continuously. The PAT is held in the add-on options and is never committed or logged.
+> Then open **MA Provider Watcher → Configuration**, paste a PAT with read access to `NicholasBoulanger/music-assistant-monochrome` into `github_token`, save, and restart the watcher. Enable `ytmusic_auto_update` and/or `monochrome_auto_update` as desired. The PAT is held in the app options and is never committed or logged.
 
 If you restart HA (not just MA), the container is recreated and the provider files are lost. The recommended fix is the **MA Provider Watcher** local add-on, which re-copies the provider whenever the MA container is recreated. One-line install from a host shell:
 
@@ -164,7 +164,14 @@ The installer auto-detects the local add-ons folder across the common layouts: t
 > ```
 > Inside the SSH/Samba add-on use `--addons-dir /addons`. After re-running, **Rebuild** the add-on (three-dot menu) so the new files are baked into its image, then **Start** it.
 
-The watcher can also **keep the provider up to date automatically**. Enable the `auto_update` option in the add-on's Configuration tab (opt-in, off by default) and it periodically checks GitHub and reinstalls the provider only when the code actually changed, so you don't have to re-run the installer on every upstream change. Turning it back off pins to the version baked into the add-on image. See [Auto-update](WATCHER_ADDON.md#auto-update) for the options and details.
+The watcher can also **keep each provider up to date independently**. The Configuration tab has separate `ytmusic_auto_update` and `monochrome_auto_update` controls (both opt-in and off by default). It reinstalls providers only when code actually changed and restarts MA once per update cycle. See [Auto-update](WATCHER_ADDON.md#auto-update) for details.
+
+> **HAOS local-app refresh:** the curl installer replaces files under `/addons/ma_provider_watcher`, but an already-installed app can keep its old image and cached Configuration schema. After running curl, use **Settings → Apps → App store → ⋮ → Check for updates**, then **Update** (or Rebuild). If the new fields still do not appear, reload Supervisor's app metadata and update the local app:
+> ```bash
+> curl -fsS -X POST -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" http://supervisor/store/reload
+> ha apps update local_ma_provider_watcher
+> ```
+> A live container can be checked with `docker exec app_local_ma_provider_watcher grep -n fetch_monochrome /watcher_lib.sh`.
 
 See **[WATCHER_ADDON.md](WATCHER_ADDON.md)** for the manual procedure, troubleshooting, and the available installer flags.
 

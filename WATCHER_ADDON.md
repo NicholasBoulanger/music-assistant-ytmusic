@@ -10,7 +10,7 @@ The add-on polls the MA container ID every 10 seconds. When the Supervisor recre
 
 The public `ytmusic_free` files are baked into the watcher image. Private Monochrome files are downloaded with the configured GitHub token and kept in the add-on's persistent `/data` directory. The token and private source are never baked into this public watcher repository or image.
 
-Optionally, the watcher can also keep the provider **up to date**: enable `auto_update` (opt-in, off by default) and it periodically fetches the latest provider from GitHub, then reinstalls + restarts MA **only when the code actually changed** (SHA-256 comparison). See [Auto-update](#auto-update) below.
+Optionally, the watcher can keep either provider **up to date** using separate `ytmusic_auto_update` and `monochrome_auto_update` controls. It reinstalls and restarts MA **only when code actually changed** (SHA-256 comparison). See [Auto-update](#auto-update) below.
 
 ---
 
@@ -49,12 +49,14 @@ arch:
   - armv7
   - i386
 options:
-  auto_update: false
+  ytmusic_auto_update: false
+  monochrome_auto_update: false
   update_interval_hours: 24
   monochrome_enabled: true
   github_token: ""
 schema:
-  auto_update: bool
+  ytmusic_auto_update: bool
+  monochrome_auto_update: bool
   update_interval_hours: int(1,)
   monochrome_enabled: bool
   github_token: password
@@ -65,12 +67,14 @@ The `options`/`schema` block exposes the [Auto-update](#auto-update) settings in
 ```yaml
 # translations/en.yaml
 configuration:
-  auto_update:
-    name: Keep providers up to date
+  ytmusic_auto_update:
+    name: Auto-update YouTube Music Free
     description: >-
-      Off by default. When enabled, periodically check GitHub for newer
-      ytmusic_free and Monochrome providers and reinstall them only when code
-      changed.
+      Check the public upstream repository for a newer ytmusic_free provider.
+  monochrome_auto_update:
+    name: Auto-update Monochrome
+    description: >-
+      Check the private Monochrome repository using the configured GitHub token.
   update_interval_hours:
     name: Check the provider for updates every (hours)
     description: >-
@@ -170,7 +174,7 @@ done
 > **Note:** The `python3.13` in `DST=` tracks MA's Python version, which changes over time (recent Music Assistant builds use `python3.14`). The installer auto-detects it; if you edit `run.sh` by hand, set it to match.
 > Check with: `docker exec addon_d5369777_music_assistant ls /app/venv/lib/`
 
-> **Note:** The `run.sh` above is the minimal core (re-inject after container recreation). The `run.sh` that the installer generates additionally implements [Auto-update](#auto-update): it reads all four Configuration options from `/data/options.json`, fetches the enabled providers into `/data` caches, and reinstalls only when a SHA-256 changes.
+> **Note:** The `run.sh` above is the minimal core (re-inject after container recreation). The `run.sh` that the installer generates additionally implements [Auto-update](#auto-update): it reads the Configuration options from `/data/options.json`, fetches only the providers whose update controls are enabled, and reinstalls only when a SHA-256 changes.
 
 ---
 
@@ -186,7 +190,7 @@ The script is POSIX `sh` (works on HAOS BusyBox `ash`), uses `curl + tar` instea
 
 > **Re-running the installer? Rebuild the add-on.** The provider files and `run.sh` are baked into the add-on image at build time. If the add-on is already installed and you re-run the script (for example to fix `--python-version` or `--ma-id`), Home Assistant keeps the cached image until you rebuild it: open the add-on → three-dot menu → **Rebuild**, then **Start**. The installer stamps a fresh version on every run so "Check for updates" flags the change, but a cached image is only replaced by a rebuild.
 >
-> **Getting the new options after an upgrade from a version without them:** the Supervisor caches a local add-on's config schema at install time. If you had an older watcher installed, a Rebuild alone may not surface `auto_update`, `update_interval_hours`, `monochrome_enabled`, and `github_token`; the schema is only re-read on an **update**. Do **Check for updates**, then **Update** the add-on (three-dot menu). A fresh install shows them immediately.
+> **Getting new options after an upgrade:** Supervisor caches an installed local app's schema separately from its running image. After running the installer, do **Settings → Apps → App store → Check for updates**, then **Update** the watcher; Rebuild alone may run new code while still showing old fields. If needed, call `POST /store/reload` as shown in [Troubleshooting](#troubleshooting), then run `ha apps update local_ma_provider_watcher`.
 
 Common flags:
 - `--force`: overwrite an existing install without prompting
@@ -294,7 +298,8 @@ Set these in the add-on's **Configuration** tab (or `options` in `config.yaml`):
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `auto_update` | bool | `false` | Off by default (opt-in). When on, the watcher periodically checks GitHub for a newer provider and reinstalls it. Note it then runs branch-head code inside MA unattended. Leave off to pin to the version baked into the image. |
+| `ytmusic_auto_update` | bool | `false` | Independently follows the public `ytmusic_free` branch. Off uses the provider copy baked into the watcher image. |
+| `monochrome_auto_update` | bool | `false` | Independently follows the private Monochrome branch. Off pins the last successfully cached copy. |
 | `update_interval_hours` | int (hours) | `24` | How often to check. `24` = daily, `168` = weekly, `1` = hourly. Clamped to a minimum of `1` at runtime; invalid values fall back to the default. |
 | `monochrome_enabled` | bool | `true` | Downloads, installs, and watches the private Monochrome provider. |
 | `github_token` | password | empty | PAT used to read the private Monochrome repository. It is masked in the UI and never logged. A classic PAT needs the `repo` scope; a fine-grained PAT needs Contents read access to that repository. |
@@ -304,7 +309,7 @@ You can change the sources when running the installer with `--ref`, `--monochrom
 ### How it works
 
 1. On first startup, the watcher uses the PAT to populate `/data/monochrome` from the private repository. The public `ytmusic_free` copy is already baked into the image.
-2. With `auto_update` enabled, it checks both repositories every `update_interval_hours` and compares the SHA-256 of each provider with its persistent cache.
+2. Each enabled auto-update control checks only its corresponding repository every `update_interval_hours` and compares the provider SHA-256 with its persistent cache.
 3. **Only if either provider changed**, it copies both current providers into the MA container and restarts MA once. Unchanged checks are a no-op.
 4. If a fetch fails, the watcher logs a warning and keeps the last cached copy. A first-time Monochrome fetch without a valid PAT cannot install Monochrome, but it does not prevent `ytmusic_free` from being installed.
 
@@ -320,11 +325,20 @@ monochrome source: /data/monochrome
 auto-update: provider change detected -> reinstalling
 ```
 
-If `auto_update` is `false`, the watcher fetches Monochrome only when its persistent cache is empty, then pins both provider versions and re-injects them on container recreation.
+With `monochrome_auto_update` off, the watcher fetches Monochrome only when its persistent cache is empty and then pins it. With `ytmusic_auto_update` off, it uses the provider copy baked into the watcher image.
 
 ---
 
 ## Troubleshooting
+
+**The files under `/addons/ma_provider_watcher` are new, but the app still shows the old version or Configuration fields**
+- The curl installer updates the local source; it does not itself refresh Supervisor's installed metadata or running image. First use **Settings → Apps → App store → ⋮ → Check for updates**, then **Update** or **Rebuild** the watcher.
+- If Rebuild runs the new code but the schema is still stale, reload the store metadata and update the local app:
+  ```bash
+  curl -fsS -X POST -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" http://supervisor/store/reload
+  ha apps update local_ma_provider_watcher
+  ```
+- Verify the source with `grep -E 'version:|ytmusic_auto_update|monochrome_auto_update' /addons/ma_provider_watcher/config.yaml` and the running image with `docker exec app_local_ma_provider_watcher grep -n fetch_monochrome /watcher_lib.sh`.
 
 **`monochrome update: GitHub token is missing` or `download failed`**
 - In the add-on's **Configuration** tab, paste a PAT that can read `NicholasBoulanger/music-assistant-monochrome`, save, and restart the watcher.
