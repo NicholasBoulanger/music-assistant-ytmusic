@@ -51,12 +51,16 @@ arch:
 options:
   ytmusic_auto_update: false
   monochrome_auto_update: false
+  ytmusic_active_version: current
+  monochrome_active_version: current
   update_interval_hours: 24
   monochrome_enabled: true
   github_token: ""
 schema:
   ytmusic_auto_update: bool
   monochrome_auto_update: bool
+  ytmusic_active_version: list(current|previous)
+  monochrome_active_version: list(current|previous)
   update_interval_hours: int(1,)
   monochrome_enabled: bool
   github_token: password
@@ -75,6 +79,10 @@ configuration:
     name: Auto-update Monochrome
     description: >-
       Check the private Monochrome repository using the configured GitHub token.
+  ytmusic_active_version:
+    name: Active YouTube Music Free version
+  monochrome_active_version:
+    name: Active Monochrome version
   update_interval_hours:
     name: Check the provider for updates every (hours)
     description: >-
@@ -298,8 +306,10 @@ Set these in the add-on's **Configuration** tab (or `options` in `config.yaml`):
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `ytmusic_auto_update` | bool | `false` | Independently follows the public `ytmusic_free` branch. Off uses the provider copy baked into the watcher image. |
+| `ytmusic_auto_update` | bool | `false` | Independently follows the public `ytmusic_free` branch. Off pins the selected copy; before any download, Current is the copy baked into the watcher image. |
 | `monochrome_auto_update` | bool | `false` | Independently follows the private Monochrome branch. Off pins the last successfully cached copy. |
+| `ytmusic_active_version` | `current` / `previous` | `current` | Chooses the installed YouTube slot. Previous falls back to the bundled image copy until the first rotation exists. |
+| `monochrome_active_version` | `current` / `previous` | `current` | Chooses the installed Monochrome slot. Previous becomes available after the first changed update. |
 | `update_interval_hours` | int (hours) | `24` | How often to check. `24` = daily, `168` = weekly, `1` = hourly. Clamped to a minimum of `1` at runtime; invalid values fall back to the default. |
 | `monochrome_enabled` | bool | `true` | Downloads, installs, and watches the private Monochrome provider. |
 | `github_token` | password | empty | PAT used to read the private Monochrome repository. It is masked in the UI and never logged. A classic PAT needs the `repo` scope; a fine-grained PAT needs Contents read access to that repository. |
@@ -310,8 +320,10 @@ You can change the sources when running the installer with `--ref`, `--monochrom
 
 1. On first startup, the watcher uses the PAT to populate `/data/monochrome` from the private repository. The public `ytmusic_free` copy is already baked into the image.
 2. Each enabled auto-update control checks only its corresponding repository every `update_interval_hours` and compares the provider SHA-256 with its persistent cache.
-3. **Only if either provider changed**, it copies both current providers into the MA container and restarts MA once. Unchanged checks are a no-op.
-4. If a fetch fails, the watcher logs a warning and keeps the last cached copy. A first-time Monochrome fetch without a valid PAT cannot install Monochrome, but it does not prevent `ytmusic_free` from being installed.
+3. A structurally valid changed download becomes **Current**; the former Current copy, hash, and fetch date rotate into **Previous**. A third version replaces the older Previous slot, so storage remains bounded at two versions per provider.
+4. **Only if either provider changed**, it copies the selected providers into the MA container and restarts MA once. Unchanged checks are a no-op.
+5. Selecting **Previous** and restarting the watcher performs the rollback. Automatic checks for that provider pause while Previous is active, preventing the rollback copy from being overwritten. Select Current and restart to resume updates.
+6. If a fetch fails, the watcher logs a warning and keeps the selected cached copy. A first-time Monochrome fetch without a valid PAT cannot install Monochrome, but it does not prevent `ytmusic_free` from being installed.
 
 Once a newer version has been cached, it also survives MA container recreation: the watcher installs from the cache in preference to the image-baked copy.
 
@@ -321,11 +333,14 @@ With auto-update active you'll see lines such as:
 
 ```
 ytmusic_free source: /data/ytmusic_free
+ytmusic_free current: date=2026-08-11T22:52:51Z hash=abc123...
+ytmusic_free previous: date=2026-08-10T18:03:12Z hash=def456...
+ytmusic_free active slot: current
 monochrome source: /data/monochrome
 auto-update: provider change detected -> reinstalling
 ```
 
-With `monochrome_auto_update` off, the watcher fetches Monochrome only when its persistent cache is empty and then pins it. With `ytmusic_auto_update` off, it uses the provider copy baked into the watcher image.
+With `monochrome_auto_update` off, the watcher fetches Monochrome only when its persistent Current cache is empty and then pins it. With either Previous slot selected, that provider's update checks pause until Current is selected again.
 
 ---
 

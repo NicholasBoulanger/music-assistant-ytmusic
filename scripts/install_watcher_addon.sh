@@ -250,12 +250,16 @@ arch:
 options:
   ytmusic_auto_update: false
   monochrome_auto_update: false
+  ytmusic_active_version: current
+  monochrome_active_version: current
   update_interval_hours: 24
   monochrome_enabled: true
   github_token: ""
 schema:
   ytmusic_auto_update: bool
   monochrome_auto_update: bool
+  ytmusic_active_version: list(current|previous)
+  monochrome_active_version: list(current|previous)
   update_interval_hours: int(1,)
   monochrome_enabled: bool
   github_token: password
@@ -275,6 +279,18 @@ configuration:
     description: >-
       Periodically check the private Monochrome repository using the configured
       GitHub token. Off pins the last successfully cached Monochrome copy.
+  ytmusic_active_version:
+    name: Active YouTube Music Free version
+    description: >-
+      Current uses the newest validated copy. Previous rolls back to the one
+      replaced by the last update and pauses YouTube updates until Current is
+      selected again.
+  monochrome_active_version:
+    name: Active Monochrome version
+    description: >-
+      Current uses the newest validated copy. Previous rolls back to the one
+      replaced by the last update and pauses Monochrome updates until Current
+      is selected again.
   update_interval_hours:
     name: Check the provider for updates every (hours)
     description: >-
@@ -334,11 +350,14 @@ cat > "$ADDON_DIR/watcher_lib.sh" <<'LIBEOF'
 read_options() {
     f="${1:-/data/options.json}"
     YTMUSIC_AUTO_UPDATE="false"; MONOCHROME_AUTO_UPDATE="false"
+    YTMUSIC_ACTIVE_VERSION="current"; MONOCHROME_ACTIVE_VERSION="current"
     UPDATE_INTERVAL_HOURS=24
     MONOCHROME_ENABLED="true"; GITHUB_TOKEN=""
     if [ -r "$f" ]; then
         YTMUSIC_AUTO_UPDATE="$(jq -r 'if has("ytmusic_auto_update") then (if .ytmusic_auto_update == true then "true" else "false" end) elif .auto_update == true then "true" else "false" end' "$f" 2>/dev/null || echo false)"
         MONOCHROME_AUTO_UPDATE="$(jq -r 'if has("monochrome_auto_update") then (if .monochrome_auto_update == true then "true" else "false" end) elif .auto_update == true then "true" else "false" end' "$f" 2>/dev/null || echo false)"
+        YTMUSIC_ACTIVE_VERSION="$(jq -r 'if .ytmusic_active_version == "previous" then "previous" else "current" end' "$f" 2>/dev/null || echo current)"
+        MONOCHROME_ACTIVE_VERSION="$(jq -r 'if .monochrome_active_version == "previous" then "previous" else "current" end' "$f" 2>/dev/null || echo current)"
         UPDATE_INTERVAL_HOURS="$(jq -r 'if (.update_interval_hours|type)=="number" then (.update_interval_hours|floor) else 24 end' "$f" 2>/dev/null || echo 24)"
         MONOCHROME_ENABLED="$(jq -r 'if .monochrome_enabled == false then "false" else "true" end' "$f" 2>/dev/null || echo true)"
         GITHUB_TOKEN="$(jq -r 'if (.github_token|type)=="string" then .github_token else "" end' "$f" 2>/dev/null || true)"
@@ -348,28 +367,70 @@ read_options() {
     UPDATE_INTERVAL=$((UPDATE_INTERVAL_HOURS * 3600))
 }
 
-# Inject source: the auto-updated cache in /data when auto-update is ENABLED and a
-# cache exists, else the copy baked into the image at build time. Disabling
-# auto-update reverts to the bundled copy (the cache is kept for re-enabling), so
-# opting out actually stops running fetched branch-head code. /data survives
-# add-on rebuilds.
-provider_src() { if [ "${YTMUSIC_AUTO_UPDATE:-false}" = "true" ] && [ -d "$CACHE" ]; then printf '%s' "$CACHE"; else printf '%s' "$BUNDLED"; fi; }
+# Select the configured persistent slot. YouTube falls back to its image-bundled
+# copy before the first cache is created; Monochrome has no public bundled copy.
+provider_src() {
+    if [ "${YTMUSIC_ACTIVE_VERSION:-current}" = "previous" ]; then
+        if [ -d "$PREVIOUS_CACHE" ]; then printf '%s' "$PREVIOUS_CACHE"; else printf '%s' "$BUNDLED"; fi
+    elif [ -d "$CACHE" ]; then
+        printf '%s' "$CACHE"
+    else
+        printf '%s' "$BUNDLED"
+    fi
+}
 
 # Monochrome is sourced from its persistent private-repository cache. There is
 # intentionally no baked copy: the watcher fork remains public and never
 # contains Monochrome source or credentials.
 monochrome_src() {
-    if [ "${MONOCHROME_ENABLED:-true}" = "true" ] && [ -d "$MONOCHROME_CACHE" ]; then
+    if [ "${MONOCHROME_ENABLED:-true}" != "true" ]; then return; fi
+    if [ "${MONOCHROME_ACTIVE_VERSION:-current}" = "previous" ] && [ -d "$MONOCHROME_PREVIOUS_CACHE" ]; then
+        printf '%s' "$MONOCHROME_PREVIOUS_CACHE"
+    elif [ -d "$MONOCHROME_CACHE" ]; then
         printf '%s' "$MONOCHROME_CACHE"
     fi
 }
 
+provider_hash() {
+    (cd "$1" && find . -type f -exec sha256sum {} \; 2>/dev/null | sort) \
+        | sha256sum | awk '{print $1}'
+}
+
+# Promote a validated directory to current and rotate the former current into
+# previous. Arguments: source hash cache hashfile datefile previous-cache
+# previous-hash previous-date label.
+promote_provider() {
+    source_dir="$1"; new_hash="$2"; cache_dir="$3"; hash_file="$4"
+    date_file="$5"; previous_cache="$6"; previous_hash="$7"
+    previous_date="$8"; log_label="$9"
+    stage="${cache_dir}.new"; previous_stage="${previous_cache}.new"
+    rm -rf "$stage" "$previous_stage"
+    mkdir -p "$stage" && cp -a "$source_dir/." "$stage/" || { rm -rf "$stage"; return 1; }
+    if [ -d "$cache_dir" ]; then
+        mkdir -p "$previous_stage" && cp -a "$cache_dir/." "$previous_stage/" \
+            || { rm -rf "$stage" "$previous_stage"; return 1; }
+        rm -rf "$previous_cache" && mv "$previous_stage" "$previous_cache" || return 1
+        if [ -f "$hash_file" ]; then cp "$hash_file" "$previous_hash"; else provider_hash "$previous_cache" > "$previous_hash"; fi
+        if [ -f "$date_file" ]; then cp "$date_file" "$previous_date"; else date -u +'%Y-%m-%dT%H:%M:%SZ' > "$previous_date"; fi
+    fi
+    rm -rf "$cache_dir"
+    if ! mv "$stage" "$cache_dir"; then
+        [ -d "$previous_cache" ] && cp -a "$previous_cache" "$cache_dir"
+        return 1
+    fi
+    printf '%s\n' "$new_hash" > "$hash_file"
+    date -u +'%Y-%m-%dT%H:%M:%SZ' > "$date_file"
+    echo "$log_label update: cached new provider ($new_hash)"
+}
+
 # Fetch one provider directory from an archive into an atomic persistent cache.
-# Arguments: provider_dir archive_url cache_dir hash_file token log_label
+# Arguments: provider_dir archive_url cache_dir hash_file date_file token
+# log_label previous_cache previous_hash previous_date
 # Return: 0 = updated, 2 = unchanged, 1 = fetch/parse failed.
 fetch_provider() {
     provider_dir="$1"; archive_url="$2"; cache_dir="$3"
-    hash_file="$4"; token="$5"; log_label="$6"
+    hash_file="$4"; date_file="$5"; token="$6"; log_label="$7"
+    previous_cache="$8"; previous_hash="$9"; previous_date="${10}"
     tmp="$(mktemp -d 2>/dev/null || mktemp -d -t maw)" || return 1
     curl_args=(-fsSL --connect-timeout 10 --max-time 120)
     if [ -n "$token" ]; then
@@ -391,19 +452,20 @@ fetch_provider() {
         rm -rf "$tmp"
         return 1
     fi
-    nh="$( (cd "$nd" && find . -type f -exec sha256sum {} \; 2>/dev/null | sort) | sha256sum | awk '{print $1}')"
+    if [ ! -f "$nd/__init__.py" ] || [ ! -f "$nd/manifest.json" ]; then
+        echo "$log_label update: provider is missing __init__.py or manifest.json"
+        rm -rf "$tmp"
+        return 1
+    fi
+    nh="$(provider_hash "$nd")"
     oh="$(cat "$hash_file" 2>/dev/null || echo none)"
     if [ "$nh" = "$oh" ] && [ -d "$cache_dir" ]; then
         rm -rf "$tmp"
         return 2
     fi
-    rm -rf "$cache_dir.new"
-    mkdir -p "$cache_dir.new" && cp -a "$nd/." "$cache_dir.new/" \
-        || { rm -rf "$tmp" "$cache_dir.new"; return 1; }
-    rm -rf "$cache_dir" && mv "$cache_dir.new" "$cache_dir" \
+    promote_provider "$nd" "$nh" "$cache_dir" "$hash_file" "$date_file" \
+        "$previous_cache" "$previous_hash" "$previous_date" "$log_label" \
         || { rm -rf "$tmp"; return 1; }
-    printf '%s\n' "$nh" > "$hash_file"
-    echo "$log_label update: cached new provider ($nh)"
     rm -rf "$tmp"
     return 0
 }
@@ -411,7 +473,8 @@ fetch_provider() {
 # Fetch the latest provider from GitHub into $CACHE.
 # Return: 0 = updated (changed), 2 = unchanged, 1 = fetch/parse failed.
 fetch_latest() {
-    fetch_provider ytmusic_free "$TARBALL_URL" "$CACHE" "$HASHFILE" "" "ytmusic_free"
+    fetch_provider ytmusic_free "$TARBALL_URL" "$CACHE" "$HASHFILE" "$DATEFILE" \
+        "" "ytmusic_free" "$PREVIOUS_CACHE" "$PREVIOUS_HASHFILE" "$PREVIOUS_DATEFILE"
 }
 
 fetch_monochrome() {
@@ -420,7 +483,9 @@ fetch_monochrome() {
         return 1
     fi
     fetch_provider monochrome "$MONOCHROME_TARBALL_URL" "$MONOCHROME_CACHE" \
-        "$MONOCHROME_HASHFILE" "$GITHUB_TOKEN" "monochrome"
+        "$MONOCHROME_HASHFILE" "$MONOCHROME_DATEFILE" "$GITHUB_TOKEN" "monochrome" \
+        "$MONOCHROME_PREVIOUS_CACHE" "$MONOCHROME_PREVIOUS_HASHFILE" \
+        "$MONOCHROME_PREVIOUS_DATEFILE"
 }
 LIBEOF
 
@@ -432,8 +497,16 @@ MA="$MA_ID"
 BUNDLED="/provider/ytmusic_free"
 CACHE="/data/ytmusic_free"
 HASHFILE="/data/ytmusic_free.sha256"
+DATEFILE="/data/ytmusic_free.fetched_at"
+PREVIOUS_CACHE="/data/ytmusic_free.previous"
+PREVIOUS_HASHFILE="/data/ytmusic_free.previous.sha256"
+PREVIOUS_DATEFILE="/data/ytmusic_free.previous.fetched_at"
 MONOCHROME_CACHE="/data/monochrome"
 MONOCHROME_HASHFILE="/data/monochrome.sha256"
+MONOCHROME_DATEFILE="/data/monochrome.fetched_at"
+MONOCHROME_PREVIOUS_CACHE="/data/monochrome.previous"
+MONOCHROME_PREVIOUS_HASHFILE="/data/monochrome.previous.sha256"
+MONOCHROME_PREVIOUS_DATEFILE="/data/monochrome.previous.fetched_at"
 DST="/app/venv/lib/$PYTHON_VERSION/site-packages/music_assistant/providers"
 # Where auto-update pulls the latest provider from. Baked from the installer's
 # --repo-owner/--ref so a fork self-updates from its own source.
@@ -460,6 +533,26 @@ fi
 echo "[\$(date)] Docker OK"
 
 log() { echo "[\$(date)] \$*"; }
+
+slot_value() { value="\$(cat "\$1" 2>/dev/null || true)"; [ -n "\$value" ] && printf '%s' "\$value" || printf '%s' unknown; }
+
+log_provider_slots() {
+    label="\$1"; active="\$2"; current_dir="\$3"; current_hash="\$4"
+    current_date="\$5"; previous_dir="\$6"; previous_hash="\$7"; previous_date="\$8"
+    if [ -d "\$current_dir" ]; then
+        log "\$label current: date=\$(slot_value "\$current_date") hash=\$(slot_value "\$current_hash")"
+    elif [ "\$label" = "ytmusic_free" ]; then
+        log "\$label current: bundled with watcher image"
+    fi
+    if [ -d "\$previous_dir" ]; then
+        log "\$label previous: date=\$(slot_value "\$previous_date") hash=\$(slot_value "\$previous_hash")"
+    elif [ "\$label" = "ytmusic_free" ]; then
+        log "\$label previous fallback: bundled with watcher image"
+    else
+        log "\$label previous: unavailable until a successful update replaces current"
+    fi
+    log "\$label active slot: \$active"
+}
 
 # Provider source and fetch helpers come from /watcher_lib.sh (sourced above).
 
@@ -513,24 +606,41 @@ warn_if_ma_misconfigured() {
     fi
 }
 
-# Prime the cache with the latest provider before the first inject (opt-in).
-if [ "\$YTMUSIC_AUTO_UPDATE" = "true" ]; then
+# A private provider cannot use Previous before an update has created that
+# slot. Fall back visibly instead of leaving MA without Monochrome.
+if [ "\$MONOCHROME_ACTIVE_VERSION" = "previous" ] && [ ! -d "\$MONOCHROME_PREVIOUS_CACHE" ]; then
+    log "WARNING: Monochrome Previous was selected but is unavailable; using Current."
+    MONOCHROME_ACTIVE_VERSION="current"
+fi
+
+# Prime current with the latest provider before the first inject (opt-in).
+# Selecting Previous pauses updates so the rollback slot cannot be overwritten.
+if [ "\$YTMUSIC_AUTO_UPDATE" = "true" ] && [ "\$YTMUSIC_ACTIVE_VERSION" = "current" ]; then
     log "ytmusic_free auto-update enabled (checking every \${UPDATE_INTERVAL_HOURS}h); fetching latest..."
     fetch_latest || true
+elif [ "\$YTMUSIC_ACTIVE_VERSION" = "previous" ]; then
+    log "ytmusic_free Previous selected; auto-update paused to preserve rollback."
 else
-    log "ytmusic_free auto-update disabled; using the bundled provider copy."
+    log "ytmusic_free auto-update disabled; keeping the selected version pinned."
 fi
 if [ "\$MONOCHROME_ENABLED" = "true" ]; then
     # A first-time install always needs to populate Monochrome's private cache.
     # With its auto-update disabled, an existing cache is deliberately pinned.
-    if [ "\$MONOCHROME_AUTO_UPDATE" = "true" ] || [ ! -d "\$MONOCHROME_CACHE" ]; then
+    if { [ "\$MONOCHROME_AUTO_UPDATE" = "true" ] && [ "\$MONOCHROME_ACTIVE_VERSION" = "current" ]; } || [ ! -d "\$MONOCHROME_CACHE" ]; then
         fetch_monochrome || true
+    elif [ "\$MONOCHROME_ACTIVE_VERSION" = "previous" ]; then
+        log "Monochrome Previous selected; auto-update paused to preserve rollback."
     fi
 fi
 log "ytmusic_free source: \$(provider_src)"
+log_provider_slots ytmusic_free "\$YTMUSIC_ACTIVE_VERSION" "\$CACHE" "\$HASHFILE" "\$DATEFILE" \
+    "\$PREVIOUS_CACHE" "\$PREVIOUS_HASHFILE" "\$PREVIOUS_DATEFILE"
 if [ "\$MONOCHROME_ENABLED" = "true" ]; then
     mono_src="\$(monochrome_src)"
     if [ -n "\$mono_src" ]; then log "monochrome source: \$mono_src"; fi
+    log_provider_slots monochrome "\$MONOCHROME_ACTIVE_VERSION" "\$MONOCHROME_CACHE" \
+        "\$MONOCHROME_HASHFILE" "\$MONOCHROME_DATEFILE" "\$MONOCHROME_PREVIOUS_CACHE" \
+        "\$MONOCHROME_PREVIOUS_HASHFILE" "\$MONOCHROME_PREVIOUS_DATEFILE"
 fi
 
 LAST_ID=\$(docker ps -q --no-trunc --filter name="\$MA" 2>/dev/null)
@@ -567,16 +677,16 @@ while true; do
     fi
     # Periodic auto-update: fetch both providers, then reinject and restart MA
     # once when either provider changed.
-    if [ "\$YTMUSIC_AUTO_UPDATE" = "true" ] || \
-       { [ "\$MONOCHROME_ENABLED" = "true" ] && [ "\$MONOCHROME_AUTO_UPDATE" = "true" ]; }; then
+    if { [ "\$YTMUSIC_AUTO_UPDATE" = "true" ] && [ "\$YTMUSIC_ACTIVE_VERSION" = "current" ]; } || \
+       { [ "\$MONOCHROME_ENABLED" = "true" ] && [ "\$MONOCHROME_AUTO_UPDATE" = "true" ] && [ "\$MONOCHROME_ACTIVE_VERSION" = "current" ]; }; then
         now=\$(date +%s)
         if [ \$((now - LAST_UPDATE)) -ge "\$UPDATE_INTERVAL" ]; then
             LAST_UPDATE=\$now
             providers_changed=0
-            if [ "\$YTMUSIC_AUTO_UPDATE" = "true" ]; then
+            if [ "\$YTMUSIC_AUTO_UPDATE" = "true" ] && [ "\$YTMUSIC_ACTIVE_VERSION" = "current" ]; then
                 if fetch_latest; then providers_changed=1; fi
             fi
-            if [ "\$MONOCHROME_ENABLED" = "true" ] && [ "\$MONOCHROME_AUTO_UPDATE" = "true" ]; then
+            if [ "\$MONOCHROME_ENABLED" = "true" ] && [ "\$MONOCHROME_AUTO_UPDATE" = "true" ] && [ "\$MONOCHROME_ACTIVE_VERSION" = "current" ]; then
                 if fetch_monochrome; then providers_changed=1; fi
             fi
             if [ "\$providers_changed" -eq 1 ]; then

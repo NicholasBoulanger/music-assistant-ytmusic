@@ -164,7 +164,7 @@ The installer auto-detects the local add-ons folder across the common layouts: t
 > ```
 > Inside the SSH/Samba add-on use `--addons-dir /addons`. After re-running, **Rebuild** the add-on (three-dot menu) so the new files are baked into its image, then **Start** it.
 
-The watcher can also **keep each provider up to date independently**. The Configuration tab has separate `ytmusic_auto_update` and `monochrome_auto_update` controls (both opt-in and off by default). It reinstalls providers only when code actually changed and restarts MA once per update cycle. See [Auto-update](WATCHER_ADDON.md#auto-update) for details.
+The watcher can also **keep each provider up to date independently**. The Configuration tab has separate `ytmusic_auto_update` and `monochrome_auto_update` controls (both opt-in and off by default). Each provider retains at most two structurally validated slots, **Current** and **Previous**, selectable with its `*_active_version` dropdown. Selecting Previous and restarting rolls back that provider and pauses its updates until Current is selected again. Fetch dates and hashes are shown in the watcher logs. See [Auto-update](WATCHER_ADDON.md#auto-update) for details.
 
 > **HAOS local-app refresh:** the curl installer replaces files under `/addons/ma_provider_watcher`, but an already-installed app can keep its old image and cached Configuration schema. After running curl, use **Settings → Apps → App store → ⋮ → Check for updates**, then **Update** (or Rebuild). If the new fields still do not appear, reload Supervisor's app metadata and update the local app:
 > ```bash

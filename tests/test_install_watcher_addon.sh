@@ -233,6 +233,8 @@ if [ "$network_ok" = "1" ]; then
     assert_contains "config.yaml has boot auto"  "boot: auto"                "$config"
     assert_contains "config.yaml exposes YouTube auto-update" "ytmusic_auto_update: false" "$config"
     assert_contains "config.yaml exposes Monochrome auto-update" "monochrome_auto_update: false" "$config"
+    assert_contains "config.yaml exposes YouTube version selector" "ytmusic_active_version: list(current|previous)" "$config"
+    assert_contains "config.yaml exposes Monochrome version selector" "monochrome_active_version: list(current|previous)" "$config"
     assert_contains "config.yaml enables Monochrome" "monochrome_enabled: true" "$config"
     assert_contains "config.yaml masks the GitHub token" "github_token: password" "$config"
     # Version must be build-stamped (1.0.<timestamp>), not the static "1.0.0",

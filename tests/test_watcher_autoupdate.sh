@@ -57,24 +57,27 @@ fi
 # these assertions rather than emit misleading failures (mirrors the sha256sum
 # shim above; the alpine CI job installs jq so it exercises them for real).
 if command -v jq >/dev/null 2>&1; then
-    opt(){ printf '%s' "$1" > "$TMP_ADDONS/o.json"; ( . "$LIB"; read_options "$TMP_ADDONS/o.json"; printf '%s|%s|%s|%s|%s' "$YTMUSIC_AUTO_UPDATE" "$MONOCHROME_AUTO_UPDATE" "$UPDATE_INTERVAL_HOURS" "$MONOCHROME_ENABLED" "$GITHUB_TOKEN" ); }
-    assert_eq "both provider updates default off" "false|false|24|true|" "$(opt '{}')"
+    opt(){ printf '%s' "$1" > "$TMP_ADDONS/o.json"; ( . "$LIB"; read_options "$TMP_ADDONS/o.json"; printf '%s|%s|%s|%s|%s|%s|%s' "$YTMUSIC_AUTO_UPDATE" "$MONOCHROME_AUTO_UPDATE" "$UPDATE_INTERVAL_HOURS" "$MONOCHROME_ENABLED" "$GITHUB_TOKEN" "$YTMUSIC_ACTIVE_VERSION" "$MONOCHROME_ACTIVE_VERSION" ); }
+    assert_eq "both provider updates default off" "false|false|24|true||current|current" "$(opt '{}')"
     assert_eq "YouTube update can be enabled independently" \
-        "true|false|24|true|" "$(opt '{"ytmusic_auto_update":true,"monochrome_auto_update":false}')"
+        "true|false|24|true||current|current" "$(opt '{"ytmusic_auto_update":true,"monochrome_auto_update":false}')"
     assert_eq "Monochrome update can be enabled independently" \
-        "false|true|24|true|" "$(opt '{"ytmusic_auto_update":false,"monochrome_auto_update":true}')"
+        "false|true|24|true||current|current" "$(opt '{"ytmusic_auto_update":false,"monochrome_auto_update":true}')"
     assert_eq "legacy auto_update:true migrates both providers to on" \
-        "true|true|24|true|" "$(opt '{"auto_update":true}')"
+        "true|true|24|true||current|current" "$(opt '{"auto_update":true}')"
     assert_eq "new explicit false overrides legacy true" \
-        "false|true|24|true|" "$(opt '{"auto_update":true,"ytmusic_auto_update":false}')"
-    assert_eq "interval 0 clamps to 1"        "true|true|1|true|"   "$(opt '{"auto_update":true,"update_interval_hours":0}')"
-    assert_eq "interval negative clamps to 1" "true|true|1|true|"   "$(opt '{"auto_update":true,"update_interval_hours":-5}')"
-    assert_eq "interval non-numeric -> 24"    "true|true|24|true|"  "$(opt '{"auto_update":true,"update_interval_hours":"x"}')"
-    assert_eq "interval null -> 24"           "true|true|24|true|"  "$(opt '{"auto_update":true,"update_interval_hours":null}')"
-    assert_eq "interval 168 kept"             "true|true|168|true|" "$(opt '{"auto_update":true,"update_interval_hours":168}')"
+        "false|true|24|true||current|current" "$(opt '{"auto_update":true,"ytmusic_auto_update":false}')"
+    assert_eq "interval 0 clamps to 1"        "true|true|1|true||current|current"   "$(opt '{"auto_update":true,"update_interval_hours":0}')"
+    assert_eq "interval negative clamps to 1" "true|true|1|true||current|current"   "$(opt '{"auto_update":true,"update_interval_hours":-5}')"
+    assert_eq "interval non-numeric -> 24"    "true|true|24|true||current|current"  "$(opt '{"auto_update":true,"update_interval_hours":"x"}')"
+    assert_eq "interval null -> 24"           "true|true|24|true||current|current"  "$(opt '{"auto_update":true,"update_interval_hours":null}')"
+    assert_eq "interval 168 kept"             "true|true|168|true||current|current" "$(opt '{"auto_update":true,"update_interval_hours":168}')"
     assert_eq "Monochrome settings parse token and explicit false" \
-        "false|false|24|false|test-token" \
+        "false|false|24|false|test-token|current|current" \
         "$(opt '{"monochrome_enabled":false,"github_token":"test-token"}')"
+    assert_eq "active version selectors parse Previous independently" \
+        "false|false|24|true||previous|current" \
+        "$(opt '{"ytmusic_active_version":"previous","monochrome_active_version":"invalid"}')"
 else
     skip "jq not installed -- read_options assertions skipped"
 fi
@@ -84,29 +87,40 @@ W="$(mktemp -d)"
 result="$(
     . "$LIB"
     YTMUSIC_AUTO_UPDATE=true
-    CACHE="$W/cache"; BUNDLED="$W/bundled"; HASHFILE="$W/hash"
+    CACHE="$W/cache"; BUNDLED="$W/bundled"; HASHFILE="$W/hash"; DATEFILE="$W/date"
+    PREVIOUS_CACHE="$W/cache.previous"; PREVIOUS_HASHFILE="$W/hash.previous"; PREVIOUS_DATEFILE="$W/date.previous"
     mkdir -p "$BUNDLED"; echo bundled > "$BUNDLED/x"
     src1="$(provider_src)"                                   # no cache -> bundled
-    mkdir -p "$W/ytmusic_free"; echo v1 > "$W/ytmusic_free/__init__.py"
+    mkdir -p "$W/ytmusic_free"; echo v1 > "$W/ytmusic_free/__init__.py"; echo '{}' > "$W/ytmusic_free/manifest.json"
     ( cd "$W" && tar -czf pkg.tgz ytmusic_free )
     TARBALL_URL="file://$W/pkg.tgz"
     fetch_latest >/dev/null 2>&1; r1=$?                      # new -> 0
     src2="$(provider_src)"                                   # auto-update on + cache -> cache
-    # Opting OUT must revert to the bundled copy even with a cache present.
+    # Disabling updates pins the current cache; slot selection controls rollback.
     YTMUSIC_AUTO_UPDATE=false; src_off="$(provider_src)"; YTMUSIC_AUTO_UPDATE=true
     fetch_latest >/dev/null 2>&1; r2=$?                      # unchanged -> 2
     echo v2 > "$W/ytmusic_free/__init__.py"; ( cd "$W" && tar -czf pkg.tgz ytmusic_free )
     fetch_latest >/dev/null 2>&1; r3=$?                      # changed -> 0
-    [ "$src1" = "$BUNDLED" ] && [ "$src2" = "$CACHE" ] && [ "$src_off" = "$BUNDLED" ] && echo "$r1 $r2 $r3"
+    YTMUSIC_ACTIVE_VERSION=previous; src_previous="$(provider_src)"
+    previous_value="$(cat "$PREVIOUS_CACHE/__init__.py")"
+    rm "$W/ytmusic_free/manifest.json"; ( cd "$W" && tar -czf pkg.tgz ytmusic_free )
+    fetch_latest >/dev/null 2>&1; r4=$?                      # invalid -> 1, slots untouched
+    current_value="$(cat "$CACHE/__init__.py")"
+    [ "$src1" = "$BUNDLED" ] && [ "$src2" = "$CACHE" ] && [ "$src_off" = "$CACHE" ] \
+        && [ "$src_previous" = "$PREVIOUS_CACHE" ] && [ "$previous_value" = v1 ] \
+        && [ "$current_value" = v2 ] && [ -s "$PREVIOUS_HASHFILE" ] \
+        && [ -s "$PREVIOUS_DATEFILE" ] && echo "$r1 $r2 $r3 $r4"
 )"
-assert_eq "provider_src bundled->cache, off->bundled, fetch_latest new/unchanged/changed = 0/2/0" "0 2 0" "$result"
+assert_eq "slots rotate v1 to Previous and reject invalid update = 0/2/0/1" "0 2 0 1" "$result"
 
 # --- private Monochrome cache + token handling ---
 mono_result="$(
     . "$LIB"
     MONOCHROME_ENABLED=true
-    MONOCHROME_CACHE="$W/mono-cache"; MONOCHROME_HASHFILE="$W/mono-hash"
-    mkdir -p "$W/monochrome"; echo mono-v1 > "$W/monochrome/__init__.py"
+    MONOCHROME_ACTIVE_VERSION=current
+    MONOCHROME_CACHE="$W/mono-cache"; MONOCHROME_HASHFILE="$W/mono-hash"; MONOCHROME_DATEFILE="$W/mono-date"
+    MONOCHROME_PREVIOUS_CACHE="$W/mono-cache.previous"; MONOCHROME_PREVIOUS_HASHFILE="$W/mono-hash.previous"; MONOCHROME_PREVIOUS_DATEFILE="$W/mono-date.previous"
+    mkdir -p "$W/monochrome"; echo mono-v1 > "$W/monochrome/__init__.py"; echo '{}' > "$W/monochrome/manifest.json"
     ( cd "$W" && tar -czf mono.tgz monochrome )
     MONOCHROME_TARBALL_URL="file://$W/mono.tgz"
     GITHUB_TOKEN="private-token-must-not-leak"
