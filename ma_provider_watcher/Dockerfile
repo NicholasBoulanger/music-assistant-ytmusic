@@ -8,7 +8,7 @@ RUN apk add --no-cache bash curl docker-cli jq tar
 RUN set -eux; \
     build_tmp="$(mktemp -d)"; \
     curl -fsSL --connect-timeout 10 --max-time 120 \
-      https://codeload.github.com/sproft/music-assistant-ytmusic/tar.gz/refs/heads/main \
+      https://codeload.github.com/NicholasBoulanger/music-assistant-ytmusic/tar.gz/refs/heads/main \
       -o "$build_tmp/provider.tgz"; \
     tar -xzf "$build_tmp/provider.tgz" -C "$build_tmp"; \
     provider_src="$(find "$build_tmp" -maxdepth 3 -type d -name ytmusic_free | head -n1)"; \

@@ -14,7 +14,7 @@
 
 set -eu
 
-REPO_OWNER="sproft"
+REPO_OWNER="NicholasBoulanger"
 REPO_NAME="music-assistant-ytmusic"
 WATCHER_REPO_OWNER="NicholasBoulanger"
 ADDON_SLUG="ma_provider_watcher"

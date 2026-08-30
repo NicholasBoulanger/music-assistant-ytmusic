@@ -1,14 +1,14 @@
 {
   "type": "music",
   "domain": "ytmusic_free",
-  "stage": "experimental",
+  "stage": "stable",
   "name": "YouTube Music (Free)",
   "description": "Stream YouTube Music without a premium subscription. Uses yt-dlp for audio extraction. Optional browser cookie auth unlocks library sync and recommendations.",
   "codeowners": ["sproft"],
   "documentation": "https://github.com/sproft/music-assistant-ytmusic/blob/main/README.md",
   "requirements": [
     "ytmusicapi>=1.7.0",
-    "yt-dlp[default]>=2025.1.12"
+    "yt-dlp[default]>=2026.8.18.122307.dev0"
   ],
   "multi_instance": true
 }

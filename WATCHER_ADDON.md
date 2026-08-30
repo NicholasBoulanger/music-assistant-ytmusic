@@ -326,7 +326,7 @@ Set these in the add-on's **Configuration** tab (or `options` in `config.yaml`):
 | `monochrome_enabled` | bool | `true` | Downloads, installs, and watches the private Monochrome provider. |
 | `github_token` | password | empty | PAT used to read the private Monochrome repository. It is masked in the UI and never logged. A classic PAT needs the `repo` scope; a fine-grained PAT needs Contents read access to that repository. |
 
-You can change the sources when running the installer with `--ref`, `--monochrome-repo OWNER/REPO`, and `--monochrome-ref`. By default it follows `sproft/music-assistant-ytmusic:main` and `NicholasBoulanger/music-assistant-monochrome:main`.
+You can change the sources when running the installer with `--repo-owner`, `--ref`, `--monochrome-repo OWNER/REPO`, and `--monochrome-ref`. This fork defaults to `NicholasBoulanger/music-assistant-ytmusic:main` so its compatibility patches are installed, while upstream remains available through `--repo-owner sproft`; Monochrome follows `NicholasBoulanger/music-assistant-monochrome:main`.
 
 ### How it works
 

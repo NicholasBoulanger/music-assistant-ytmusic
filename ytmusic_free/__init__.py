@@ -13,8 +13,22 @@ apps like SimpMusic work. This may break if YouTube changes their API.
 
 from __future__ import annotations
 
+# The one place this provider's version is recorded. A release is cut by pushing
+# a tag, and .github/workflows/release.yml refuses to publish when the tag and
+# this string disagree, so a release and the code inside it can never claim
+# different numbers.
+#
+# It lives here rather than in manifest.json for two reasons. Only the
+# ytmusic_free/ directory ships (.dockerignore is "*" then "!ytmusic_free", and
+# both installers copy just this directory), so a repo-root VERSION file would
+# never reach an install. And Music Assistant would throw it away anyway:
+# ProviderManifest has no version field and mashumaro drops unknown keys, so the
+# manifest object handed to the provider never carries one. See issue #68.
+__version__ = "1.1.3"
+
 import asyncio
 import importlib
+import json
 import logging
 import os
 import re
@@ -48,6 +62,8 @@ from music_assistant_models.media_items import (
     MediaItemType,
     MediaType,
     Playlist,
+    Podcast,
+    PodcastEpisode,
     ProviderMapping,
     RecommendationFolder,
     SearchResults,
@@ -56,6 +72,8 @@ from music_assistant_models.media_items import (
 )
 from music_assistant_models.streamdetails import StreamDetails
 
+from music_assistant.controllers.cache import use_cache
+from music_assistant.helpers import util as mass_util
 from music_assistant.helpers.util import infer_album_type, install_package, parse_title_and_version
 from music_assistant.models.music_provider import MusicProvider
 
@@ -70,6 +88,88 @@ if TYPE_CHECKING:
 YTM_DOMAIN = "https://music.youtube.com"
 VARIOUS_ARTISTS_YTM_ID = "UCUTXlgdcKU5vfzFqHOWIvkA"
 DEFAULT_STREAM_URL_EXPIRATION = 3600  # 1 hour
+
+# MA 2.10 initializes provider instances concurrently. Importing yt-dlp from
+# separate worker threads can make Python 3.14 detect a cross-module lock cycle
+# while yt-dlp imports requests (usually requests.structures), aborting provider
+# setup with _DeadlockError. Keep package installation and first imports
+# process-wide, using MA's shared import executor where available, so multiple
+# YT instances cannot race one another. The short retry also lets an unrelated
+# provider import that was already in flight finish before we give up.
+_PACKAGE_SETUP_LOCK = asyncio.Lock()
+PACKAGE_IMPORT_ATTEMPTS = 3
+
+# googlevideo answers 403 to any request whose Range header is missing or
+# open-ended ("bytes=0-"), while a bounded "bytes=0-1023" against the very same
+# URL answers 206 (the rqh=1 URL parameter; enforcement observed 2026-08-19,
+# breaking every install at once with extraction still green). ffmpeg only ever
+# opens URLs the unbounded way, so the URL cannot be handed to Music Assistant
+# as StreamType.HTTP; the provider fetches the bytes itself in bounded chunks
+# instead.
+#
+# Bounded is not enough: the range's *size* is capped too. Measured on
+# 2026-08-19 against a real ANDROID_VR URL: 1 MiB answers 206 and 2 MiB
+# answers 403 (the earlier 10 MiB, chosen to mirror yt-dlp's http_chunk_size,
+# 403d in production while every diagnostic that probed with small ranges
+# passed). 1 MiB is the largest measured-good size; get_audio_stream also
+# halves the chunk on a 403 down to STREAM_CHUNK_FLOOR before failing, so a
+# future tightening of the cap degrades to smaller requests instead of
+# breaking playback outright.
+STREAM_CHUNK_SIZE = 1024 * 1024
+
+# Give-up point for that halving. Below this, request overhead dominates and a
+# 403 is clearly not about the range size anymore (1 KiB probes pass even when
+# 10 MiB fails), so keep shrinking would only mask a different failure.
+STREAM_CHUNK_FLOOR = 64 * 1024
+
+# How much of a chunk's body to hand over per yield. Purely a buffering knob
+# for the pipe into ffmpeg; it has no effect on the HTTP requests.
+STREAM_YIELD_SIZE = 64 * 1024
+
+# Longest pre-roll window we will hold a track start for. A single skippable
+# ad is around 5 seconds (issue #51 measured 4 to 5) but yt-dlp sums a whole
+# pod, and two non-skippable ads back to back reach the mid-thirties, so this
+# has to clear that or it would refuse legitimate waits.
+#
+# Past it we hand the URL over *immediately* rather than sleeping the cap and
+# handing it over anyway. Waiting 45 seconds and then serving a URL we already
+# know is still gated is the worst of both outcomes: the user gets the silence
+# and the failure. Failing at once at least skips to the next track promptly.
+MAX_PREROLL_WAIT = 45.0
+
+# The oldest yt-dlp that can still stream at all. YouTube killed the
+# android_vr client on 2026-08-17: its URLs serve at most ~1 MiB in total and
+# then answer 403 to every request, bounded or not, paced or not (all of it
+# measured 2026-08-19), so no fetch strategy on this side can play a full
+# track from them. yt-dlp dropped android_vr from its default clients in
+# nightly 2026.08.18 (yt-dlp/yt-dlp#17461); those defaults extract via
+# visionos, verified the same day to serve whole files with no PO token.
+#
+# The ``.dev0`` spelling is load-bearing twice over: it is the version PyPI
+# actually carries for the nightly, and PEP 440 only lets pip consider
+# pre-releases when the specifier itself names one, so this floor installs
+# nightlies without any --pre flag. Replace with the next stable release once
+# one exists above it.
+MIN_YTDLP_REQUIREMENT = "yt-dlp[default]>=2026.8.18.122307.dev0"
+
+# The same floor as a comparable date tuple, for warning at stream time when
+# the *imported* module is still older: install_package upgrades the package
+# on disk, but a Python process that already imported yt_dlp keeps the old
+# module until Music Assistant restarts.
+MIN_YTDLP_VERSION_FOR_PLAYBACK = (2026, 8, 18)
+
+# ``available_at`` first appeared in yt-dlp 2025.08.20, but it only became
+# ad-derived in 2025.12.08. On the releases in between it is a flat six seconds
+# in the future on *every* non-live format, ad or not, so honouring it there
+# would put six seconds of silence in front of every single track. Older
+# releases omit the field entirely and need no guard.
+#
+# The manifest floor now excludes that range, but this check still has to
+# exist: pip does not upgrade an already-satisfied requirement, so an install
+# that first resolved under the old floor keeps whatever yt-dlp it landed on
+# and never sees the new one.
+MIN_YTDLP_VERSION_FOR_PREROLL = (2025, 12, 8)
+
 # Song radio and the personal mixes are effectively endless, so a full fetch has
 # no natural stopping point. Ask for a queue's worth and stop there.
 #
@@ -85,6 +185,34 @@ DEFAULT_STREAM_URL_EXPIRATION = 3600  # 1 hour
 # duplicate some tracks and skip others. get_playlist_tracks accordingly
 # returns nothing for page > 0.
 RADIO_PLAYLIST_LIMIT = 100
+
+# How long a playlist's track list is reused before it is fetched again.
+# Short, because the whole point is that auto-generated mixes change: long
+# enough that browsing one twice shows the same thing, short enough that it
+# still turns over during a day. Music Assistant bypasses this entirely for
+# playback and refill, so it only ever affects what you are looking at, never
+# what you are hearing. Same figure the official ytmusic provider uses.
+PLAYLIST_TRACKS_CACHE_TTL = 3 * 3600
+
+# Catalogue metadata: an album's title, artwork and release year do not change
+# after it is published, and an artist's discography changes a few times a year
+# at most. Long lifetimes here are what make the album-year lookup below
+# affordable, and they cut the request volume that raises the bot-detection risk
+# raised in issue #53. Same figures the official ytmusic provider uses.
+CATALOG_CACHE_TTL = 30 * 24 * 3600
+ARTIST_CACHE_TTL = 7 * 24 * 3600
+
+# Song radio is meant to differ each time it is asked for, so it gets a short
+# window: long enough that paging through a queue is stable, short enough that
+# asking again tomorrow gives you different music.
+SIMILAR_TRACKS_CACHE_TTL = 24 * 3600
+
+# Album lookups run to fill in release years on tracks that only carry an album
+# id. Bounded on both axes: at most this many at once, so a cold cache does not
+# arrive as a burst of parallel requests, and never more than this many distinct
+# albums per call, so one pathological playlist cannot turn into hundreds.
+ALBUM_YEAR_LOOKUP_CONCURRENCY = 4
+ALBUM_YEAR_LOOKUP_LIMIT = 40
 
 # Features that work without a YTM account
 BASE_FEATURES = {
@@ -105,6 +233,16 @@ AUTHENTICATED_FEATURES = {
     ProviderFeature.LIBRARY_ARTISTS_EDIT,
     ProviderFeature.LIBRARY_ALBUMS_EDIT,
     ProviderFeature.LIBRARY_PLAYLISTS_EDIT,
+    # A YTM "library track" is a liked song, so add/remove map to rating the
+    # song. Without this a delete only touched Music Assistant's database and
+    # the next sync re-imported the like (issue #82).
+    ProviderFeature.LIBRARY_TRACKS_EDIT,
+    # Subscribed shows. Safe to declare unconditionally alongside the others
+    # only because get_library_podcasts goes through the same guards as every
+    # other library method: without auth it raises rather than reporting an
+    # empty library, so Music Assistant never reads it as "unsubscribe from
+    # everything". See issue #55.
+    ProviderFeature.LIBRARY_PODCASTS,
 }
 
 # YTM search filter per media type. YTM has no multi-type search, so a search
@@ -114,13 +252,107 @@ SEARCH_FILTER_BY_TYPE = {
     MediaType.ALBUM: "albums",
     MediaType.TRACK: "songs",
     MediaType.PLAYLIST: "playlists",
+    MediaType.PODCAST: "podcasts",
 }
+
+# Second search pass for tracks (issue #77). The "songs" filter only sees the
+# YTM catalog, so live recordings and other plain-YouTube uploads never
+# surface through it; the "videos" tab does index them. Kept out of
+# SEARCH_FILTER_BY_TYPE because it is an addition to the TRACK search, not a
+# type of its own.
+SEARCH_FILTER_VIDEOS = "videos"
+
+# The "videos" filter also returns podcast episodes (their resultType is
+# forced to "video" by the filter); those belong to the podcast domain, not in
+# track results.
+VIDEO_TYPE_PODCAST_EPISODE = "MUSIC_VIDEO_TYPE_PODCAST_EPISODE"
+
+# How much better a video has to match the query than the best catalog song
+# before it is ranked ahead of the songs, as a fraction of the query's tokens.
+# Videos are ranked below songs by default, but Music Assistant shares one
+# capped result window between every enabled provider, so a tail-ranked video
+# is invisible as soon as the user has a second provider (issue #77). A video
+# that covers substantially more of the query than any song does is what the
+# user was searching for, so it has to survive that cut.
+VIDEO_PROMOTION_MARGIN = 0.25
+
+# Podcast episode ids carry their show with them: "<podcastId>|<videoId>". Music
+# Assistant looks an episode up on its own, without the show for context, and
+# PodcastEpisode requires a podcast, so the id has to be enough to rebuild both.
+# Matches the official ytmusic provider's separator, and "|" cannot appear in a
+# YouTube id or playlist id. See issue #52.
+PODCAST_EPISODE_SPLITTER = "|"
+
+# Search returns a show as "MPSP" + its playlist id, while get_podcast expects
+# the bare playlist id. Strip on the way in so one id shape flows through.
+PODCAST_BROWSE_PREFIX = "MPSP"
+
+# Episodes per show. get_podcast pages beyond this, but a queue's worth of the
+# most recent episodes is what a browse is for, and every extra page is another
+# request against a service that rate-limits.
+PODCAST_EPISODE_LIMIT = 100
+
+# Shows in the library. Higher than the episode limit because this is a flat
+# list of subscriptions rather than a per-show fetch, and a truncated library
+# is the one thing Music Assistant reads as "you unsubscribed".
+LIBRARY_PODCAST_LIMIT = 9999
+
+# YouTube returns two auto-generated playlists alongside real subscriptions:
+# "New Episodes" (RDPN) and "Saved episodes" (SE). They are not shows, they do
+# not answer to get_podcast, and syncing them into the library would put two
+# permanent pseudo-subscriptions there that the user cannot remove. The official
+# ytmusic provider skips them for the same reason.
+PERSONAL_PODCAST_PLAYLIST_IDS = frozenset({"RDPN", "SE"})
+
+# Playlists that exist only inside a signed-in account: liked songs ("LM") and
+# the auto-generated podcast lists above. The yt-dlp fallback runs without
+# cookies, so for these it can never return anything; YouTube answers "The
+# playlist does not exist", which reads like data loss in the log (issue #82).
+PRIVATE_PLAYLIST_IDS = frozenset({"LM"}) | PERSONAL_PODCAST_PLAYLIST_IDS
+
+# Shows and episodes change far more slowly than a mix does: a new episode
+# appears weekly at best, and the description and artwork essentially never
+# change. Same stale-while-revalidate treatment as playlist tracks.
+PODCAST_CACHE_TTL = 6 * 3600
+
+# "3 hr 46 min", "31 min", "1 hr". YouTube spells episode lengths in words
+# rather than the clock format used for tracks, so _parse_timestamp cannot read
+# them.
+DURATION_WORDS_RE = re.compile(
+    r"(?:(?P<hours>\d+)\s*(?:hours?|hrs?|h)\b)?\s*"
+    r"(?:(?P<minutes>\d+)\s*(?:minutes?|mins?|m)\b)?\s*"
+    r"(?:(?P<seconds>\d+)\s*(?:seconds?|secs?|s)\b)?",
+    re.IGNORECASE,
+)
 
 CONF_AUTH_TYPE = "auth_type"
 CONF_COOKIE = "cookie_header"
 CONF_BRAND_ACCOUNT = "brand_account"
 CONF_AUTH_USER = "auth_user"
 CONF_PREFER_AUDIO_QUALITY = "prefer_audio_quality"
+CONF_FILTER_AI_MUSIC = "filter_ai_music"
+CONF_AI_BLOCKLIST = "ai_blocklist"
+CONF_AI_BLOCKLIST_URL = "ai_blocklist_url"
+
+# How long a fetched remote blocklist is trusted before a refresh is scheduled.
+# These lists change on the order of days, and the refresh happens in the
+# background off a stale read, so nothing waits on it. See issue #53.
+AI_BLOCKLIST_TTL = 12 * 3600
+
+# Seconds to wait on the remote list before giving up. Short on purpose: a
+# slow or dead host must not delay the radio call that noticed the staleness.
+AI_BLOCKLIST_TIMEOUT = 15
+
+# How long to leave a failed fetch alone before trying again. Without this the
+# staleness check re-fires on every filtered call, because a failure never
+# advances the fetched-at stamp, producing a request per queue build and a
+# warning line to match.
+AI_BLOCKLIST_RETRY_AFTER = 600
+
+# A YouTube channel id. Used to tell "block this exact channel" apart from
+# "block anything by this artist name", because names collide and ids do not.
+CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+
 AUTH_TYPE_NONE = "none"
 AUTH_TYPE_COOKIE = "cookie"
 
@@ -136,10 +368,31 @@ LEGACY_AUTH_FILE = "/data/ytmusic_browser_auth.json"
 # or hours later, with no obvious error to the user. See issue #6.
 RECOMMENDED_AUTH_COOKIES = ("__Secure-1PSID", "__Secure-3PSID", "SAPISID")
 
-# Substrings in exception messages that suggest an auth lapse (vs. a transient
-# network or parsing error). ytmusicapi surfaces httpx.HTTPStatusError with the
-# response status in the message, so plain substring matching is sufficient.
-AUTH_LAPSE_ERROR_MARKERS = ("401", "Unauthorized")
+# Patterns in exception messages that suggest an auth lapse, as opposed to a
+# transient network or parsing error. ytmusicapi surfaces httpx.HTTPStatusError
+# with the response status in the message.
+#
+# A bare "401" substring was too loose: it matched any message that happened to
+# contain those digits anywhere, and the strings we pass through here routinely
+# carry video ids and track titles. "Error 401 while fetching abc401xyz" and
+# "no formats for video 4012ab" were indistinguishable, so an ordinary
+# extraction failure could be reported to the user as an expired cookie. Anchor
+# the status to how an HTTP error actually spells it instead.
+# 403 is deliberately absent. It has its own meaning here (the owned-playlist
+# no-op path) and reporting it as an expired cookie would send people to
+# re-capture a cookie that is fine.
+AUTH_LAPSE_ERROR_PATTERN = re.compile(
+    r"(?:\b401\s+(?:Client\s+)?Error\b"
+    r"|\bstatus[_ ]code[=: ]+401\b"
+    r"|\bHTTP\s+401\b"
+    r"|\bUnauthorized\b"
+    r"|\bnot\s+authenticated\b"
+    r"|\bauthentication\s+(?:failed|required)\b"
+    # ytmusicapi's own wording when the client has no credentials at all
+    # (YTMusic._check_auth raises YTMusicUserError with exactly this text).
+    r"|\bprovide\s+authentication\b)",
+    re.IGNORECASE,
+)
 
 # Music Assistant's core search controller sanitizes the query before handing it
 # to a provider, replacing every "/" with a space and stripping "'"
@@ -289,6 +542,16 @@ def _strip_browse_prefix(playlist_id: str) -> str:
     return playlist_id[2:] if playlist_id.startswith("VL") else playlist_id
 
 
+def _is_private_playlist_id(playlist_id: str) -> bool:
+    """Is this a per-account playlist that only an authenticated call can read?
+
+    See ``PRIVATE_PLAYLIST_IDS``. For these the unauthenticated yt-dlp
+    fallback is guaranteed to fail, so callers skip it rather than log a
+    misleading "playlist does not exist" for a playlist that plainly exists.
+    """
+    return _strip_browse_prefix(playlist_id) in PRIVATE_PLAYLIST_IDS
+
+
 def _is_radio_playlist_id(playlist_id: str) -> bool:
     """Does this id carry the "RD" prefix, whatever kind of RD it turns out to be?
 
@@ -375,6 +638,277 @@ def _rank_audio_format(fmt: dict[str, Any], prefer_quality: bool) -> tuple[float
     return (1.0 if is_aac else 0.0, bitrate)
 
 
+def _parse_duration_words(value: Any) -> int | None:
+    """Seconds from a spelled-out duration like "3 hr 46 min".
+
+    Returns None when nothing numeric is found, so a caller can leave the
+    duration unset rather than claiming a track is zero seconds long.
+
+    Tracks report a clock string ("3:46") that ``_parse_timestamp`` reads;
+    podcast episodes report words instead, and the two are not interchangeable:
+    "3 hr 46 min" read as a clock is nonsense, and "3:46" read as words finds no
+    unit at all. Falls through to ``_parse_timestamp`` so either spelling works
+    whichever endpoint it came from.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+
+    match = DURATION_WORDS_RE.match(text)
+    if match and any(match.groupdict().values()):
+        hours = int(match["hours"] or 0)
+        minutes = int(match["minutes"] or 0)
+        seconds = int(match["seconds"] or 0)
+        total = hours * 3600 + minutes * 60 + seconds
+        if total > 0:
+            return total
+
+    return _parse_timestamp(text)
+
+
+def _episode_item_id(podcast_id: str, video_id: str) -> str:
+    """Build the composite id an episode is addressed by."""
+    return f"{podcast_id}{PODCAST_EPISODE_SPLITTER}{video_id}"
+
+
+def _split_episode_id(item_id: str) -> tuple[str, str]:
+    """Split "<podcastId>|<videoId>" into its parts.
+
+    A bare id with no separator is treated as the video id with no known show,
+    because that is what a hand-written or legacy id looks like and refusing it
+    outright would be less useful than resolving what we can.
+    """
+    podcast_id, sep, video_id = str(item_id).partition(PODCAST_EPISODE_SPLITTER)
+    if not sep:
+        return "", podcast_id
+    return podcast_id, video_id
+
+
+def _strip_podcast_browse_prefix(browse_id: str) -> str:
+    """Turn a search result's "MPSP<playlistId>" into the bare playlist id."""
+    return str(browse_id or "").removeprefix(PODCAST_BROWSE_PREFIX)
+
+
+def _description_text(value: Any) -> str | None:
+    """Read a description that may arrive as a string or a Description object.
+
+    ``get_podcast`` returns plain strings; ``get_episode`` returns ytmusicapi's
+    ``Description``, which stringifies to a repr rather than its text.
+    """
+    if value is None:
+        return None
+    text = getattr(value, "text", None)
+    if isinstance(text, str):
+        return text or None
+    if isinstance(value, str):
+        return value or None
+    return None
+
+
+def _normalize_artist_name(value: str) -> str:
+    """Fold an artist name to a form two spellings of it can both match."""
+    return " ".join(str(value).split()).casefold()
+
+
+def _search_tokens(value: str) -> set[str]:
+    """Split text into comparable tokens for query matching.
+
+    Punctuation is a separator rather than part of a token, so the dashes and
+    dots a YouTube upload title is full of ("7 SECONDS. Live in Madrid
+    (19-3-25)") do not stop its words from matching a plain typed query.
+    """
+    return {token for token in re.split(r"\W+", value.casefold()) if token}
+
+
+def _query_match_score(query_tokens: set[str], track: Track) -> float:
+    """How much of the query a track's title, version and artists cover, 0..1.
+
+    Deliberately crude: it only measures how many of the words the user typed
+    appear somewhere in the track, which is enough to tell a recording the
+    query names outright from a fuzzy catalog match on one or two of its words.
+    It is never used to rank results that YouTube Music already ordered against
+    each other, only to decide whether a video beats the songs (issue #77).
+    """
+    if not query_tokens:
+        return 0.0
+    parts = [track.name, track.version, *(artist.name for artist in track.artists)]
+    track_tokens = _search_tokens(" ".join(part for part in parts if part))
+    return len(query_tokens & track_tokens) / len(query_tokens)
+
+
+def _parse_blocklist(raw: str) -> tuple[frozenset[str], frozenset[str]]:
+    """Parse a blocklist document into (channel ids, normalized names).
+
+    Deliberately lenient about the format, because the whole point of the URL
+    field is to point at a list somebody else maintains, and we do not get to
+    dictate what they serve. Three shapes are understood:
+
+    * a JSON array of strings
+    * a JSON object with an ``artists``, ``channels`` or ``items`` array
+    * plain text, one entry per line, ``#`` starting a comment
+
+    Anything that parses as neither yields an empty pair rather than raising,
+    so a list that changes shape under us degrades to "filter nothing" instead
+    of breaking playback. Entries are classified by ``CHANNEL_ID_RE``: channel
+    ids match exactly, everything else matches on a folded name.
+    """
+    entries: list[str] = []
+    text = (raw or "").strip()
+    if not text:
+        return frozenset(), frozenset()
+
+    # Tracked separately from `entries`: valid JSON in a shape we do not
+    # recognise must yield nothing, not fall through to the line parser, which
+    # would otherwise turn every line of the document into an "artist name".
+    parsed_as_json = False
+    if text[0] in "[{":
+        with suppress(ValueError, TypeError, AttributeError):
+            loaded = json.loads(text)
+            parsed_as_json = True
+            if isinstance(loaded, dict):
+                for key in ("artists", "channels", "items"):
+                    if isinstance(loaded.get(key), list):
+                        loaded = loaded[key]
+                        break
+                else:
+                    loaded = []
+            if isinstance(loaded, list):
+                for item in loaded:
+                    if isinstance(item, str):
+                        entries.append(item)
+                    elif isinstance(item, dict):
+                        # Objects are common in community lists; take whichever
+                        # identifying field is present.
+                        for key in ("channel_id", "channelId", "id", "name", "artist"):
+                            if isinstance(item.get(key), str):
+                                entries.append(item[key])
+                                break
+
+    if not parsed_as_json:
+        if text.lstrip().startswith("<"):
+            # An HTML error page served with a 200, which some hosts do instead
+            # of a 404. Without this every line of it becomes a blocked artist.
+            return frozenset(), frozenset()
+        for line in text.splitlines():
+            # Only a leading "#" is a comment, matching what the config field
+            # and the README promise. Splitting on any "#" would truncate a
+            # name that legitimately contains one.
+            entry = line.strip()
+            if entry and not entry.startswith("#"):
+                entries.append(entry)
+
+    channel_ids = {e.strip() for e in entries if CHANNEL_ID_RE.match(e.strip())}
+    names = {
+        _normalize_artist_name(e)
+        for e in entries
+        if e.strip() and not CHANNEL_ID_RE.match(e.strip())
+    }
+    return frozenset(channel_ids), frozenset(names - {""})
+
+
+def _ytdlp_honours_preroll(version: str | None) -> bool:
+    """Whether this yt-dlp's ``available_at`` actually tracks pre-roll ads.
+
+    See ``MIN_YTDLP_VERSION_FOR_PREROLL``. An unreadable or unexpected version
+    string returns True, because the field is only acted on when it is present
+    *and* in the future: guessing "honour" costs a wait that a modern yt-dlp
+    only asks for when there really is an ad, while guessing "ignore" would
+    silently reinstate issue #51 for anyone whose version we failed to parse.
+    """
+    if not version:
+        return True
+    parts = version.split(".")[:3]
+    try:
+        parsed = tuple(int(part) for part in parts)
+    except (TypeError, ValueError):
+        return True
+    if len(parsed) < 3:
+        return True
+    return parsed >= MIN_YTDLP_VERSION_FOR_PREROLL
+
+
+def _ytdlp_can_stream(version: str | None) -> bool:
+    """Whether this yt-dlp's default clients survive the android_vr shutdown.
+
+    See ``MIN_YTDLP_VERSION_FOR_PLAYBACK``. Below the floor the defaults still
+    include android_vr, whose URLs stop serving after ~1 MiB, so every track
+    longer than a jingle dies mid-first-chunk. Only used to *warn*, never to
+    refuse: an unreadable version returns True because a wrong warning every
+    track is worse than a missing one, and the 403 itself still surfaces.
+    """
+    if not version:
+        return True
+    parts = version.split(".")[:3]
+    try:
+        parsed = tuple(int(part) for part in parts)
+    except (TypeError, ValueError):
+        return True
+    if len(parsed) < 3:
+        return True
+    return parsed >= MIN_YTDLP_VERSION_FOR_PLAYBACK
+
+
+def _preroll_wait_seconds(fmt: dict[str, Any], now: float | None = None) -> float:
+    """Seconds to wait before ``fmt``'s URL can actually be fetched.
+
+    When YouTube puts a pre-roll ad in front of a track it serves a media URL
+    that is not valid yet, and answers a fetch before the ad window with a 403.
+    yt-dlp models this as ``available_at``, a unix timestamp, and its own
+    downloader blocks on it ("Sleeping N seconds as required by the site")
+    before touching the URL.
+
+    We do not download; we hand the URL to Music Assistant, which fetches it at
+    once. So the wait has to happen here or the fetch 403s and the track is
+    skipped as unplayable. That was issue #51: extraction reported success,
+    playback failed, and nothing in between logged a reason.
+
+    Mirrors yt-dlp's own ``max(f.get('available_at') or 0 for f in
+    requested_formats)``: a merged format drops the field from the top level and
+    keeps it only on its parts, so taking the max means the wait covers whichever
+    part is gated latest. Absent, zero and unparseable all mean "no wait", so an
+    older yt-dlp that predates the field degrades to today's behaviour rather
+    than raising.
+
+    Returned uncapped. Whether a given wait is worth serving belongs to the
+    caller, which can tell "wait it out" apart from "too long to be real, fail
+    now" and act differently; clamping here would collapse the two.
+
+    yt-dlp also offers ``use_ad_playback_context``, which suppresses the wait at
+    the source. It is not usable here: it only takes effect on the ``mweb`` and
+    ``web_music`` player clients, and pinning a client is exactly what PR #44
+    removed, for reasons that still hold.
+    """
+    now = time.time() if now is None else now
+    parts = fmt.get("requested_formats") or [fmt]
+    available_at = 0.0
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        # OverflowError too: it is an ArithmeticError, not a ValueError, so an
+        # oversized int would otherwise escape and break the never-raise
+        # contract this docstring promises.
+        with suppress(TypeError, ValueError, OverflowError):
+            available_at = max(available_at, float(part.get("available_at") or 0))
+
+    wait = available_at - now
+    return wait if wait > 0 else 0.0
+
+
+def _content_range_total(value: str | None) -> int | None:
+    """Total byte size out of a ``Content-Range: bytes 0-1023/16492447`` header.
+
+    None for an absent, malformed or ``*``-sized header, so the caller falls
+    back to reading until a chunk comes back short instead of trusting a
+    number that was never there.
+    """
+    if not value or "/" not in value:
+        return None
+    total = value.rsplit("/", 1)[1].strip()
+    return int(total) if total.isdigit() else None
+
+
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ProviderInstanceType:
@@ -389,7 +923,25 @@ async def get_config_entries(
     action: str | None = None,
     values: dict[str, ConfigValueType] | None = None,
 ) -> tuple[ConfigEntry, ...]:
-    """Return Config entries to setup this provider."""
+    """Return Config entries to setup this provider.
+
+    Only Music Assistant 2.9.x calls this module-level hook. 2.10 resolves
+    config entries through the ``get_config_entries`` instance method on the
+    provider class instead, with no fallback to this function (issue #78).
+    Both delegate to :func:`_build_config_entries` so the two servers see the
+    same entries.
+    """
+    return _build_config_entries()
+
+
+def _build_config_entries() -> tuple[ConfigEntry, ...]:
+    """The provider's config entries, shared by the 2.9 and 2.10 hooks.
+
+    Every entry is optional with a usable default, deliberately: that is what
+    lets Music Assistant 2.10 create an instance without a ``setup_flow``
+    module, applying defaults and letting the cookie be added later from the
+    options page, same as on 2.9.
+    """
     return (
         ConfigEntry(
             key=CONF_AUTH_TYPE,
@@ -411,7 +963,11 @@ async def get_config_entries(
             default_value="",
             required=False,
             depends_on=CONF_AUTH_TYPE,
-            depends_on_value=[AUTH_TYPE_COOKIE],
+            # A scalar, not a list: both the 2.9 frontend and the 2.10 server
+            # compare depends_on_value with plain equality, so a list never
+            # matches anything and the gate silently stays open (or, on 2.10,
+            # shut). Exact-match single value is the documented contract.
+            depends_on_value=AUTH_TYPE_COOKIE,
             description="Paste your YouTube Music cookie from browser DevTools. "
             "Open music.youtube.com → DevTools → Network → copy the 'Cookie' header "
             "from any request. Must contain __Secure-3PAPISID.",
@@ -423,7 +979,7 @@ async def get_config_entries(
             default_value="",
             required=False,
             depends_on=CONF_AUTH_TYPE,
-            depends_on_value=[AUTH_TYPE_COOKIE],
+            depends_on_value=AUTH_TYPE_COOKIE,
             description="Leave empty for personal account. For brand accounts, "
             "find your ID at myaccount.google.com/brandaccounts or check the "
             "X-Goog-PageId header in browser DevTools on music.youtube.com.",
@@ -435,7 +991,7 @@ async def get_config_entries(
             default_value=0,
             required=False,
             depends_on=CONF_AUTH_TYPE,
-            depends_on_value=[AUTH_TYPE_COOKIE],
+            depends_on_value=AUTH_TYPE_COOKIE,
             description="Which signed-in Google account the cookie should resolve to, "
             "taken from the X-Goog-AuthUser request header on music.youtube.com. "
             "Leave at 0 unless you captured the cookie from a browser with several "
@@ -454,6 +1010,46 @@ async def get_config_entries(
             "128 kbps, though some accounts and regions are offered nothing better than a "
             "48 kbps AAC stream. Leave enabled unless you have a specific reason not to.",
         ),
+        ConfigEntry(
+            key=CONF_FILTER_AI_MUSIC,
+            type=ConfigEntryType.BOOLEAN,
+            label="Filter AI-generated music",
+            default_value=False,
+            required=False,
+            description="When enabled, tracks by artists on your blocklist are removed "
+            "from radio, mixes, similar tracks and recommendations before they reach the "
+            "queue. Search results, your library and playlists you chose yourself are "
+            "never filtered, so looking something up still finds it. Off by default, and "
+            "it does nothing until you give it a list below.",
+        ),
+        ConfigEntry(
+            key=CONF_AI_BLOCKLIST,
+            type=ConfigEntryType.STRING,
+            label="Blocked artists",
+            default_value="",
+            required=False,
+            depends_on=CONF_FILTER_AI_MUSIC,
+            description="One entry per line, or separated by semicolons. An entry is "
+            "either an artist name or a YouTube channel id (UC...). Semicolons rather "
+            "than commas, because commas appear inside real names and splitting on them "
+            "would turn 'Earth, Wind & Fire' into a rule blocking everyone called Earth. "
+            "Names match loosely, ignoring case and extra spaces; channel ids match "
+            "exactly and are the reliable choice when two artists share a name. Lines "
+            "starting with # are ignored.",
+        ),
+        ConfigEntry(
+            key=CONF_AI_BLOCKLIST_URL,
+            type=ConfigEntryType.STRING,
+            label="Blocklist URL (optional)",
+            default_value="",
+            required=False,
+            depends_on=CONF_FILTER_AI_MUSIC,
+            description="Optional: a URL serving a community-maintained list, merged with "
+            "your own entries above. Accepts a JSON array of names or channel ids, a JSON "
+            "object with an 'artists' key, or plain text one per line. Refreshed in the "
+            "background about twice a day; if the URL is unreachable the last good list "
+            "keeps working and nothing is filtered that was not already.",
+        ),
     )
 
 
@@ -463,6 +1059,33 @@ class YoutubeMusicFreeProvider(MusicProvider):
     _ytmusic = None
     _yt_dlp_module = None
     _prefer_quality: bool = True
+    # Set from the installed yt-dlp version the first time a stream is
+    # resolved. Defaults to True so the pre-roll wait is on unless a version we
+    # know to be wrong about it is detected: the guard exists to suppress one
+    # bad release range, not to opt in to the fix. See issue #51.
+    _preroll_supported: bool = True
+    # Once-per-load latch for the stale-yt-dlp warning: the condition holds
+    # for every single track until Music Assistant restarts, and one loud
+    # warning reads better than one per queue item.
+    _warned_stale_ytdlp: bool = False
+    # AI-music filter (issue #53). Two sets rather than one, because channel
+    # ids must match exactly while names have to survive spelling drift.
+    _ai_filter_enabled: bool = False
+    _ai_blocklist_url: str = ""
+    _ai_blocked_channel_ids: frozenset[str] = frozenset()
+    _ai_blocked_names: frozenset[str] = frozenset()
+    # Entries typed into the config, kept apart from the fetched ones so a
+    # refresh can replace the remote half without discarding the user's own.
+    _ai_local_channel_ids: frozenset[str] = frozenset()
+    _ai_local_names: frozenset[str] = frozenset()
+    _ai_blocklist_fetched_at: float = 0.0
+    # Last attempt, successful or not, so a dead URL backs off instead of
+    # re-firing on every filtered call.
+    _ai_blocklist_attempted_at: float = 0.0
+    _ai_blocklist_refreshing: bool = False
+    # Holds a reference to the in-flight background refresh so the event loop
+    # does not garbage collect it mid-request.
+    _ai_blocklist_task: object = None
     _authenticated: bool = False
     _auth_lapse_warned: bool = False
     # Per-category flag: True once we've seen a non-empty sync. Used to tell a
@@ -473,8 +1096,25 @@ class YoutubeMusicFreeProvider(MusicProvider):
     # a second, genuinely empty account raise a false partial-auth error.
     _library_seen_nonempty: dict[str, bool]
 
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return the config entries for this provider instance.
+
+        Music Assistant 2.10 resolves the options page through this instance
+        method; the module-level hook above exists for 2.9.x, which never
+        calls this one (issue #78). 2.10 also calls it on every load, before
+        ``handle_async_init``, so it must not depend on state assigned there —
+        the entries are static, so that holds trivially.
+        """
+        return _build_config_entries()
+
     async def handle_async_init(self) -> None:
         """Set up the YTMusicFree provider."""
+        # First line out of the provider on every start, and deliberately before
+        # anything that can fail. Bug reports arrive as log excerpts, and until
+        # this existed the only answer to "which build are you running?" was
+        # "whatever main was on the day I installed". Logged rather than read
+        # from the manifest because Music Assistant drops the key. Issue #68.
+        self.logger.info("YouTube Music (Free) provider version %s", __version__)
         logging.getLogger("yt_dlp").setLevel(logging.WARNING)
         await self._install_packages()
         await self._purge_legacy_auth_file()
@@ -483,6 +1123,12 @@ class YoutubeMusicFreeProvider(MusicProvider):
         # False and pin every instance to the high-quality selector.
         prefer_quality = self.config.get_value(CONF_PREFER_AUDIO_QUALITY)
         self._prefer_quality = True if prefer_quality is None else bool(prefer_quality)
+
+        self._load_ai_filter_config()
+        if self._ai_filter_enabled and self._ai_blocklist_url:
+            # Non-fatal on purpose: an unreachable list must not stop the
+            # provider loading. The local entries are already in effect.
+            await self._refresh_remote_blocklist()
 
         auth_type = self.config.get_value(CONF_AUTH_TYPE) or AUTH_TYPE_NONE
         if auth_type == AUTH_TYPE_COOKIE:
@@ -496,8 +1142,27 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     self._ytmusic = await asyncio.to_thread(
                         self._create_ytmusic_client, auth=auth_headers, user=brand_account
                     )
-                    # Validate auth by making a lightweight library call
-                    await asyncio.to_thread(self._ytmusic.get_library_songs, limit=1)
+                    # Validate auth by making a lightweight library call.
+                    #
+                    # "Did it raise" is not enough on its own. A lapsed YouTube
+                    # session does not answer 401: it answers HTTP 200 with a
+                    # logged-out payload, which ytmusicapi unwraps to []. So the
+                    # call below succeeds, and before this check the provider
+                    # logged "library sync enabled" over a cookie that was
+                    # already dead. That reassuring line was the reporter's
+                    # first clue in issue #55 that something was wrong with the
+                    # logging rather than with their troubleshooting.
+                    songs = await asyncio.to_thread(
+                        self._ytmusic.get_library_songs, limit=1
+                    )
+                    if not songs and await asyncio.to_thread(
+                        self._probe_session_alive
+                    ) is False:
+                        raise RuntimeError(
+                            "the cookie was accepted but the account is not "
+                            "signed in (YouTube answers a lapsed session with "
+                            "an empty library rather than an auth error)"
+                        )
                     self._authenticated = True
                     self._auth_lapse_warned = False
                     self.logger.info(
@@ -698,17 +1363,38 @@ class YoutubeMusicFreeProvider(MusicProvider):
         ]
         if not filters:
             return parsed_results
+        # A track search gets a second pass over the "videos" tab, appended
+        # last so catalog songs come back first and videos rank below them in
+        # the merged results (issue #77).
+        if MediaType.TRACK in media_types:
+            filters.append(SEARCH_FILTER_VIDEOS)
 
-        results: list[dict] = []
+        results: list[tuple[str, dict]] = []
         for ytm_filter in filters:
             # Keep categories independent: one failing filter must not sink
             # the others.
             try:
-                results.extend(await _search_type(ytm_filter))
+                results.extend(
+                    (ytm_filter, item) for item in await _search_type(ytm_filter)
+                )
             except Exception as err:  # noqa: BLE001
                 self.logger.debug("search filter %s failed: %s", ytm_filter, err)
 
-        for result in results:
+        # Tracks are collected per pass instead of straight into the result.
+        # Music Assistant truncates the merged track list to `limit` before it
+        # re-ranks, and ytmusicapi treats `limit` as a floor, so the songs tab
+        # alone already fills that window; videos appended unbounded behind it
+        # would be cut off before anyone saw them, quietly re-losing the
+        # content issue #77 is about. Composing under `limit` here, with a
+        # slice reserved for videos, is the only place that can be done.
+        song_tracks: list[Track] = []
+        video_tracks: list[Track] = []
+        # YTM keeps a song and its music video as distinct ids, so this set
+        # should never fire across the songs/videos passes; it guards against
+        # the backend handing out a counterpart id twice, which it has done
+        # elsewhere (ytmusicapi #739).
+        seen_track_ids: set[str] = set()
+        for ytm_filter, result in results:
             try:
                 result_type = result.get("resultType")
                 if result_type == "artist" and MediaType.ARTIST in media_types:
@@ -717,16 +1403,86 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     parsed_results.albums.append(self._parse_album(result))
                 elif result_type == "playlist" and MediaType.PLAYLIST in media_types:
                     parsed_results.playlists.append(self._parse_playlist(result))
+                elif result_type == "podcast" and MediaType.PODCAST in media_types:
+                    # A show arrives as "MPSP<playlistId>" here and as the bare
+                    # playlist id everywhere else; _parse_podcast strips it so
+                    # one id shape reaches Music Assistant.
+                    parsed_results.podcasts.append(self._parse_podcast(result))
                 elif (
                     result_type in ("song", "video")
                     and MediaType.TRACK in media_types
+                    # The videos filter forces resultType "video" even on the
+                    # podcast episodes it returns; those belong to the podcast
+                    # domain, not in track results.
+                    and result.get("videoType") != VIDEO_TYPE_PODCAST_EPISODE
                     and (track := self._parse_track(result))
+                    and track.item_id not in seen_track_ids
                 ):
-                    parsed_results.tracks.append(track)
+                    seen_track_ids.add(track.item_id)
+                    if ytm_filter == SEARCH_FILTER_VIDEOS:
+                        video_tracks.append(track)
+                    else:
+                        song_tracks.append(track)
             except (InvalidDataError, KeyError, TypeError):
                 pass  # skip invalid items
 
+        # Catalog songs first, videos below them, together at most `limit`.
+        # The reservation shrinks to what the videos pass actually returned,
+        # so songs only give up window space when there is a video to show.
+        reserve = min(len(video_tracks), max(1, limit // 4))
+        songs_shown = song_tracks[: max(0, limit - reserve)]
+        promoted, weaker = self._split_promoted_videos(search_query, song_tracks, video_tracks)
+        # Promoted videos go in front of the songs, but must not evict them:
+        # only the slots the songs were not going to use are theirs. Anything
+        # over that stays ahead of the weaker videos and behind the songs,
+        # which is where it would have ranked before.
+        front_slots = max(0, limit - len(songs_shown))
+        parsed_results.tracks = (
+            promoted[:front_slots] + songs_shown + promoted[front_slots:] + weaker
+        )[:limit]
+
+        await self._attach_album_years(parsed_results.tracks)
         return parsed_results
+
+    @staticmethod
+    def _split_promoted_videos(
+        search_query: str,
+        song_tracks: list[Track],
+        video_tracks: list[Track],
+    ) -> tuple[list[Track], list[Track]]:
+        """Split the videos pass into the ones that outrank the songs and the rest.
+
+        Videos belong below catalog songs: for most queries the catalog holds
+        the recording the user meant, and the videos tab offers a live cover of
+        it. The exception is a query the catalog simply does not have, where the
+        video is the answer and ranking it last hides it (issue #77) — Music
+        Assistant slices the merged per-provider results to one shared window,
+        so with a second provider enabled only the head of this list is seen.
+
+        A video is promoted when it covers the query at least
+        ``VIDEO_PROMOTION_MARGIN`` better than *every* song did, which is the
+        strict reading of "clearly better" on purpose: a catalog song that
+        matches the query as well as the video keeps its place in front.
+
+        Order within each group is left as YouTube Music returned it, and no
+        split is made when there are no songs to outrank, so a crude token
+        score never gets to re-order results that YTM already ranked.
+        """
+        if not song_tracks or not video_tracks:
+            return [], video_tracks
+        query_tokens = _search_tokens(search_query)
+        if not query_tokens:
+            return [], video_tracks
+        threshold = (
+            max(_query_match_score(query_tokens, song) for song in song_tracks)
+            + VIDEO_PROMOTION_MARGIN
+        )
+        promoted: list[Track] = []
+        weaker: list[Track] = []
+        for video in video_tracks:
+            target = promoted if _query_match_score(query_tokens, video) >= threshold else weaker
+            target.append(video)
+        return promoted, weaker
 
     @classmethod
     def _parse_youtube_url(cls, query: str) -> tuple[str, str] | None:
@@ -892,6 +1648,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 )
         return results
 
+    @use_cache(CATALOG_CACHE_TTL, allow_expired_cache=True)
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id.
 
@@ -945,6 +1702,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         track.version = f"{track.version} [{trim_label}]".strip() if track.version else f"[{trim_label}]"
         return track
 
+    @use_cache(CATALOG_CACHE_TTL, allow_expired_cache=True)
     async def get_album(self, prov_album_id: str) -> Album:
         """Get full album details by id."""
         album_obj = await asyncio.to_thread(self._ytmusic.get_album, prov_album_id)
@@ -952,15 +1710,22 @@ class YoutubeMusicFreeProvider(MusicProvider):
             raise MediaNotFoundError(f"Album {prov_album_id} not found")
         return self._parse_album(album_obj, prov_album_id)
 
+    @use_cache(CATALOG_CACHE_TTL, allow_expired_cache=True)
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
         """Get album tracks for given album id."""
         album_obj = await asyncio.to_thread(self._ytmusic.get_album, prov_album_id)
         if not album_obj or not album_obj.get("tracks"):
             return []
+        album = self._parse_album(album_obj, prov_album_id)
         tracks = []
         for track_number, track_obj in enumerate(album_obj["tracks"], 1):
             with suppress(InvalidDataError, KeyError, TypeError):
                 track = self._parse_track(track_obj, track_number=track_number)
+                # Free here: the album this track came from is already in hand,
+                # year and all, so there is nothing to look up.
+                track.album = self._get_item_mapping(
+                    MediaType.ALBUM, album.item_id, album.name, album.year
+                )
                 tracks.append(track)
         return tracks
 
@@ -990,11 +1755,20 @@ class YoutubeMusicFreeProvider(MusicProvider):
             self.logger.debug("get_artist failed for %s: %s", prov_artist_id, err)
             return None
 
+    @use_cache(ARTIST_CACHE_TTL, allow_expired_cache=True)
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Get full artist details by id."""
-        # Fake IDs created when artist channel ID is unknown — return a stub
-        if prov_artist_id.startswith("unknown_"):
-            name = prov_artist_id[8:]
+        # Fake IDs created when artist channel ID is unknown — return a stub.
+        # "unknown_<name>" carries a display name; bare "unknown" is the
+        # artist-less placeholder from _minimal_track and the videos-tab search
+        # fallback (issue #77). Music Assistant resolves a track's artist
+        # mappings through this method when the artist page opens and when a
+        # track is added to the library, and it treats MediaNotFoundError as
+        # "drop the artist" — which errors the artist page and, for a track
+        # whose only artist is the placeholder, fails the library add with
+        # "Track is missing artist(s)". So the placeholder must resolve.
+        if prov_artist_id == "unknown" or prov_artist_id.startswith("unknown_"):
+            name = prov_artist_id[8:] or "Unknown Artist"
             return Artist(
                 item_id=prov_artist_id,
                 name=name,
@@ -1022,6 +1796,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         except Exception as e:
             raise MediaNotFoundError(f"Artist {prov_artist_id} not found") from e
 
+    @use_cache(ARTIST_CACHE_TTL, allow_expired_cache=True)
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
         """Get a list of albums for the given artist."""
         artist_obj = await self._fetch_artist_obj(prov_artist_id)
@@ -1037,6 +1812,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 albums.append(self._parse_album(album_obj, album_obj.get("browseId")))
         return albums
 
+    @use_cache(ARTIST_CACHE_TTL, allow_expired_cache=True)
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
         """Get a list of most popular tracks for the given artist."""
         artist_obj = await self._fetch_artist_obj(prov_artist_id)
@@ -1048,6 +1824,104 @@ class YoutubeMusicFreeProvider(MusicProvider):
             return playlist_tracks[:25]
         return []
 
+    # ------------------------------------------------------------------
+    # Podcasts (issue #52)
+    #
+    # Works without an account: search, show detail and episode detail all
+    # answer anonymously, and an episode is an ordinary YouTube video id, so the
+    # existing stream path carries the audio with no new code.
+    #
+    # Library sync is deliberately absent. get_library_podcasts and
+    # get_saved_episodes need auth, and declaring LIBRARY_PODCASTS without them
+    # would have Music Assistant sync a library we cannot read, which is exactly
+    # how issue #55 emptied people's libraries.
+    # ------------------------------------------------------------------
+
+    async def _fetch_podcast_obj(self, prov_podcast_id: str) -> dict[str, Any]:
+        """Fetch a show, accepting either the bare or MPSP-prefixed id."""
+        podcast_id = _strip_podcast_browse_prefix(prov_podcast_id)
+        try:
+            podcast_obj = await asyncio.to_thread(
+                self._ytmusic.get_podcast, podcast_id, limit=PODCAST_EPISODE_LIMIT
+            )
+        except Exception as err:
+            raise MediaNotFoundError(f"Podcast {prov_podcast_id} not found") from err
+        if not podcast_obj:
+            raise MediaNotFoundError(f"Podcast {prov_podcast_id} not found")
+        return podcast_obj
+
+    @use_cache(PODCAST_CACHE_TTL, allow_expired_cache=True)
+    async def get_podcast(self, prov_podcast_id: str) -> Podcast:
+        """Get full podcast details by id."""
+        podcast_id = _strip_podcast_browse_prefix(prov_podcast_id)
+        podcast_obj = await self._fetch_podcast_obj(podcast_id)
+        return self._parse_podcast(podcast_obj, podcast_id)
+
+    async def get_podcast_episodes(
+        self, prov_podcast_id: str
+    ) -> AsyncGenerator[PodcastEpisode, None]:
+        """Get the episodes of a podcast."""
+        podcast_id = _strip_podcast_browse_prefix(prov_podcast_id)
+        podcast_obj = await self._fetch_podcast_obj(podcast_id)
+        podcast = self._parse_podcast(podcast_obj, podcast_id)
+        for index, episode_obj in enumerate(podcast_obj.get("episodes") or [], start=1):
+            with suppress(InvalidDataError, KeyError, TypeError):
+                # "index" is None on every anonymous response measured, so the
+                # enumeration order is the only ordering available. Episodes
+                # come back newest first, which is the order a listener expects.
+                position = episode_obj.get("index") or index
+                yield self._parse_podcast_episode(episode_obj, podcast, position)
+
+    @use_cache(PODCAST_CACHE_TTL, allow_expired_cache=True)
+    async def get_podcast_episode(self, prov_episode_id: str) -> PodcastEpisode:
+        """Get a single podcast episode by its composite id."""
+        podcast_id, video_id = _split_episode_id(prov_episode_id)
+        if not video_id:
+            raise MediaNotFoundError(f"Episode {prov_episode_id} not found")
+        try:
+            episode_obj = await asyncio.to_thread(self._ytmusic.get_episode, video_id)
+        except Exception as err:
+            raise MediaNotFoundError(f"Episode {prov_episode_id} not found") from err
+        if not episode_obj:
+            raise MediaNotFoundError(f"Episode {prov_episode_id} not found")
+        # get_episode does not echo the video id back, and PodcastEpisode needs
+        # it to build its own item_id, so put it back from what we were asked.
+        episode_obj.setdefault("videoId", video_id)
+
+        # A PodcastEpisode must carry a Podcast. The id we were given holds the
+        # show, and the response names it too, so fall back to the response when
+        # a caller hands us a bare video id.
+        if not podcast_id:
+            author = episode_obj.get("author")
+            if isinstance(author, dict):
+                podcast_id = _strip_podcast_browse_prefix(author.get("id") or "")
+            podcast_id = podcast_id or _strip_podcast_browse_prefix(
+                episode_obj.get("playlistId") or ""
+            )
+        podcast = await self._podcast_for_episode(podcast_id, episode_obj)
+        return self._parse_podcast_episode(episode_obj, podcast)
+
+    async def _podcast_for_episode(self, podcast_id: str, episode_obj: dict) -> Podcast:
+        """Resolve the show an episode belongs to, degrading to a stub.
+
+        A failed show lookup must not make the episode unplayable, so fall back
+        to a minimal Podcast built from what the episode response already names.
+        """
+        if podcast_id:
+            try:
+                return await self.get_podcast(podcast_id)
+            except Exception as err:  # noqa: BLE001 - a stub podcast still plays
+                self.logger.debug(
+                    "could not resolve podcast %s for episode: %s", podcast_id, err
+                )
+        author = episode_obj.get("author")
+        name = author.get("name") if isinstance(author, dict) else None
+        return self._parse_podcast(
+            {"title": name or "Unknown Podcast"},
+            podcast_id or episode_obj.get("playlistId") or "unknown",
+        )
+
+    @use_cache(PLAYLIST_TRACKS_CACHE_TTL, allow_expired_cache=True)
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
         """Get full playlist details by id."""
         try:
@@ -1060,6 +1934,21 @@ class YoutubeMusicFreeProvider(MusicProvider):
         except MediaNotFoundError:
             raise
         except Exception as err:  # noqa: BLE001 - degrade to the yt-dlp fallback
+            if _is_private_playlist_id(prov_playlist_id):
+                # No fallback exists for a private playlist, so this is the
+                # only place the real error can surface. At debug level all a
+                # user ever saw was yt-dlp's misleading "playlist does not
+                # exist" (issue #82).
+                self.logger.warning(
+                    "could not read private playlist %s with the authenticated "
+                    "session (%s: %s)",
+                    prov_playlist_id,
+                    type(err).__name__,
+                    err,
+                )
+                raise MediaNotFoundError(
+                    f"Playlist {prov_playlist_id} not found"
+                ) from err
             # ytmusicapi requires auth for some playlist types, and raises a
             # KeyError outright on song radio, so fall back to yt-dlp.
             self.logger.debug(
@@ -1158,10 +2047,28 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 playlist_id,
                 len(tracks_raw),
             )
-        return result
+        return self._drop_ai_tracks(result, f"mix {playlist_id}")
 
+    @use_cache(PLAYLIST_TRACKS_CACHE_TTL, allow_expired_cache=True)
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
-        """Return playlist tracks for the given playlist id."""
+        """Return playlist tracks for the given playlist id.
+
+        Cached, and the reason is the opposite of what it looks like. Nothing
+        here was ever cached, so every browse of a mix re-rolled it: the watch
+        endpoint hands back a freshly generated list on each call, measured at
+        147 tracks with no overlap between two consecutive requests. A list
+        that changes every time you look at it is not a playlist, and it also
+        meant a request to YouTube for every render.
+
+        The three-hour window makes a mix stable enough to read, and Music
+        Assistant bypasses it where freshness actually matters: playback and
+        refill pass ``force_refresh``, which sets the bypass context variable
+        ``use_cache`` honours, so a dynamic playlist still yields new tracks
+        when it is played rather than browsed. ``allow_expired_cache`` serves
+        the stale list immediately and refreshes behind it, so an expiry never
+        shows up as a spinner. Matches the official ytmusic provider. See
+        issue #56.
+        """
         if page > 0:
             return []
         # Only ids that nothing else will answer for go to the radio endpoint
@@ -1193,8 +2100,14 @@ class YoutubeMusicFreeProvider(MusicProvider):
                         track.position = index
                         result.append(track)
             expected_count = self._parse_playlist_track_count(playlist_obj)
-            if not tracks_raw or (
-                expected_count is not None and len(tracks_raw) < expected_count
+            # Private playlists never take the fill-the-gap fallback: yt-dlp
+            # cannot see them, and the undercount test is chronically true for
+            # "LM" because YouTube's reported count includes unavailable
+            # entries, so every liked-songs fetch warned about a "missing"
+            # playlist that was read just fine (issue #82).
+            if not _is_private_playlist_id(prov_playlist_id) and (
+                not tracks_raw
+                or (expected_count is not None and len(tracks_raw) < expected_count)
             ):
                 # A radio id cannot be opened without a seed video. When we
                 # already parsed a track, hand its id over so the fallback has
@@ -1204,11 +2117,28 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     prov_playlist_id, seed
                 )
                 if len(ytdlp_result) > len(result):
-                    return self._merge_playlist_track_results(result, ytdlp_result)
+                    result = self._merge_playlist_track_results(result, ytdlp_result)
+            await self._attach_album_years(result)
             return result
         except (MediaNotFoundError, UnplayableMediaError):
             raise
         except Exception as err:  # noqa: BLE001 - degrade to the yt-dlp fallback
+            if _is_private_playlist_id(prov_playlist_id):
+                # yt-dlp cannot read a private playlist, so degrading would
+                # return an empty list, and the cache decorator would then
+                # store that emptiness over the last good listing. Re-raise
+                # instead: nothing is cached on an exception, so the
+                # stale-while-revalidate cache keeps serving the previous
+                # listing, and the real error reaches the log at a level the
+                # user can see (issue #82).
+                self.logger.warning(
+                    "could not read private playlist %s with the authenticated "
+                    "session (%s: %s)",
+                    prov_playlist_id,
+                    type(err).__name__,
+                    err,
+                )
+                raise
             # ytmusicapi requires auth for some playlist types, and raises a
             # KeyError outright on song radio, so a fallback here is expected.
             # Include the error: without it this line cannot tell an
@@ -1405,6 +2335,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 pass
         return result
 
+    @use_cache(SIMILAR_TRACKS_CACHE_TTL, allow_expired_cache=True)
     async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Track]:
         """Return a dynamic list of tracks based on the provided track (song radio).
 
@@ -1439,21 +2370,55 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 track = self._parse_track(_normalize_watch_track(track_obj))
                 if track:
                     tracks.append(track)
-        return tracks
+        return self._drop_ai_tracks(tracks, f"song radio for {video_id}")
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
-        """Return stream details for the given track.
+        """Return stream details for the given track or podcast episode.
 
         ``item_id`` may carry a trim window (``VIDEOID@start-end``): the bare
         video id is used to resolve the stream, and ffmpeg input args trim the
         audio to that window so unwanted intros/outros (e.g. end-card audio)
         don't play.
+
+        A podcast episode is addressed as ``PODCASTID|VIDEOID`` (issue #52).
+        Once the show is stripped off, an episode is an ordinary YouTube video
+        and resolves down exactly the same path as a track.
         """
-        video_id, start, end = _split_track_id(item_id)
+        # Strip into a separate name, never over item_id: Music Assistant
+        # correlates the returned StreamDetails back to the queue item by the id
+        # it asked for, so handing back the bare video id would break that link.
+        stream_id = item_id
+        if media_type == MediaType.PODCAST_EPISODE or PODCAST_EPISODE_SPLITTER in item_id:
+            _, stream_id = _split_episode_id(item_id)
+        video_id, start, end = _split_track_id(stream_id)
         stream_format = await self._get_stream_format(video_id)
         self.logger.debug(
             "Resolved stream format '%s' for track %s", stream_format.get("format"), video_id
         )
+
+        # Sit out any pre-roll ad window before handing the URL over, because
+        # fetching inside it returns 403 (issue #51). Ahead of the expiration
+        # maths below, so the TTL we report is measured from the moment Music
+        # Assistant actually receives the URL rather than from before the wait.
+        if self._preroll_supported and (wait := _preroll_wait_seconds(stream_format)):
+            if wait > MAX_PREROLL_WAIT:
+                self.logger.warning(
+                    "Track %s reports a %.0fs pre-roll window, beyond the %.0fs "
+                    "we are willing to hold playback for. Handing the url over "
+                    "now; it will most likely be refused with a 403 and the "
+                    "track skipped.",
+                    video_id,
+                    wait,
+                    MAX_PREROLL_WAIT,
+                )
+            else:
+                self.logger.debug(
+                    "Waiting %.1fs for the pre-roll ad window on track %s before "
+                    "handing over the stream url",
+                    wait,
+                    video_id,
+                )
+                await asyncio.sleep(wait)
 
         url = stream_format["url"]
         expiration = DEFAULT_STREAM_URL_EXPIRATION
@@ -1476,11 +2441,27 @@ class YoutubeMusicFreeProvider(MusicProvider):
             audio_format=AudioFormat(
                 content_type=content_type,
             ),
-            stream_type=StreamType.HTTP,
+            # CUSTOM rather than HTTP: googlevideo now refuses unbounded
+            # fetches (see STREAM_CHUNK_SIZE), so ffmpeg cannot open this URL
+            # itself. Music Assistant instead pulls the bytes through
+            # get_audio_stream below.
+            stream_type=StreamType.CUSTOM,
+            # Unused for CUSTOM playback, but Music Assistant's logging and the
+            # live canary both read the resolved URL from here.
             path=url,
-            can_seek=True,
+            # False on purpose: with can_seek=False Music Assistant hands the
+            # seek offset to ffmpeg, which decodes and discards up to it. Seeking
+            # at this layer would mean starting the fetch at a byte offset, and a
+            # WebM/MP4 stream without its byte-0 headers is unparseable.
+            can_seek=False,
             allow_seek=True,
             expiration=expiration,
+            data={
+                "url": url,
+                # yt-dlp's per-format headers (User-Agent etc.), sent on every
+                # chunk so the fetch looks like the client that minted the URL.
+                "headers": dict(stream_format.get("http_headers") or {}),
+            },
         )
         if channels := stream_format.get("audio_channels"):
             with suppress(ValueError, TypeError):
@@ -1517,14 +2498,101 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     stream_details.duration = end - (start or 0)
         return stream_details
 
+    async def get_audio_stream(
+        self, streamdetails: StreamDetails, seek_position: int = 0
+    ) -> AsyncGenerator[bytes, None]:
+        """Stream the resolved audio in bounded-range chunks.
+
+        googlevideo enforces *bounded* Range requests on these URLs: no Range
+        header or an open-ended ``bytes=0-`` answers 403, ``bytes=0-N`` answers
+        206 from the same URL (see STREAM_CHUNK_SIZE). ffmpeg only opens URLs
+        the unbounded way, so the provider fetches the bytes itself, the same
+        way YouTube's own clients and yt-dlp do, and hands them down the pipe.
+
+        ``seek_position`` is part of the MusicProvider signature but always
+        arrives as 0 here: ``can_seek`` is False, so Music Assistant seeks by
+        decoding and discarding on its side of the pipe. That is deliberate; a
+        byte-offset start would drop the container headers that live at byte 0
+        and hand ffmpeg an unparseable stream.
+
+        The end of the file is detected two ways: the total from the first
+        response's ``Content-Range``, and a chunk answering with fewer bytes
+        than asked for. The second also covers a server that ignores the range
+        and answers 200 with the whole body.
+        """
+        del seek_position  # always 0, see docstring
+        data = streamdetails.data if isinstance(streamdetails.data, dict) else {}
+        url = data.get("url") or streamdetails.path
+        base_headers: dict[str, str] = dict(data.get("headers") or {})
+        chunk_size = STREAM_CHUNK_SIZE
+        pos = 0
+        total: int | None = None
+        while total is None or pos < total:
+            end = pos + chunk_size - 1
+            if total is not None:
+                end = min(end, total - 1)
+            headers = {**base_headers, "Range": f"bytes={pos}-{end}"}
+            received = 0
+            async with self.mass.http_session.get(url, headers=headers) as response:
+                if response.status == 403:
+                    # googlevideo caps the range size and the cap has already
+                    # moved once (10 MiB worked, then didn't). Nothing has
+                    # been yielded for this request, so retrying the same
+                    # position with a smaller ask is safe; only when the floor
+                    # still 403s is the URL itself the problem.
+                    if chunk_size > STREAM_CHUNK_FLOOR:
+                        chunk_size = max(chunk_size // 2, STREAM_CHUNK_FLOOR)
+                        self.logger.debug(
+                            "403 for a %d-byte range on %s; retrying bytes %d- "
+                            "with %d-byte chunks",
+                            end - pos + 1,
+                            streamdetails.item_id,
+                            pos,
+                            chunk_size,
+                        )
+                        continue
+                    # The strongest signal this provider has that the URL is
+                    # dead (expired, or enforcement changed again). Name the
+                    # position: a 403 at byte 0 and a 403 mid-track are
+                    # different bugs.
+                    raise UnplayableMediaError(
+                        f"googlevideo answered 403 at bytes {pos}-{end} for "
+                        f"{streamdetails.item_id} even at the "
+                        f"{STREAM_CHUNK_FLOOR}-byte floor"
+                    )
+                if response.status == 416:
+                    # Asked past the end of the file: a Content-Range total
+                    # that overstated the size. Everything real was streamed.
+                    return
+                response.raise_for_status()
+                if total is None and response.status == 206:
+                    total = _content_range_total(response.headers.get("Content-Range"))
+                async for part in response.content.iter_chunked(STREAM_YIELD_SIZE):
+                    received += len(part)
+                    yield part
+            if response.status == 200:
+                # The server ignored the Range header and the whole body just
+                # streamed out in one response. Asking again would replay it.
+                return
+            if received < (end - pos + 1):
+                # Short answer: either the file ended inside this chunk, or
+                # the connection dropped mid-chunk. Content-Range tells the
+                # two apart; without one, short can only be treated as done.
+                if total is None or pos + received >= total:
+                    return
+                # Truncated read. Resume from what actually arrived rather
+                # than skipping the gap.
+                pos += received
+                continue
+            pos = end + 1
+
     # ------------------------------------------------------------------
     # Library methods (require authentication)
     # ------------------------------------------------------------------
 
     def _is_auth_lapse(self, err: Exception) -> bool:
         """Return True if the error looks like an expired or invalid cookie."""
-        err_str = str(err)
-        return any(marker in err_str for marker in AUTH_LAPSE_ERROR_MARKERS)
+        return bool(AUTH_LAPSE_ERROR_PATTERN.search(str(err)))
 
     def _probe_session_alive(self) -> bool | None:
         """Best-effort check that the ytmusicapi session is still authenticated.
@@ -1561,22 +2629,77 @@ class YoutubeMusicFreeProvider(MusicProvider):
             self._library_seen_nonempty[category] = True
         return prev
 
-    async def _guard_partial_auth_empty(self, category: str, count: int) -> None:
-        """Raise on a suspected partial-auth empty sync to preserve MA's library cache.
+    async def _require_library_auth(self, category: str) -> None:
+        """Fail a library sync we cannot vouch for, rather than reporting it empty.
 
-        Only fires when the category was previously populated and the current
-        sync came back empty, then a side-channel probe confirms the session
-        is no longer authenticated.
+        Music Assistant treats a completed sync as authoritative. Anything it
+        previously held for this provider and did not see this round is dropped
+        from the library, and any item left with no provider claiming it is
+        unfavourited (``sync_library`` in its ``MusicProvider`` base). So
+        yielding nothing is not a neutral "no data": it is an instruction to
+        delete.
+
+        The provider declares the library features unconditionally at setup, so
+        a failed or lapsed cookie does not stop Music Assistant asking. Before
+        this guard the library methods answered that question with a silent
+        early return, which is why a cookie going stale emptied someone's
+        favourites rather than just failing to refresh them. Issue #55.
+
+        Genuinely anonymous instances are exempt: they have no library, never
+        had one, and nothing of theirs is waiting to be deleted.
         """
-        previously_populated = self._record_library_count(category, count)
-        if count > 0 or not previously_populated:
+        if self._authenticated:
             return
-        alive = await asyncio.to_thread(self._probe_session_alive)
-        if alive is not False:
+        auth_type = (self.config.get_value(CONF_AUTH_TYPE) if self.config else None) or (
+            AUTH_TYPE_NONE
+        )
+        if auth_type != AUTH_TYPE_COOKIE:
             return
         err = RuntimeError(
-            "Library returned empty but session probe reports Unauthorized "
-            "(suspected partial-auth lapse, issue #10)"
+            "Cookie authentication is configured but not active, so the library "
+            "cannot be read. Failing this sync on purpose: reporting an empty "
+            "library would make Music Assistant delete the items it already has "
+            "(issue #55). Refresh the cookie on the provider config page."
+        )
+        self._warn_library_error(f"get_library_{category}", err)
+        raise err
+
+    async def _guard_partial_auth_empty(self, category: str, count: int) -> None:
+        """Raise on a suspected partial-auth empty sync to preserve MA's library.
+
+        Fires whenever a sync comes back empty and a side-channel probe confirms
+        the session is no longer authenticated.
+
+        It used to also require the category to have been seen populated earlier
+        in this process. That state lives in ``_library_seen_nonempty``, which is
+        in memory and reset by ``handle_async_init``, so after any restart every
+        category read as "never populated" and the guard returned before probing
+        anything. A lapsed cookie plus a restart therefore looked exactly like a
+        genuinely empty library, which is the shape of issue #55. The probe is
+        one request and only runs when a sync returned nothing, which is rare
+        enough that its cost is irrelevant next to wiping someone's library.
+        """
+        self._record_library_count(category, count)
+        if count > 0:
+            return
+        alive = await asyncio.to_thread(self._probe_session_alive)
+        if alive is None:
+            # Undetermined. Accept the empty result rather than failing every
+            # genuinely empty library whenever the probe is unavailable, but say
+            # so, because this is the one path that can still lose items.
+            self.logger.warning(
+                "get_library_%s returned nothing and the session probe was "
+                "inconclusive. Treating the empty library as genuine. If items "
+                "disappear from Music Assistant after this, the cookie has "
+                "most likely lapsed and needs refreshing.",
+                category,
+            )
+            return
+        if alive:
+            return
+        err = RuntimeError(
+            "Library returned empty but the session probe reports the account "
+            "is not signed in (suspected cookie lapse, issues #10 and #55)"
         )
         self._warn_library_error(f"get_library_{category}", err)
         raise err
@@ -1599,25 +2722,86 @@ class YoutubeMusicFreeProvider(MusicProvider):
         else:
             self.logger.warning("%s failed: %s", context, err)
 
+    async def _fetch_library(self, method: str, **kwargs: Any) -> list[dict]:
+        """Run one ytmusicapi library call, failing the sync if it cannot answer.
+
+        Music Assistant treats a completed sync as authoritative: anything it
+        held for this provider and did not see this round is dropped from the
+        library, and whatever is then left with no provider claiming it is
+        unfavourited. So the "log it and return nothing" this replaces was not
+        a neutral "no data". It was an instruction to delete, issued on the
+        strength of a rate limit, a timeout or a stray parse error. Issue #64,
+        the same thesis as #55.
+
+        One helper rather than five copies. The swallow it replaces was written
+        once and then copied into each library method as it was added, most
+        recently into ``get_library_podcasts``. There is now one place to get
+        this wrong instead of five.
+
+        The original exception is re-raised unchanged rather than wrapped. Its
+        type and message are what a bug report needs, and ``_warn_library_error``
+        has already logged the explanation next to it.
+
+        ``except Exception`` is deliberate and must not be widened to
+        ``BaseException``: Music Assistant cancels the sync task on shutdown,
+        and a ``CancelledError`` is not a library failure to be logged as one.
+        """
+        try:
+            if self._ytmusic is None:
+                raise RuntimeError(
+                    "the ytmusicapi client is not initialised, so the library "
+                    "cannot be read"
+                )
+            call = getattr(self._ytmusic, method, None)
+            if call is None:
+                raise RuntimeError(
+                    f"the installed ytmusicapi has no {method}(). Upgrade it "
+                    "inside the Music Assistant container with "
+                    "`pip install --upgrade ytmusicapi`, then restart Music "
+                    "Assistant: the old module is already loaded in the "
+                    "running process, so the upgrade on its own changes "
+                    "nothing"
+                )
+            results = await asyncio.to_thread(call, **kwargs)
+            if results is None:
+                return []
+            if not isinstance(results, (list, tuple)):
+                # A shape we cannot count is a shape we cannot vouch for. len()
+                # of a dict counts its keys, so a changed response would sail
+                # past the empty-library guard on a non-zero count and then
+                # yield nothing, which is the deletion this helper exists to
+                # prevent.
+                raise TypeError(f"{method} returned {type(results).__name__}, expected a list")
+        except Exception as err:
+            # Warned here rather than at the call sites so the message still
+            # names the ytmusicapi method that actually failed.
+            self._warn_library_error(method, err)
+            raise
+        return list(results)
+
     async def get_library_artists(self) -> AsyncGenerator[Artist, None]:
-        """Get artists from the user's library (subscriptions + library artists)."""
+        """Get artists from the user's library (subscriptions + library artists).
+
+        Two independent fetches, and a failure in either fails the whole method.
+        Each used to be swallowed on its own, after which the empty-library
+        guard ran on ``len(subs) + len(lib_artists)``: a failed subscriptions
+        call next to five library artists produced a non-zero count, a clean
+        sync, and the deletion of every subscribed artist. That sum only means
+        something when both halves actually answered. Issue #64.
+
+        The second fetch is skipped once the first has failed. Whatever took out
+        one call (a lapsed cookie, a rate limit, YouTube being down) is about to
+        take out the other, its result would be discarded by the raise anyway,
+        and retrying into a rate limit is how a short one becomes a long one.
+        """
 
         if not self._authenticated:
+            await self._require_library_auth("artists")
             return
-        subs: list[dict] = []
-        lib_artists: list[dict] = []
-        try:
-            subs = await asyncio.to_thread(
-                self._ytmusic.get_library_subscriptions, limit=9999
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_subscriptions", err)
-        try:
-            lib_artists = await asyncio.to_thread(
-                self._ytmusic.get_library_artists, limit=9999
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_artists", err)
+        subs = await self._fetch_library("get_library_subscriptions", limit=9999)
+        lib_artists = await self._fetch_library("get_library_artists", limit=9999)
+        # Reached only when both fetches answered, which is the only reading of
+        # this sum that means anything.
         await self._guard_partial_auth_empty("artists", len(subs) + len(lib_artists))
         seen_ids: set[str] = set()
         for item in subs:
@@ -1641,14 +2825,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
         """Get albums from the user's library."""
 
         if not self._authenticated:
+            await self._require_library_auth("albums")
             return
-        try:
-            results = await asyncio.to_thread(
-                self._ytmusic.get_library_albums, limit=9999
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_albums", err)
-            return
+        results = await self._fetch_library("get_library_albums", limit=9999)
         await self._guard_partial_auth_empty("albums", len(results))
         for item in results:
             with suppress(InvalidDataError, KeyError, TypeError):
@@ -1658,14 +2837,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
         """Get tracks from the user's library."""
 
         if not self._authenticated:
+            await self._require_library_auth("tracks")
             return
-        try:
-            results = await asyncio.to_thread(
-                self._ytmusic.get_library_songs, limit=9999
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_songs", err)
-            return
+        results = await self._fetch_library("get_library_songs", limit=9999)
         await self._guard_partial_auth_empty("tracks", len(results))
         for item in results:
             with suppress(InvalidDataError, KeyError, TypeError):
@@ -1677,19 +2851,39 @@ class YoutubeMusicFreeProvider(MusicProvider):
         """Get playlists from the user's library."""
 
         if not self._authenticated:
+            await self._require_library_auth("playlists")
             return
-        try:
-            results = await asyncio.to_thread(
-                self._ytmusic.get_library_playlists, limit=9999
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_playlists", err)
-            return
+        results = await self._fetch_library("get_library_playlists", limit=9999)
         await self._guard_partial_auth_empty("playlists", len(results))
         for item in results:
             with suppress(InvalidDataError, KeyError, TypeError):
                 item.setdefault("id", item.get("playlistId"))
                 yield self._parse_playlist(item)
+
+    async def get_library_podcasts(self) -> AsyncGenerator[Podcast, None]:
+        """Get the shows the user subscribes to.
+
+        Same guard order as every other library method, and for the same reason:
+        Music Assistant deletes anything a completed sync did not return, so an
+        unauthenticated run has to fail rather than answer "no subscriptions",
+        and so does a run whose fetch failed. See issues #55 and #64.
+        """
+        if not self._authenticated:
+            await self._require_library_auth("podcasts")
+            return
+        results = await self._fetch_library("get_library_podcasts", limit=LIBRARY_PODCAST_LIMIT)
+        shows = [
+            obj
+            for obj in results
+            if str(obj.get("podcastId") or "") not in PERSONAL_PODCAST_PLAYLIST_IDS
+        ]
+        # Counted after the auto-playlists are dropped. Counting before would
+        # make a lapsed session look populated on the strength of two entries
+        # YouTube returns whether or not you subscribe to anything.
+        await self._guard_partial_auth_empty("podcasts", len(shows))
+        for obj in shows:
+            with suppress(InvalidDataError, KeyError, TypeError):
+                yield self._parse_podcast(obj)
 
     async def library_add(self, item: MediaItemType) -> bool:
         """Add an item to the user's library."""
@@ -1707,6 +2901,11 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 await asyncio.to_thread(self._ytmusic.subscribe_artists, [item_id])
             elif item.media_type in (MediaType.ALBUM, MediaType.PLAYLIST):
                 await asyncio.to_thread(self._ytmusic.rate_playlist, item_id, "LIKE")
+            elif item.media_type == MediaType.TRACK:
+                # A library track is a liked song. The id may carry a trim
+                # window ("VIDEOID@start-end"); only the bare video id rates.
+                video_id, _, _ = _split_track_id(item_id)
+                await asyncio.to_thread(self._ytmusic.rate_song, video_id, "LIKE")
             else:
                 return False
             return True
@@ -1733,6 +2932,13 @@ class YoutubeMusicFreeProvider(MusicProvider):
             elif media_type in (MediaType.ALBUM, MediaType.PLAYLIST):
                 await asyncio.to_thread(
                     self._ytmusic.rate_playlist, prov_item_id, "INDIFFERENT"
+                )
+            elif media_type == MediaType.TRACK:
+                # Un-rate the song so the delete also removes the like on
+                # YouTube; otherwise the next sync re-imports it (issue #82).
+                video_id, _, _ = _split_track_id(prov_item_id)
+                await asyncio.to_thread(
+                    self._ytmusic.rate_song, video_id, "INDIFFERENT"
                 )
             else:
                 return False
@@ -1768,7 +2974,10 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 with suppress(InvalidDataError, KeyError, TypeError):
                     if video_id := content.get("videoId"):
                         track = self._parse_track(content)
-                        if track:
+                        # Filtered per track, so a folder left with nothing is
+                        # dropped by the `if items` check below rather than
+                        # rendering as an empty shelf.
+                        if track and self._drop_ai_tracks([track], f"home feed '{title}'"):
                             items.append(track)
                     elif browse_id := content.get("browseId"):
                         if content.get("subscribers") or content.get("type") == "artist":
@@ -1799,6 +3008,152 @@ class YoutubeMusicFreeProvider(MusicProvider):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # AI-music filter (issue #53)
+    # ------------------------------------------------------------------
+
+    def _load_ai_filter_config(self) -> None:
+        """Read the filter settings into the sets the hot path consults."""
+        self._ai_filter_enabled = bool(self.config.get_value(CONF_FILTER_AI_MUSIC))
+        self._ai_blocklist_url = str(self.config.get_value(CONF_AI_BLOCKLIST_URL) or "").strip()
+        raw = str(self.config.get_value(CONF_AI_BLOCKLIST) or "")
+        # Semicolons, not commas. A single-line config box needs some in-line
+        # separator, and commas are far too common inside real artist names:
+        # splitting on them turns "Earth, Wind & Fire" into a rule that blocks
+        # every artist called "Earth". Semicolons effectively never appear in
+        # a name, so they separate unambiguously.
+        self._ai_local_channel_ids, self._ai_local_names = _parse_blocklist(
+            raw.replace(";", "\n")
+        )
+        self._ai_blocked_channel_ids = self._ai_local_channel_ids
+        self._ai_blocked_names = self._ai_local_names
+        self._ai_blocklist_fetched_at = 0.0
+        if self._ai_filter_enabled:
+            self.logger.debug(
+                "AI filter enabled with %d local channel ids and %d local names",
+                len(self._ai_local_channel_ids),
+                len(self._ai_local_names),
+            )
+
+    async def _refresh_remote_blocklist(self) -> None:
+        """Fetch the remote list and merge it over the local entries.
+
+        Never raises. A failure leaves whatever is already loaded in place,
+        because the alternative is a filter that quietly empties itself when a
+        community list goes offline, which would look identical to the filter
+        being switched off.
+        """
+        url = self._ai_blocklist_url
+        if not url or self._ai_blocklist_refreshing:
+            return
+        self._ai_blocklist_refreshing = True
+        # Stamped before the attempt, not after it, so the backoff applies to a
+        # failure too. Only advancing this on success is what let a dead URL
+        # re-fire on every single filtered call.
+        self._ai_blocklist_attempted_at = time.time()
+        try:
+            # Imported here rather than at module scope: aiohttp is guaranteed
+            # inside Music Assistant but is not a declared test dependency, and
+            # a module-level import would make the offline suite unrunnable
+            # without it.
+            aiohttp = importlib.import_module("aiohttp")
+            async with self.mass.http_session.get(
+                url, timeout=aiohttp.ClientTimeout(total=AI_BLOCKLIST_TIMEOUT)
+            ) as response:
+                response.raise_for_status()
+                body = await response.text()
+        except Exception as err:  # noqa: BLE001 - any failure means "keep the old list"
+            self.logger.warning(
+                "could not refresh the AI blocklist from %s: %s. Keeping the "
+                "previous list of %d channel ids and %d names.",
+                url,
+                err,
+                len(self._ai_blocked_channel_ids),
+                len(self._ai_blocked_names),
+            )
+            return
+        finally:
+            self._ai_blocklist_refreshing = False
+
+        remote_ids, remote_names = _parse_blocklist(body)
+        if not remote_ids and not remote_names:
+            self.logger.warning(
+                "the AI blocklist at %s parsed to nothing. Either it is empty "
+                "or its format is not one this provider understands; only your "
+                "own entries are in effect.",
+                url,
+            )
+        self._ai_blocked_channel_ids = self._ai_local_channel_ids | remote_ids
+        self._ai_blocked_names = self._ai_local_names | remote_names
+        self._ai_blocklist_fetched_at = time.time()
+        self.logger.debug(
+            "AI blocklist refreshed from %s: %d channel ids, %d names in total",
+            url,
+            len(self._ai_blocked_channel_ids),
+            len(self._ai_blocked_names),
+        )
+
+    def _schedule_blocklist_refresh_if_stale(self) -> None:
+        """Kick off a background refresh when the fetched list has aged out.
+
+        Fire and forget. The caller is on the path that builds a queue, so it
+        uses the list it already has and picks up the new one next time round.
+        """
+        if not self._ai_filter_enabled or not self._ai_blocklist_url:
+            return
+        if self._ai_blocklist_refreshing:
+            return
+        now = time.time()
+        if self._ai_blocklist_fetched_at and now - self._ai_blocklist_fetched_at < AI_BLOCKLIST_TTL:
+            return
+        if now - self._ai_blocklist_attempted_at < AI_BLOCKLIST_RETRY_AFTER:
+            return
+        with suppress(RuntimeError):
+            # RuntimeError when there is no running loop, which only happens in
+            # tests driving these helpers synchronously.
+            task = asyncio.get_running_loop().create_task(self._refresh_remote_blocklist())
+            # Keep a reference so the task is not garbage collected mid-flight.
+            self._ai_blocklist_task = task
+
+    def _is_ai_blocked(self, track: Track) -> bool:
+        """Whether ``track`` is by an artist on the blocklist."""
+        for artist in track.artists or ():
+            artist_id = getattr(artist, "item_id", None)
+            if artist_id and artist_id in self._ai_blocked_channel_ids:
+                return True
+            name = getattr(artist, "name", None)
+            if name and _normalize_artist_name(name) in self._ai_blocked_names:
+                return True
+        return False
+
+    def _drop_ai_tracks(self, tracks: list[Track], source: str) -> list[Track]:
+        """Remove blocklisted tracks from an auto-generated list.
+
+        Applied only to lists YouTube generated for us (radio, mixes, similar
+        tracks, recommendations). Search, library and hand-picked playlists are
+        left alone: filtering those would make a deliberate lookup fail to find
+        something the user explicitly asked for.
+        """
+        if not self._ai_filter_enabled:
+            return tracks
+        # Ahead of the empty-list exit, not after it. A config with only a
+        # remote URL starts with both sets empty, so gating the refresh on
+        # having entries meant that if the one fetch at startup failed, nothing
+        # ever retried and the filter stayed off for the process lifetime.
+        # Ahead of the empty-list exit, not after it. A config with only a
+        # remote URL starts with both sets empty, so gating the refresh on
+        # having entries meant that if the one fetch at startup failed, nothing
+        # ever retried and the filter stayed off for the process lifetime.
+        self._schedule_blocklist_refresh_if_stale()
+        if not self._ai_blocked_channel_ids and not self._ai_blocked_names:
+            return tracks
+        kept = [track for track in tracks if not self._is_ai_blocked(track)]
+        if dropped := len(tracks) - len(kept):
+            self.logger.debug(
+                "AI filter removed %d of %d tracks from %s", dropped, len(tracks), source
+            )
+        return kept
+
     async def _get_stream_format(self, item_id: str) -> dict[str, Any]:
         """Extract the best audio stream URL via yt-dlp (no cookies required)."""
 
@@ -1810,6 +3165,28 @@ class YoutubeMusicFreeProvider(MusicProvider):
             if self._yt_dlp_module is None:
                 self._yt_dlp_module = importlib.import_module("yt_dlp")
             yt_dlp = self._yt_dlp_module
+
+            # Decided here rather than at the call site because this is the only
+            # place the module is guaranteed to be imported.
+            ytdlp_version = getattr(getattr(yt_dlp, "version", None), "__version__", None)
+            self._preroll_supported = _ytdlp_honours_preroll(ytdlp_version)
+
+            # Checked against the *imported* module, not the installed package:
+            # setup upgrades the package on disk, but a process that already
+            # imported the old yt_dlp keeps it until Music Assistant restarts,
+            # and that gap looks exactly like the outage the upgrade fixed.
+            if not self._warned_stale_ytdlp and not _ytdlp_can_stream(ytdlp_version):
+                self._warned_stale_ytdlp = True
+                self.logger.warning(
+                    "yt-dlp %s still extracts through the android_vr client, "
+                    "which YouTube shut down on 2026-08-17: its URLs stop "
+                    "serving after ~1 MiB, so every track dies mid-stream. "
+                    "The provider requests %s at startup; restart Music "
+                    "Assistant so the upgrade is picked up, or run "
+                    "pip install -U --pre 'yt-dlp[default]' in the container.",
+                    ytdlp_version,
+                    MIN_YTDLP_REQUIREMENT,
+                )
 
             url = f"{YTM_DOMAIN}/watch?v={video_id}"
             ydl_opts = {
@@ -1985,6 +3362,21 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     name=name_only,
                 )
             ]
+        # A videos-tab search result sometimes carries no artists at all: the
+        # plain-YouTube uploads issue #77 exists to surface are exactly the
+        # ones whose subtitle has no linked channel. Dropping them would
+        # re-lose that content, so they get the same placeholder _minimal_track
+        # uses. Everything else keeps the raise: a catalog song without artists
+        # is malformed data, not a known shape.
+        if not track.artists and track_obj.get("resultType") == "video":
+            track.artists = [
+                ItemMapping(
+                    media_type=MediaType.ARTIST,
+                    item_id="unknown",
+                    provider=self.instance_id,
+                    name="Unknown Artist",
+                )
+            ]
         if not track.artists:
             raise InvalidDataError("Track is missing artists")
 
@@ -2136,6 +3528,84 @@ class YoutubeMusicFreeProvider(MusicProvider):
             playlist.owner = self.name
         return playlist
 
+    def _parse_podcast(self, podcast_obj: dict, podcast_id: str | None = None) -> Podcast:
+        """Parse a YTM podcast dict into a Podcast model object.
+
+        ``podcast_id`` overrides whatever the payload carries, because the show
+        detail response does not repeat its own id and the search result spells
+        it as an ``MPSP``-prefixed browse id.
+        """
+        resolved_id = podcast_id or _strip_podcast_browse_prefix(
+            podcast_obj.get("podcastId") or podcast_obj.get("browseId") or ""
+        )
+        if not resolved_id:
+            raise InvalidDataError("Podcast is missing an ID")
+        podcast = Podcast(
+            item_id=resolved_id,
+            provider=self.instance_id,
+            name=podcast_obj.get("title") or "Unknown Podcast",
+            provider_mappings={
+                ProviderMapping(
+                    item_id=resolved_id,
+                    provider_domain=self.domain,
+                    provider_instance=self.instance_id,
+                    url=f"{YTM_DOMAIN}/playlist?list={resolved_id}",
+                )
+            },
+        )
+        if description := _description_text(podcast_obj.get("description")):
+            podcast.metadata.description = description
+        author = podcast_obj.get("author") or podcast_obj.get("channel")
+        if isinstance(author, dict):
+            podcast.publisher = author.get("name")
+        elif isinstance(author, str):
+            podcast.publisher = author
+        if podcast_obj.get("thumbnails"):
+            podcast.metadata.images = self._parse_thumbnails(podcast_obj["thumbnails"])
+        if isinstance(episodes := podcast_obj.get("episodes"), list):
+            podcast.total_episodes = len(episodes)
+        return podcast
+
+    def _parse_podcast_episode(
+        self, episode_obj: dict, podcast: Podcast, position: int = 0
+    ) -> PodcastEpisode:
+        """Parse a YTM episode dict into a PodcastEpisode model object."""
+        video_id = episode_obj.get("videoId")
+        if not video_id:
+            raise InvalidDataError("Podcast episode is missing videoId")
+        item_id = _episode_item_id(podcast.item_id, video_id)
+        episode = PodcastEpisode(
+            item_id=item_id,
+            provider=self.instance_id,
+            name=episode_obj.get("title") or "Unknown Episode",
+            position=position,
+            podcast=podcast,
+            provider_mappings={
+                ProviderMapping(
+                    item_id=item_id,
+                    provider_domain=self.domain,
+                    provider_instance=self.instance_id,
+                    url=f"{YTM_DOMAIN}/watch?v={video_id}",
+                    audio_format=self._catalog_audio_format(),
+                )
+            },
+        )
+        if (duration := _parse_duration_words(episode_obj.get("duration"))) is not None:
+            episode.duration = duration
+        if description := _description_text(episode_obj.get("description")):
+            episode.metadata.description = description
+        if episode_obj.get("thumbnails"):
+            episode.metadata.images = self._parse_thumbnails(episode_obj["thumbnails"])
+        # Deliberately no release_date. The "date" key on an anonymous response
+        # holds a view count ("591K views"), not a date, on every episode of
+        # every show checked. Parsing it would either raise or, worse, land a
+        # nonsense date on the item.
+        #
+        # fully_played and resume_position_ms are also left unset: None tells
+        # Music Assistant to use its own resume point, which is better than us
+        # inventing one from a field YouTube does not give us anonymously.
+        return episode
+
     def _parse_thumbnails(self, thumbnails_obj: list[dict]) -> list[MediaItemImage]:
         """Convert YTM thumbnail list to MediaItemImage list."""
         result: list[MediaItemImage] = []
@@ -2171,13 +3641,70 @@ class YoutubeMusicFreeProvider(MusicProvider):
             )
         return result
 
-    def _get_item_mapping(self, media_type: MediaType, key: str, name: str) -> ItemMapping:
-        return ItemMapping(
+    def _get_item_mapping(
+        self, media_type: MediaType, key: str, name: str, year: int | None = None
+    ) -> ItemMapping:
+        mapping = ItemMapping(
             media_type=media_type,
             item_id=key,
             provider=self.instance_id,
             name=name,
         )
+        if year is not None:
+            # Upstream ItemMapping carries a year; this provider never set one,
+            # so an album reached through a track had no release year at all.
+            # Issue #53.
+            mapping.year = year
+        return mapping
+
+    async def _attach_album_years(self, tracks: list[Track]) -> None:
+        """Fill in the release year on each track's album, in place.
+
+        A track parsed from a playlist or a search result carries only
+        ``{"id", "name"}`` for its album, so the year has to come from an album
+        lookup. That is only affordable because ``get_album`` is cached for a
+        month: in steady state this costs nothing, and a cold cache costs one
+        request per distinct album rather than one per track.
+
+        Bounded on both axes. Concurrency is capped so a cold cache does not
+        arrive as a burst, and the number of distinct albums is capped so one
+        pathological playlist cannot become hundreds of requests. Past the cap
+        the remaining tracks simply keep a year of None, which is what they had
+        before this existed.
+
+        Never raises: a year is a nice-to-have, and failing a playlist load over
+        one is a bad trade. Requested in issue #53.
+        """
+        wanted: dict[str, list[ItemMapping]] = {}
+        for track in tracks:
+            album = getattr(track, "album", None)
+            album_id = getattr(album, "item_id", None)
+            if album_id and getattr(album, "year", None) is None:
+                wanted.setdefault(album_id, []).append(album)
+        if not wanted:
+            return
+
+        album_ids = list(wanted)[:ALBUM_YEAR_LOOKUP_LIMIT]
+        if len(wanted) > ALBUM_YEAR_LOOKUP_LIMIT:
+            self.logger.debug(
+                "album-year lookup capped at %d of %d distinct albums",
+                ALBUM_YEAR_LOOKUP_LIMIT,
+                len(wanted),
+            )
+        semaphore = asyncio.Semaphore(ALBUM_YEAR_LOOKUP_CONCURRENCY)
+
+        async def _fill(album_id: str) -> None:
+            async with semaphore:
+                try:
+                    album = await self.get_album(album_id)
+                except Exception as err:  # noqa: BLE001 - a missing year is not an error
+                    self.logger.debug("album-year lookup failed for %s: %s", album_id, err)
+                    return
+            if album.year:
+                for mapping in wanted[album_id]:
+                    mapping.year = album.year
+
+        await asyncio.gather(*(_fill(album_id) for album_id in album_ids))
 
     def _get_artist_item_mapping(self, artist_obj: dict) -> ItemMapping:
         # search results (filter="artists") key the id as "browseId" and the
@@ -2201,14 +3728,64 @@ class YoutubeMusicFreeProvider(MusicProvider):
         )
 
     async def _install_packages(self) -> None:
-        """Install required packages if not already present."""
-        for pkg in ("yt-dlp[default]", "ytmusicapi"):
-            await install_package(pkg)
-        try:
-            await asyncio.to_thread(importlib.import_module, "yt_dlp")
-        except ImportError as err:
-            raise SetupFailedError("yt-dlp failed to install") from err
-        try:
-            await asyncio.to_thread(importlib.import_module, "ytmusicapi")
-        except ImportError as err:
-            raise SetupFailedError("ytmusicapi failed to install") from err
+        """Install required packages, upgrading yt-dlp past the android_vr cutoff.
+
+        The yt-dlp requirement carries the MIN_YTDLP_REQUIREMENT floor rather
+        than a bare name, and that difference is what actually delivers the
+        2026-08 fix to existing installs: Music Assistant skips manifest
+        requirements without ``==``, and pip never touches an
+        already-satisfied bare requirement, so a floor here at setup is the
+        only hook that runs on every provider load.
+
+        An install failure degrades to a warning while something importable
+        exists: a stale yt-dlp plays nothing but browses fine, and the stream
+        path warns about staleness itself, whereas refusing to load would
+        take browsing down with it (and the import checks below still stop a
+        genuinely absent package).
+        """
+        async with _PACKAGE_SETUP_LOCK:
+            for pkg in (MIN_YTDLP_REQUIREMENT, "ytmusicapi"):
+                try:
+                    await install_package(pkg)
+                except Exception as err:  # noqa: BLE001 - degrade to what's installed
+                    self.logger.warning(
+                        "could not install or upgrade %s: %s. Continuing with "
+                        "whatever is already installed.",
+                        pkg,
+                        err,
+                    )
+
+            imported_modules: dict[str, Any] = {}
+            for module_name in ("requests", "yt_dlp", "ytmusicapi"):
+                for attempt in range(1, PACKAGE_IMPORT_ATTEMPTS + 1):
+                    try:
+                        if import_in_thread := getattr(
+                            mass_util, "import_module_in_thread", None
+                        ):
+                            # MA 2.10 serializes every provider import through
+                            # one executor and already retries module-lock
+                            # collisions once. Reuse that process-wide guard.
+                            imported_modules[module_name] = await import_in_thread(module_name)
+                        else:
+                            # MA 2.9 has no shared importer. The provider lock
+                            # still serializes all YT instances, and doing the
+                            # import here avoids separate worker-thread races.
+                            imported_modules[module_name] = importlib.import_module(module_name)
+                        break
+                    except Exception as err:  # noqa: BLE001 - retry Python import deadlocks
+                        if (
+                            type(err).__name__ != "_DeadlockError"
+                            or attempt == PACKAGE_IMPORT_ATTEMPTS
+                        ):
+                            raise SetupFailedError(
+                                f"{module_name} failed to import"
+                            ) from err
+                        self.logger.warning(
+                            "Python import deadlock while loading %s; retrying (%s/%s)",
+                            module_name,
+                            attempt,
+                            PACKAGE_IMPORT_ATTEMPTS,
+                        )
+                        await asyncio.sleep(0.1 * attempt)
+
+            self._yt_dlp_module = imported_modules["yt_dlp"]

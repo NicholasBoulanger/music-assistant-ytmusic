@@ -17,7 +17,7 @@ MONOCHROME_PREVIOUS_HASHFILE="/data/monochrome.previous.sha256"
 MONOCHROME_PREVIOUS_DATEFILE="/data/monochrome.previous.fetched_at"
 # Where auto-update pulls the latest provider from. Baked from the installer's
 # --repo-owner/--ref so a fork self-updates from its own source.
-TARBALL_URL="https://codeload.github.com/sproft/music-assistant-ytmusic/tar.gz/refs/heads/main"
+TARBALL_URL="https://codeload.github.com/NicholasBoulanger/music-assistant-ytmusic/tar.gz/refs/heads/main"
 MONOCHROME_TARBALL_URL="https://api.github.com/repos/NicholasBoulanger/music-assistant-monochrome/tarball/main"
 # How long to wait for the configured MA container to appear before logging a
 # loud ERROR. Catches the case where the installer's auto-detect fallback

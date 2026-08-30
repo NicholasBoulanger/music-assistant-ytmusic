@@ -1,5 +1,5 @@
 name: MA Provider Watcher (Monochrome)
-version: "1.1.0"
+version: "1.1.1"
 slug: ma_provider_watcher
 description: Keeps YouTube Music Free and private Monochrome providers installed and updated in Music Assistant.
 url: https://github.com/NicholasBoulanger/music-assistant-ytmusic/tree/main/ma_provider_watcher
