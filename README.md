@@ -2,6 +2,14 @@
 
 A custom Music Assistant provider that streams YouTube Music **without a premium subscription**, using the same technique as open-source players like [SimpMusic](https://github.com/maxrave-dev/SimpMusic).
 
+This fork includes upstream **1.2.3** (October 11, 2026; `b1ece38`) with MA 2.10
+Discover recommendations, more personalized shelves, recovery from interrupted
+YouTube stream URLs, cookie-auth notices, video artwork fixes, and provider icons.
+It retains our Python 3.14 startup fix: package setup is serialized, dependency
+imports use MA's shared importer, and import deadlocks have bounded retries.
+The Home Assistant watcher app version is **1.1.2**. Its independent provider
+update controls and Current/Previous rollback slots continue to use this fork.
+
 ## How it works
 
 | Component | Role |

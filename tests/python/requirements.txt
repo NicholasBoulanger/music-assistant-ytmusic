@@ -2,8 +2,17 @@ pytest>=8.0
 # Needed by test_stream_quality.py, which evaluates the real yt-dlp format
 # selector against synthetic format tables. No network access is involved.
 # Kept in step with the floor in ytmusic_free/manifest.json so CI exercises a
-# version the provider actually claims to support.
-yt-dlp>=2025.1.12
+# version the provider actually claims to support. Since the android_vr
+# shutdown (2026-08-17) that floor is a nightly: naming the .dev0 version in
+# the specifier is what lets pip resolve pre-releases without --pre, and the
+# live canary genuinely needs it, because a stable 2026.07.04 extracts
+# through android_vr, whose URLs stop serving after ~1 MiB.
+yt-dlp[default]>=2026.8.18.122307.dev0
 # Only the live suite needs this, to reach the radio/watch endpoint that serves
 # auto-generated mixes. The offline tests stub the client out entirely.
 ytmusicapi>=1.7.0
+# The AI-blocklist refresh fetches through Music Assistant's aiohttp session and
+# builds an aiohttp.ClientTimeout. MA always ships aiohttp; the provider imports
+# it lazily so the rest of the suite runs without it, but the tests that cover
+# that refresh path need it present.
+aiohttp>=3.9

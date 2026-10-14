@@ -60,10 +60,21 @@ def _install_music_assistant_models() -> None:
         depends_on_value: list | None = None
         description: str | None = None
 
+    @dataclass
+    class _ProviderError:
+        # Mirrors the upstream field order. translation_key must default to
+        # None: the provider leaves it unset so its own message is shown.
+        error_code: int
+        message: str
+        translation_key: str | None = None
+        translation_args: list = field(default_factory=list)
+        translation_owner: str | None = None
+
     config_entries.ConfigEntry = _ConfigEntry
     config_entries.ConfigValueOption = _ConfigValueOption
     config_entries.ConfigValueType = object
     config_entries.ProviderConfig = object
+    config_entries.ProviderError = _ProviderError
 
     enums = _new_module("music_assistant_models.enums")
 
@@ -112,6 +123,8 @@ def _install_music_assistant_models() -> None:
         ALBUM = "album"
         TRACK = "track"
         PLAYLIST = "playlist"
+        PODCAST = "podcast"
+        PODCAST_EPISODE = "podcast_episode"
 
     class _ProviderFeature(str, Enum):
         SEARCH = "search"
@@ -123,17 +136,24 @@ def _install_music_assistant_models() -> None:
         LIBRARY_ALBUMS = "library_albums"
         LIBRARY_TRACKS = "library_tracks"
         LIBRARY_PLAYLISTS = "library_playlists"
+        LIBRARY_PODCASTS = "library_podcasts"
         RECOMMENDATIONS = "recommendations"
         LIBRARY_ARTISTS_EDIT = "library_artists_edit"
         LIBRARY_ALBUMS_EDIT = "library_albums_edit"
         LIBRARY_PLAYLISTS_EDIT = "library_playlists_edit"
+        LIBRARY_TRACKS_EDIT = "library_tracks_edit"
 
     class _StreamType(str, Enum):
         HTTP = "http"
+        CUSTOM = "custom"
+
+    class _EventType(str, Enum):
+        PROVIDERS_UPDATED = "providers_updated"
 
     enums.AlbumType = _AlbumType
     enums.ConfigEntryType = _ConfigEntryType
     enums.ContentType = _ContentType
+    enums.EventType = _EventType
     enums.ImageType = _ImageType
     enums.MediaType = _MediaType
     enums.ProviderFeature = _ProviderFeature
@@ -142,21 +162,29 @@ def _install_music_assistant_models() -> None:
     errors = _new_module("music_assistant_models.errors")
 
     class _MAError(Exception):
-        pass
+        error_code = 0
 
     class _InvalidDataError(_MAError):
         pass
+
+    class _LoginFailed(_MAError):
+        # Upstream value, pinned in tests/ma_contract.py: Music Assistant maps
+        # it to the "Authentication required" status.
+        error_code = 6
 
     class _MediaNotFoundError(_MAError):
         pass
 
     class _SetupFailedError(_MAError):
-        pass
+        # Upstream value, pinned in tests/ma_contract.py: the startup notice
+        # that does not blame the cookie is written with it.
+        error_code = 5
 
     class _UnplayableMediaError(_MAError):
         pass
 
     errors.InvalidDataError = _InvalidDataError
+    errors.LoginFailed = _LoginFailed
     errors.MediaNotFoundError = _MediaNotFoundError
     errors.SetupFailedError = _SetupFailedError
     errors.UnplayableMediaError = _UnplayableMediaError
@@ -195,6 +223,11 @@ def _install_music_assistant_models() -> None:
         item_id: str
         provider: str
         name: str = ""
+        # Upstream carries this and the provider now fills it for albums
+        # reached through a track (issue #53). Without it here the stub would be
+        # missing a field reality has, and a test could not tell a year that was
+        # set from one that silently went nowhere.
+        year: int | None = None
 
         def __hash__(self):
             return hash((self.media_type, self.item_id, self.provider))
@@ -273,6 +306,30 @@ def _install_music_assistant_models() -> None:
         is_editable: bool = False
 
     @dataclass
+    class _Podcast(_BaseMediaItem):
+        publisher: str | None = None
+        total_episodes: int | None = None
+
+    @dataclass
+    class _PodcastEpisode(_BaseMediaItem):
+        # Matches the released upstream, where both report a None default even
+        # though the source declares them without one. The provider always sets
+        # both explicitly, and the unit suite asserts that, so the stub does not
+        # need to be stricter than the package users run.
+        position: int = None  # type: ignore[assignment]
+        podcast: object = None
+        duration: int = 0
+        fully_played: bool | None = None
+        resume_position_ms: int | None = None
+
+    # Exactly these four fields, on purpose: the ones the provider passes.
+    # Music Assistant 2.9's models (1.1.129.post1) raise TypeError on the
+    # keywords 2.10 added (type, enabled_by_default, supports_provider_filter);
+    # adding those here would let the provider pass one and still go green
+    # while it fails to build rows on 2.9. Keeping the stub at four makes any
+    # new keyword a deliberate decision. Pinned in tests/ma_contract.py.
+    # Issue #96.
+    @dataclass
     class _RecommendationFolder:
         item_id: str
         provider: str
@@ -285,6 +342,7 @@ def _install_music_assistant_models() -> None:
         albums: list = field(default_factory=list)
         tracks: list = field(default_factory=list)
         playlists: list = field(default_factory=list)
+        podcasts: list = field(default_factory=list)
 
     media_items.Album = _Album
     media_items.Artist = _Artist
@@ -294,6 +352,8 @@ def _install_music_assistant_models() -> None:
     media_items.MediaItemType = object
     media_items.MediaType = enums.MediaType
     media_items.Playlist = _Playlist
+    media_items.Podcast = _Podcast
+    media_items.PodcastEpisode = _PodcastEpisode
     media_items.ProviderMapping = _ProviderMapping
     media_items.RecommendationFolder = _RecommendationFolder
     media_items.SearchResults = _SearchResults
@@ -314,6 +374,9 @@ def _install_music_assistant_models() -> None:
         expiration: int = 0
         duration: int | None = None
         extra_input_args: list = field(default_factory=list)
+        # Free-form provider payload upstream; get_audio_stream reads the
+        # stream url and headers from it.
+        data: object = None
 
     streamdetails.StreamDetails = _StreamDetails
 
@@ -368,6 +431,7 @@ def _install_music_assistant() -> None:
         name: str = "YouTube Music (Free)"
 
         def __init__(self, mass=None, manifest=None, config=None, supported_features=None):
+            import asyncio
             import logging
 
             self.mass = mass
@@ -375,10 +439,61 @@ def _install_music_assistant() -> None:
             self.config = config
             self.supported_features = supported_features or set()
             self.logger = logging.getLogger("ytmusic_free_test")
+            # Set by Music Assistant once loaded_in_mass has returned. See
+            # verify_server_contract.
+            self.initialized = asyncio.Event()
+
+        async def loaded_in_mass(self) -> None:
+            return None
+
+        async def unload(self, is_removed: bool = False) -> None:
+            return None
+
+        # The Music Assistant 2.10 recommendation hooks, gate included. The
+        # base versions raise once RECOMMENDATIONS is declared, which is the
+        # whole of issue #96: without the gate here a provider that never
+        # overrode them passed every test while 2.10 showed no rows at all.
+        async def get_recommendations(self) -> list:
+            if enums.ProviderFeature.RECOMMENDATIONS in self.supported_features:
+                raise NotImplementedError
+            return []
+
+        async def get_recommendation_items(self, item_id: str) -> list:
+            if enums.ProviderFeature.RECOMMENDATIONS in self.supported_features:
+                raise NotImplementedError
+            return sys.modules["music_assistant_models.media_items"].UniqueList()
 
     music_provider_mod.MusicProvider = _MusicProvider
     models.music_provider = music_provider_mod
     pkg.models = models
+
+    controllers = _new_module("music_assistant.controllers")
+    cache_mod = _new_module("music_assistant.controllers.cache")
+
+    def _use_cache(expiration=600, **kwargs):
+        """Pass-through stand-in for Music Assistant's ``use_cache``.
+
+        Deliberately does no caching. The real decorator needs ``self.mass.cache``,
+        which the unit suite does not have, and every other test here wants the
+        undecorated behaviour anyway. What it does do is record the arguments on
+        the wrapped function, so a test can assert the decorator is applied with
+        the intended lifetime rather than merely that the code still runs.
+        """
+        import functools
+
+        def _decorator(func):
+            @functools.wraps(func)
+            async def _wrapper(*args, **fn_kwargs):
+                return await func(*args, **fn_kwargs)
+
+            _wrapper.__ma_cache__ = {"expiration": expiration, **kwargs}
+            return _wrapper
+
+        return _decorator
+
+    cache_mod.use_cache = _use_cache
+    controllers.cache = cache_mod
+    pkg.controllers = controllers
 
 
 _install_music_assistant_models()

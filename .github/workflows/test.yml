@@ -57,10 +57,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # 3.13 matches the Python version Music Assistant currently ships in
-        # its container. 3.11 is the lowest version the model classes have
-        # historically supported, so we cover the floor too.
-        python-version: ["3.11", "3.13"]
+        # MA 2.10.6 runs Python 3.14; retain the older compatibility checks too.
+        python-version: ["3.11", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
 
@@ -151,3 +149,8 @@ jobs:
               exit 1
             fi
           '
+
+      - name: Verify provider hooks against the real MA server
+        run: |
+          docker run --rm -i --entrypoint /app/venv/bin/python \
+            local-test-image:latest - < tests/verify_server_contract.py

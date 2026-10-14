@@ -62,7 +62,7 @@ assert_file_exists "committed app run.sh exists" "$REPO_ROOT/ma_provider_watcher
 assert_file_exists "committed app watcher_lib.sh exists" "$REPO_ROOT/ma_provider_watcher/watcher_lib.sh"
 
 repo_config="$(sed -n '1,200p' "$REPO_ROOT/ma_provider_watcher/config.yaml")"
-assert_contains "repository app has a fixed release version" 'version: "1.1.1"' "$repo_config"
+assert_contains "repository app has a fixed release version" 'version: "1.1.2"' "$repo_config"
 assert_contains "repository app discovers MA container at runtime" 'ma_container: auto' "$repo_config"
 assert_contains "repository app discovers Python at runtime" 'python_version: auto' "$repo_config"
 if bash -n "$REPO_ROOT/ma_provider_watcher/run.sh" "$REPO_ROOT/ma_provider_watcher/watcher_lib.sh" 2>/dev/null; then

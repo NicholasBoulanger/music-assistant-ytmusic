@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
+import types
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,10 +19,12 @@ from music_assistant_models.enums import (
     ImageType,
     MediaType,
     ProviderFeature,
+    StreamType,
 )
 from music_assistant_models.errors import (
     InvalidDataError,
     MediaNotFoundError,
+    UnplayableMediaError,
 )
 
 import ytmusic_free as ytm
@@ -35,6 +39,10 @@ def test_module_constants_present():
     assert ytm.YTM_DOMAIN == "https://music.youtube.com"
     assert ytm.VARIOUS_ARTISTS_YTM_ID == "UCUTXlgdcKU5vfzFqHOWIvkA"
     assert ytm.DEFAULT_STREAM_URL_EXPIRATION == 3600
+    # A cap, not a target. Has to clear a realistic multi-ad pod (the mid
+    # thirties) without letting a bogus timestamp present as a hung player.
+    assert 40 <= ytm.MAX_PREROLL_WAIT <= 90
+    assert ytm.MIN_YTDLP_VERSION_FOR_PREROLL == (2025, 12, 8)
 
 
 def test_base_features_are_anonymous_safe():
@@ -132,7 +140,7 @@ def test_build_auth_headers_falls_back_to_secure_3papisid_when_sapisid_missing(
     _forbid_open(monkeypatch)
     cookie = "__Secure-3PAPISID=fallbackValue; SID=foo"
     headers = provider._build_auth_headers(cookie)
-    # The hash uses the extracted SAPISID — we can't see the secret, but we can
+    # The hash uses the extracted SAPISID â€” we can't see the secret, but we can
     # confirm the same input produces a stable-shape header.
     assert headers["authorization"].startswith("SAPISIDHASH ")
 
@@ -374,6 +382,74 @@ def _setup_instance(monkeypatch, instance_id, values):
     return instance
 
 
+def _setup_cookie_instance(monkeypatch, instance_id, *, library, account_info, extra_config=None):
+    """Run handle_async_init with cookie auth and a scripted ytmusicapi client."""
+    instance = _make_provider(instance_id)
+    instance.config = _StubConfig(
+        {
+            ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_COOKIE,
+            ytm.CONF_COOKIE: "__Secure-3PAPISID=abc; SID=def",
+            **(extra_config or {}),
+        }
+    )
+    _forbid_open(monkeypatch)
+
+    async def _noop():
+        return None
+
+    client = MagicMock()
+    client.get_library_songs = MagicMock(return_value=library)
+    client.get_account_info = MagicMock(return_value=account_info)
+
+    monkeypatch.setattr(instance, "_install_packages", _noop)
+    monkeypatch.setattr(instance, "_purge_legacy_auth_file", _noop)
+    monkeypatch.setattr(instance, "_create_ytmusic_client", lambda auth=None, user=None: client)
+    monkeypatch.setattr(instance, "_build_auth_headers", lambda cookie, user: {"Cookie": cookie})
+    handler = _attach_capture(instance)
+    asyncio.run(instance.handle_async_init())
+    return instance, handler
+
+
+def test_init_does_not_claim_success_on_a_lapsed_cookie(monkeypatch):
+    """Issue #55: "library sync enabled" was printed over a dead cookie.
+
+    A lapsed YouTube session answers HTTP 200 with a logged-out payload rather
+    than 401, so the validation call succeeded and the provider announced that
+    library sync was enabled. The reporter flagged that line as the odd part of
+    their evidence, and they were right: it was the bug.
+    """
+    instance, handler = _setup_cookie_instance(
+        monkeypatch, "inst_lapsed", library=[], account_info={}
+    )
+
+    assert instance._authenticated is False
+    joined = " ".join(handler.messages()).lower()
+    assert "library sync enabled" not in joined
+    assert "anonymous" in joined
+
+
+def test_init_still_authenticates_an_account_with_an_empty_library(monkeypatch):
+    """An empty library is not evidence of a bad cookie when the session is live."""
+    instance, _ = _setup_cookie_instance(
+        monkeypatch, "inst_empty_but_valid", library=[], account_info={"accountName": "Real"}
+    )
+
+    assert instance._authenticated is True
+
+
+def test_init_skips_the_probe_when_the_library_call_returns_items(monkeypatch):
+    """The common path must not pay for an extra request."""
+    instance, _ = _setup_cookie_instance(
+        monkeypatch,
+        "inst_populated",
+        library=[{"videoId": "v1", "title": "x"}],
+        account_info={"accountName": "Real"},
+    )
+
+    assert instance._authenticated is True
+    assert instance._ytmusic.get_account_info.call_count == 0
+
+
 def test_prefer_quality_false_is_honored(monkeypatch):
     """A configured False must survive; `or True` used to swallow it."""
     instance = _setup_instance(
@@ -481,6 +557,463 @@ def test_cookie_instance_falls_back_to_anonymous_on_bad_cookie(monkeypatch):
     assert instance._authenticated is False
     # Second call is the anonymous retry after _build_auth_headers raised.
     assert instance._created_clients[-1] == {"auth": None, "user": None}
+
+
+# ---------------------------------------------------------------------------
+# Auth notice in the Music Assistant UI (issue #92)
+# ---------------------------------------------------------------------------
+
+
+class _FakeConfigController:
+    """Records what the provider writes as its last_error."""
+
+    def __init__(self):
+        self.writes = []
+
+    def update_provider_last_error(self, instance_id, error):
+        self.writes.append((instance_id, error))
+
+
+class _FakeMass:
+    """Just the server surface _sync_auth_notice touches."""
+
+    def __init__(self):
+        self.config = _FakeConfigController()
+        self.events = []
+        self.providers = []
+
+    def signal_event(self, event, object_id=None, data=None):
+        self.events.append((event, data))
+
+
+def _attach_mass(instance):
+    """Register the instance with a fake server, as a successful load would."""
+    mass = _FakeMass()
+    mass.providers.append(instance)
+    instance.mass = mass
+    return mass
+
+
+def _loaded_cookie_instance(monkeypatch, instance_id):
+    """A cookie instance that authenticated at startup and finished loading."""
+    instance, handler = _setup_cookie_instance(
+        monkeypatch, instance_id, library=[{"videoId": "v1"}], account_info={"accountName": "A"}
+    )
+    mass = _attach_mass(instance)
+    instance.initialized.set()
+    return instance, mass, handler
+
+
+_BAD_COOKIE = {ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_COOKIE, ytm.CONF_COOKIE: "SID=no_papisid_here"}
+
+
+def test_cookie_failure_records_a_notice_naming_the_mode_and_the_error(monkeypatch):
+    instance = _setup_instance(monkeypatch, "inst_notice_bad", _BAD_COOKIE)
+
+    notice = instance._auth_notice
+    assert notice is not None
+    assert "anonymous mode" in notice
+    # Quoted in a code span, or Markdown would eat the underscores.
+    assert "`Cookie must contain __Secure-3PAPISID`" in notice
+
+
+def test_empty_cookie_records_a_notice_and_a_warning(monkeypatch):
+    """Cookie auth chosen with the field left empty used to log nothing at all."""
+    instance = _make_provider("inst_notice_empty")
+    handler = _attach_capture(instance)
+    instance.config = _StubConfig({ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_COOKIE, ytm.CONF_COOKIE: ""})
+
+    async def _noop():
+        return None
+
+    monkeypatch.setattr(instance, "_install_packages", _noop)
+    monkeypatch.setattr(instance, "_purge_legacy_auth_file", _noop)
+    monkeypatch.setattr(instance, "_create_ytmusic_client", lambda auth=None, user=None: MagicMock())
+    asyncio.run(instance.handle_async_init())
+
+    assert instance._auth_notice == ytm.AUTH_NOTICE_COOKIE_MISSING
+    assert any(
+        r.levelname == "WARNING" and "no cookie is set" in r.getMessage() for r in handler.records
+    )
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_NONE},
+        {},
+        {ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_COOKIE, ytm.CONF_COOKIE: "__Secure-3PAPISID=a; SAPISID=b"},
+    ],
+    ids=["anonymous", "unset", "working-cookie"],
+)
+def test_no_notice_when_nothing_is_wrong(monkeypatch, values):
+    """A deliberately anonymous instance is not a failure and must not look like one."""
+    instance = _setup_instance(monkeypatch, "inst_notice_none", values)
+    assert instance._auth_notice is None
+
+
+def test_notice_is_written_only_after_music_assistant_finishes_loading(monkeypatch):
+    """Music Assistant clears last_error after a successful load.
+
+    On 2.10.5 that clear runs after loaded_in_mass, so writing any earlier gets
+    the notice wiped. The write waits for ``initialized`` and only runs through
+    the event loop; test_notice_survives_the_servers_clear checks that this
+    lands it after the clear on both server versions.
+    """
+    instance = _setup_instance(monkeypatch, "inst_notice_wait", _BAD_COOKIE)
+    mass = _attach_mass(instance)
+
+    async def _scenario():
+        await instance.loaded_in_mass()
+        await asyncio.sleep(0)
+        writes_before = list(mass.config.writes)
+        instance.initialized.set()
+        await instance._auth_notice_task
+        return writes_before
+
+    writes_before = asyncio.run(_scenario())
+
+    assert writes_before == []
+    assert len(mass.config.writes) == 1
+    instance_id, error = mass.config.writes[0]
+    assert instance_id == "inst_notice_wait"
+    assert error.error_code == ytm.LoginFailed.error_code
+    assert error.message == instance._auth_notice
+    # A translation key would make Music Assistant show its generic text.
+    assert error.translation_key is None
+    assert mass.events == [(ytm.EventType.PROVIDERS_UPDATED, mass.providers)]
+
+
+def test_loaded_instance_without_a_problem_writes_nothing(monkeypatch):
+    instance = _setup_instance(
+        monkeypatch, "inst_notice_quiet", {ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_NONE}
+    )
+    mass = _attach_mass(instance)
+
+    async def _scenario():
+        await instance.loaded_in_mass()
+        instance.initialized.set()
+        await instance._auth_notice_task
+
+    asyncio.run(_scenario())
+
+    assert mass.config.writes == []
+    assert mass.events == []
+
+
+def test_notice_is_not_written_for_an_instance_that_was_replaced(monkeypatch):
+    """A reload swaps in a new instance whose own load just cleared the field."""
+    instance = _setup_instance(monkeypatch, "inst_notice_stale", _BAD_COOKIE)
+    mass = _attach_mass(instance)
+    mass.providers[:] = [_make_provider("inst_notice_stale")]
+    instance.initialized.set()
+
+    instance._sync_auth_notice()
+
+    assert mass.config.writes == []
+
+
+def test_unload_cancels_a_pending_notice(monkeypatch):
+    instance = _setup_instance(monkeypatch, "inst_notice_unload", _BAD_COOKIE)
+    mass = _attach_mass(instance)
+
+    async def _scenario():
+        await instance.loaded_in_mass()
+        await asyncio.sleep(0)
+        await instance.unload()
+        # Release the waiter as a late load would. The fake server still lists
+        # the instance, so only the cancel in unload can stop the write.
+        instance.initialized.set()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        # Read inside the loop: asyncio.run cancels leftover tasks on exit.
+        return instance._auth_notice_task.cancelled(), list(mass.config.writes)
+
+    cancelled, writes = asyncio.run(_scenario())
+
+    assert cancelled
+    assert writes == []
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="eager tasks need Python 3.12")
+@pytest.mark.parametrize("server", ["2.10.5", "2.11"])
+def test_notice_survives_the_servers_clear(monkeypatch, server):
+    """Model both servers' post-load ordering and check the final stored value.
+
+    2.11 clears last_error, then starts the post-load step. 2.10.5 starts the
+    post-load step eagerly (loaded_in_mass and ``initialized.set()`` run right
+    away) and clears synchronously afterwards. The notice has to be the last
+    write in both.
+    """
+    instance = _setup_instance(monkeypatch, f"inst_notice_order_{server}", _BAD_COOKIE)
+    mass = _attach_mass(instance)
+
+    def _clear():
+        mass.config.writes.append((instance.instance_id, None))
+
+    async def _post_load():
+        await instance.loaded_in_mass()
+        instance.initialized.set()
+
+    async def _scenario():
+        loop = asyncio.get_running_loop()
+        if server == "2.11":
+            _clear()
+            post_load = asyncio.Task(_post_load(), loop=loop, eager_start=True)
+        else:
+            post_load = asyncio.Task(_post_load(), loop=loop, eager_start=True)
+            _clear()
+        await post_load
+        await instance._auth_notice_task
+
+    asyncio.run(_scenario())
+
+    assert mass.config.writes[-1][1] is not None
+    assert mass.config.writes[-1][1].message == instance._auth_notice
+
+
+@pytest.mark.parametrize("mass", [None, types.SimpleNamespace(config=object())])
+def test_notice_is_skipped_without_server_support(monkeypatch, mass):
+    """No server in the tests, or Music Assistant 2.9 without the API."""
+    instance = _setup_instance(monkeypatch, "inst_notice_old", _BAD_COOKIE)
+    instance.mass = mass
+    instance.initialized.set()
+
+    instance._sync_auth_notice()
+
+    assert instance._auth_notice_shown is None
+
+
+def test_a_failing_write_never_breaks_the_provider(monkeypatch):
+    instance = _setup_instance(monkeypatch, "inst_notice_raise", _BAD_COOKIE)
+    mass = _attach_mass(instance)
+
+    def _boom(instance_id, error):
+        raise RuntimeError("config store unavailable")
+
+    mass.config.update_provider_last_error = _boom
+    instance.initialized.set()
+
+    instance._sync_auth_notice()
+
+    # Not marked shown, so the next sync tries again.
+    assert instance._auth_notice_shown is None
+
+
+def test_runtime_auth_lapse_raises_the_notice_once(monkeypatch):
+    """A cookie that worked at startup and lapses later must surface too."""
+    instance, mass, _ = _loaded_cookie_instance(monkeypatch, "inst_notice_lapse")
+
+    instance._warn_library_error("get_library_songs", RuntimeError("Server returned HTTP 401"))
+    instance._warn_library_error("get_library_albums", RuntimeError("401 Client Error: x"))
+
+    assert len(mass.config.writes) == 1
+    _, error = mass.config.writes[0]
+    assert error.message.startswith("YouTube stopped accepting the cookie")
+    assert "`Server returned HTTP 401`" in error.message
+
+
+def test_a_lapse_before_loading_finishes_waits_for_the_pending_task(monkeypatch):
+    """A lapse after registration but before the server clears last_error.
+
+    Music Assistant registers the instance before it clears the field, so a
+    write from this window would be wiped and, being marked shown, never
+    repeated. The pending task has to write it instead.
+    """
+    instance, _ = _setup_cookie_instance(
+        monkeypatch,
+        "inst_notice_early",
+        library=[{"videoId": "v1"}],
+        account_info={"accountName": "A"},
+    )
+    mass = _attach_mass(instance)
+
+    async def _scenario():
+        instance._warn_library_error("get_library_songs", RuntimeError("Server returned HTTP 401"))
+        writes_before = list(mass.config.writes)
+        await instance.loaded_in_mass()
+        instance.initialized.set()
+        await instance._auth_notice_task
+        return writes_before
+
+    writes_before = asyncio.run(_scenario())
+
+    assert writes_before == []
+    assert len(mass.config.writes) == 1
+    assert mass.config.writes[0][1].message.startswith("YouTube stopped accepting the cookie")
+
+
+def _setup_cookie_instance_failing(monkeypatch, instance_id, error):
+    """Cookie instance whose validation call raises ``error``."""
+    instance = _make_provider(instance_id)
+    instance.config = _StubConfig(
+        {ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_COOKIE, ytm.CONF_COOKIE: "__Secure-3PAPISID=a; SID=b"}
+    )
+
+    async def _noop():
+        return None
+
+    client = MagicMock()
+    client.get_library_songs = MagicMock(side_effect=error)
+    monkeypatch.setattr(instance, "_install_packages", _noop)
+    monkeypatch.setattr(instance, "_purge_legacy_auth_file", _noop)
+    monkeypatch.setattr(instance, "_create_ytmusic_client", lambda auth=None, user=None: client)
+    monkeypatch.setattr(instance, "_build_auth_headers", lambda cookie, user: {"Cookie": cookie})
+    handler = _attach_capture(instance)
+    asyncio.run(instance.handle_async_init())
+    return instance, handler
+
+
+class YTMusicUserError(Exception):
+    """Same name as ytmusicapi's credentials error, which is matched by name."""
+
+
+class InvalidHeader(ValueError):
+    """Same name as the requests error for a header value it refuses."""
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("Server returned HTTP 401: Unauthorized."),
+        YTMusicUserError("Please provide authentication before using this function"),
+        InvalidHeader("Invalid return character or leading space in header: cookie"),
+    ],
+    ids=["http-401", "ytmusicapi-user-error", "invalid-header"],
+)
+def test_startup_errors_about_the_cookie_get_the_cookie_notice(monkeypatch, error):
+    instance, _ = _setup_cookie_instance_failing(monkeypatch, "inst_notice_cookie_err", error)
+
+    assert instance._auth_notice.startswith("Cookie authentication failed")
+    assert instance._auth_notice_code is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionError("Failed to resolve 'music.youtube.com'"),
+        TimeoutError("Read timed out"),
+        RuntimeError("Server returned HTTP 503: Service Unavailable."),
+        json.JSONDecodeError("Expecting value", "<html>", 0),
+    ],
+    ids=["dns", "timeout", "http-503", "parse"],
+)
+def test_startup_errors_elsewhere_do_not_blame_the_cookie(monkeypatch, error):
+    """A network blip at boot must not send the user to recapture a good cookie."""
+    instance, handler = _setup_cookie_instance_failing(monkeypatch, "inst_notice_net", error)
+    mass = _attach_mass(instance)
+    instance.initialized.set()
+
+    instance._sync_auth_notice()
+
+    assert instance._auth_notice.startswith("The cookie could not be checked")
+    _, written = mass.config.writes[0]
+    # Shown as ERROR, where the settings page offers Reload.
+    assert written.error_code == ytm.SetupFailedError.error_code
+    joined = " ".join(handler.messages())
+    assert "refresh your cookie" not in joined
+    assert "Could not verify the cookie" in joined
+
+
+def test_startup_log_does_not_quote_cookie_values(monkeypatch):
+    error = InvalidHeader("Invalid leading whitespace in header value: ' SID=abc123; HSID=def'")
+    instance, handler = _setup_cookie_instance_failing(monkeypatch, "inst_notice_log", error)
+
+    joined = " ".join(handler.messages())
+    assert "abc123" not in joined
+    assert "abc123" not in instance._auth_notice
+
+
+def test_proxy_407_is_not_a_cookie_lapse(provider):
+    err = RuntimeError(
+        "HTTPSConnectionPool(host='music.youtube.com', port=443): Max retries exceeded "
+        "(Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection "
+        "failed: 407 Proxy Authentication Required')))"
+    )
+    assert provider._is_auth_lapse(err) is False
+    assert provider._is_auth_lapse(RuntimeError("Authentication required")) is True
+
+
+def test_non_auth_library_errors_raise_no_notice(monkeypatch):
+    instance, mass, _ = _loaded_cookie_instance(monkeypatch, "inst_notice_timeout")
+
+    instance._warn_library_error("get_library_songs", RuntimeError("Read timed out"))
+
+    assert instance._auth_notice is None
+    assert mass.config.writes == []
+
+
+def test_session_probe_lapse_raises_the_notice(monkeypatch):
+    """The probe path words its error so the lapse pattern does not match it."""
+    instance, mass, _ = _loaded_cookie_instance(monkeypatch, "inst_notice_probe")
+    instance._ytmusic.get_account_info = MagicMock(return_value={})
+
+    with pytest.raises(RuntimeError, match="not signed in"):
+        asyncio.run(instance._guard_partial_auth_empty("tracks", 0))
+
+    assert len(mass.config.writes) == 1
+    assert "not signed in" in mass.config.writes[0][1].message
+
+
+def test_a_populated_sync_withdraws_a_lapse_notice(monkeypatch):
+    """One stray 401 must not leave the badge up while the library syncs fine."""
+    instance, mass, _ = _loaded_cookie_instance(monkeypatch, "inst_notice_clear")
+    instance._warn_library_error("library_add for x", RuntimeError("HTTP 401 Unauthorized"))
+
+    asyncio.run(instance._guard_partial_auth_empty("tracks", 3))
+
+    assert [error for _, error in mass.config.writes][1:] == [None]
+    assert instance._auth_notice is None
+    assert len(mass.events) == 2
+
+
+def test_a_lapse_does_not_replace_the_startup_notice(monkeypatch):
+    """An instance that never authenticated already says why; keep that text."""
+    instance = _setup_instance(monkeypatch, "inst_notice_keep", _BAD_COOKIE)
+    startup_notice = instance._auth_notice
+
+    instance._warn_library_error("get_home", RuntimeError("HTTP 401"))
+
+    assert instance._auth_notice == startup_notice
+
+
+def test_notice_reason_is_one_short_line_without_backticks():
+    long_error = RuntimeError("first line\n  second `quoted` line " + "x" * 400)
+
+    reason = ytm._auth_notice_reason(long_error)
+
+    assert "\n" not in reason
+    assert "`" not in reason
+    assert len(reason) <= ytm.AUTH_NOTICE_REASON_MAX
+    assert reason.endswith("...")
+    assert reason.startswith("first line second 'quoted' line")
+
+
+def test_notice_reason_never_quotes_cookie_values():
+    """requests embeds a rejected header value in its error message."""
+    err = ValueError(
+        "Invalid leading whitespace in header value: ' SID=abc123; HSID=def456; SSID=ghi'"
+    )
+
+    reason = ytm._auth_notice_reason(err)
+
+    for secret in ("abc123", "def456", "ghi"):
+        assert secret not in reason
+    assert "SID=<redacted>" in reason
+
+
+def test_cookie_with_surrounding_whitespace_still_authenticates(monkeypatch):
+    instance = _setup_instance(
+        monkeypatch,
+        "inst_cookie_space",
+        {ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_COOKIE, ytm.CONF_COOKIE: "  __Secure-3PAPISID=a; SAPISID=b \n"},
+    )
+    assert instance._authenticated is True
+    assert instance._created_clients[0]["auth"]["cookie"] == "__Secure-3PAPISID=a; SAPISID=b"
+
+
+def test_notice_reason_falls_back_to_the_exception_type():
+    assert ytm._auth_notice_reason(RuntimeError()) == "RuntimeError"
 
 
 # ---------------------------------------------------------------------------
@@ -898,6 +1431,160 @@ def test_parse_thumbnails_landscape_for_maxres(provider):
     assert images[0].type == ImageType.LANDSCAPE
 
 
+# Issue #90: Music Assistant only uses THUMB images for player artwork, so every
+# item that has any usable picture must come out with one.
+MAXRES = "https://i.ytimg.com/vi/x/maxresdefault.jpg"
+MAXRES_ONLY_VIDEO = [
+    {"url": "https://i.ytimg.com/vi/x/hqdefault.jpg", "width": 480, "height": 360},
+    {"url": MAXRES, "width": 1280, "height": 720},
+]
+
+
+def test_parse_thumbnails_mirrors_landscape_as_thumb_for_video(provider):
+    # hqdefault is dropped by the width filter, leaving only a LANDSCAPE.
+    images = provider._parse_thumbnails(MAXRES_ONLY_VIDEO)
+    assert [img.type for img in images] == [ImageType.LANDSCAPE, ImageType.THUMB]
+    assert images[1].path == images[0].path == MAXRES
+    assert images[1].provider == provider.instance_id
+    assert images[1].remotely_accessible is True
+
+
+def test_parse_thumbnails_no_mirror_when_thumb_exists(provider):
+    thumbs = [
+        {"url": MAXRES, "width": 1280, "height": 720},
+        {"url": "https://example/a=w800-h800", "width": 800, "height": 800},
+    ]
+    images = provider._parse_thumbnails(thumbs)
+    assert [img.type for img in images] == [ImageType.LANDSCAPE, ImageType.THUMB]
+    assert images[1].path == "https://example/a=w800-h800"
+
+
+def test_parse_thumbnails_mirrors_once_for_several_landscapes(provider):
+    thumbs = [
+        {"url": MAXRES, "width": 1280, "height": 720},
+        {"url": "https://i.ytimg.com/vi/y/maxresdefault.jpg", "width": 1920, "height": 1080},
+    ]
+    images = provider._parse_thumbnails(thumbs)
+    thumbs_out = [img for img in images if img.type == ImageType.THUMB]
+    assert [img.path for img in thumbs_out] == ["https://i.ytimg.com/vi/y/maxresdefault.jpg"]
+
+
+def test_parse_thumbnails_crops_a_wide_size_param_banner_square(provider):
+    # A banner with no entry under 600 px is all LANDSCAPE; the THUMB fallback
+    # asks the image server for a square crop of it.
+    thumbs = [
+        {"url": "https://lh3.googleusercontent.com/a=w1440-h600", "width": 1440, "height": 600},
+        {"url": "https://lh3.googleusercontent.com/a=w2880-h1200-p-l90-rj", "width": 2880, "height": 1200},
+    ]
+    images = provider._parse_thumbnails(thumbs)
+    assert [img.type for img in images] == [ImageType.LANDSCAPE, ImageType.THUMB]
+    assert images[1].path == "https://lh3.googleusercontent.com/a=w600-h600-p"
+
+
+def test_parse_thumbnails_no_fallback_when_a_small_size_param_image_became_thumb(provider):
+    # Real artist headers: the 540x225 entry is rewritten to a square THUMB.
+    thumbs = [
+        {"url": "https://lh3.googleusercontent.com/a=w540-h225", "width": 540, "height": 225},
+        {"url": "https://lh3.googleusercontent.com/a=w1440-h600", "width": 1440, "height": 600},
+    ]
+    images = provider._parse_thumbnails(thumbs)
+    assert [img.type for img in images] == [ImageType.LANDSCAPE, ImageType.THUMB]
+    assert images[1].path == "https://lh3.googleusercontent.com/a=w600-h600-p"
+
+
+# Search and playlist rows for video uploads carry a single signed 400x225.
+SMALL_FRAME = "https://i.ytimg.com/vi/x/hqdefault.jpg?sqp=-oaymwE&rs=AOn4CL"
+SMALL_FRAME_ONLY = [{"url": SMALL_FRAME, "width": 400, "height": 225}]
+
+
+def test_parse_thumbnails_keeps_a_small_video_frame_for_a_track(provider):
+    images = provider._parse_thumbnails(SMALL_FRAME_ONLY, keep_small_frame=True)
+    assert [(img.type, img.path) for img in images] == [(ImageType.THUMB, SMALL_FRAME)]
+
+
+def test_parse_thumbnails_drops_a_small_video_frame_by_default(provider):
+    # Playlists: Music Assistant generates a collage when there is no THUMB.
+    assert provider._parse_thumbnails(SMALL_FRAME_ONLY) == []
+
+
+def test_parse_thumbnails_keeps_the_widest_small_video_frame(provider):
+    # yt-dlp flat playlist entries top out at 336x188.
+    thumbs = [
+        {"url": f"https://i.ytimg.com/vi/x/hqdefault.jpg?sqp={w}", "width": w, "height": h}
+        for w, h in ((168, 94), (336, 188), (246, 138), (196, 110))
+    ]
+    images = provider._parse_thumbnails(thumbs, keep_small_frame=True)
+    assert [img.path for img in images] == ["https://i.ytimg.com/vi/x/hqdefault.jpg?sqp=336"]
+    assert images[0].type == ImageType.THUMB
+
+
+@pytest.mark.parametrize(
+    "thumb",
+    [
+        # Channel avatar: artists keep deferring to fanart.tv and TheAudioDB.
+        {"url": "https://yt3.ggpht.com/abc=s88-c-k-c0x00ffffff-no-rj", "width": 88, "height": 88},
+        # No width: the one real case pointed at a deleted video and 404s.
+        {"url": "https://i.ytimg.com/vi/gone/mqdefault.jpg"},
+    ],
+    ids=["channel-avatar", "no-width"],
+)
+def test_parse_thumbnails_keep_small_frame_ignores_non_frames(provider, thumb):
+    assert provider._parse_thumbnails([thumb], keep_small_frame=True) == []
+
+
+def test_parse_track_keeps_a_small_video_frame(provider):
+    track = provider._parse_track(
+        {
+            "videoId": "x",
+            "title": "Mix",
+            "artists": [{"name": "Uploader", "id": "UCx"}],
+            "thumbnails": SMALL_FRAME_ONLY,
+        }
+    )
+    assert [img.path for img in track.metadata.images] == [SMALL_FRAME]
+
+
+def test_parse_playlist_leaves_a_frame_only_playlist_to_the_collage(provider):
+    playlist = provider._parse_playlist(
+        {"playlistId": "PLx", "title": "P", "thumbnails": SMALL_FRAME_ONLY}
+    )
+    assert not playlist.metadata.images
+
+
+def test_parse_album_keeps_the_mirrored_thumb_through_unique_list(provider):
+    album = provider._parse_album(
+        {"browseId": "MPREb_x", "title": "A", "artists": [], "thumbnails": MAXRES_ONLY_VIDEO}
+    )
+    assert [img.type for img in album.metadata.images] == [ImageType.LANDSCAPE, ImageType.THUMB]
+
+
+@pytest.mark.parametrize(
+    "thumbnails",
+    [
+        MAXRES_ONLY_VIDEO,
+        [{"url": "https://i.ytimg.com/vi/x/hqdefault.jpg?sqp=a", "width": 320, "height": 180}],
+    ],
+    ids=["maxresdefault-only", "small-frame-only"],
+)
+def test_get_track_video_upload_carries_a_thumb(provider, thumbnails):
+    """End to end through get_track's videoDetails normalisation (#90)."""
+    mock = MagicMock()
+    mock.get_song = MagicMock(
+        return_value={
+            "videoDetails": {
+                "videoId": "x",
+                "title": "Mix",
+                "lengthSeconds": "3600",
+                "author": "Uploader",
+                "thumbnail": {"thumbnails": thumbnails},
+            }
+        }
+    )
+    provider._ytmusic = mock
+    track = asyncio.run(provider.get_track("x"))
+    assert any(img.type == ImageType.THUMB for img in track.metadata.images)
+
+
 def test_parse_thumbnails_skips_empty_url(provider):
     thumbs = [{"url": "", "width": 800, "height": 800}]
     images = provider._parse_thumbnails(thumbs)
@@ -995,10 +1682,13 @@ def test_get_config_entries_returns_expected_keys():
         ytm.CONF_BRAND_ACCOUNT,
         ytm.CONF_AUTH_USER,
         ytm.CONF_PREFER_AUDIO_QUALITY,
+        ytm.CONF_FILTER_AI_MUSIC,
+        ytm.CONF_AI_BLOCKLIST,
+        ytm.CONF_AI_BLOCKLIST_URL,
     ]
     cookie_entry = next(e for e in entries if e.key == ytm.CONF_COOKIE)
     assert cookie_entry.depends_on == ytm.CONF_AUTH_TYPE
-    assert cookie_entry.depends_on_value == [ytm.AUTH_TYPE_COOKIE]
+    assert cookie_entry.depends_on_value == ytm.AUTH_TYPE_COOKIE
 
 
 def test_auth_user_entry_is_cookie_only_and_defaults_to_zero():
@@ -1006,7 +1696,38 @@ def test_auth_user_entry_is_cookie_only_and_defaults_to_zero():
     entry = next(e for e in entries if e.key == ytm.CONF_AUTH_USER)
     assert entry.default_value == 0
     assert entry.depends_on == ytm.CONF_AUTH_TYPE
-    assert entry.depends_on_value == [ytm.AUTH_TYPE_COOKIE]
+    assert entry.depends_on_value == ytm.AUTH_TYPE_COOKIE
+
+
+def test_depends_on_value_is_a_scalar_everywhere():
+    """Both MA 2.9's frontend and MA 2.10's server compare depends_on_value
+    with plain equality, never containment, so a list can never match a
+    selected option. Every gated entry must use the scalar form."""
+    entries = asyncio.run(ytm.get_config_entries(mass=None))
+    for entry in entries:
+        assert not isinstance(entry.depends_on_value, list), entry.key
+
+
+def test_instance_get_config_entries_matches_module_hook(provider):
+    """MA 2.10 resolves the options page via the no-argument instance method;
+    2.9 uses the module-level hook (issue #78). Both must return the same
+    entries, and the instance method must be callable with no arguments,
+    exactly as the 2.10 config controller calls it."""
+    from_instance = asyncio.run(provider.get_config_entries())
+    from_module = asyncio.run(ytm.get_config_entries(mass=None))
+    # Full-object equality, not just keys: the stub ConfigEntry is a dataclass,
+    # so this pins every field (type, options, depends_on gating, defaults) to
+    # stay identical between the 2.9 and 2.10 paths.
+    assert list(from_instance) == list(from_module)
+
+
+def test_instance_get_config_entries_needs_no_init(provider):
+    """2.10 calls the instance method on every load, before handle_async_init,
+    so it must work on a freshly constructed provider with no client, no
+    config reads, and no async-init state."""
+    provider._ytmusic = None
+    entries = asyncio.run(provider.get_config_entries())
+    assert len(entries) == 8
 
 
 # ---------------------------------------------------------------------------
@@ -1034,24 +1755,47 @@ def test_search_artist_dispatches_with_artists_filter(provider):
     assert captured["filter"] == "artists"
 
 
-def test_search_track_dispatches_with_songs_filter(provider):
-    captured = {}
+def test_search_track_dispatches_with_songs_then_videos_filter(provider):
+    """A track search runs the songs filter and then the videos filter: the
+    songs tab only sees the YTM catalog, so live recordings and other plain
+    YouTube uploads would otherwise never surface (issue #77)."""
+    captured = []
 
     def _search(query, filter, limit):
-        captured["filter"] = filter
+        captured.append(filter)
         return []
 
     mock = MagicMock()
     mock.search = _search
     provider._ytmusic = mock
     asyncio.run(provider.search("foo", [MediaType.TRACK], limit=3))
-    assert captured["filter"] == "songs"
+    assert captured == ["songs", "videos"]
+
+
+def test_search_without_tracks_never_calls_videos_filter(provider):
+    """The videos pass exists purely to widen track results; a search that
+    asks for no tracks must not pay for it."""
+    captured = []
+
+    def _search(query, filter, limit):
+        captured.append(filter)
+        return []
+
+    mock = MagicMock()
+    mock.search = _search
+    provider._ytmusic = mock
+    asyncio.run(
+        provider.search("foo", [MediaType.ARTIST, MediaType.PLAYLIST], limit=3)
+    )
+    assert captured == ["artists", "playlists"]
 
 
 def test_search_multi_type_runs_filtered_call_per_type(provider):
     """Multi-type search issues one filtered call per type, not one unfiltered
     call. An unfiltered YTM search skews to songs/videos, so artists and
-    playlists rarely surface (issue #18)."""
+    playlists rarely surface (issue #18). The extra videos pass for tracks
+    (issue #77) always runs last, so catalog songs rank above videos in the
+    merged track list."""
     captured = []
 
     def _search(query, filter, limit):
@@ -1068,7 +1812,7 @@ def test_search_multi_type_runs_filtered_call_per_type(provider):
             limit=3,
         )
     )
-    assert captured == ["artists", "albums", "songs", "playlists"]
+    assert captured == ["artists", "albums", "songs", "playlists", "videos"]
     assert None not in captured
 
 
@@ -1078,6 +1822,8 @@ def test_search_one_failing_filter_does_not_sink_others(provider):
     def _search(query, filter, limit):
         if filter == "artists":
             raise RuntimeError("boom")
+        if filter != "songs":
+            return []
         return [
             {
                 "resultType": "song",
@@ -1136,27 +1882,338 @@ def test_search_parses_returned_items_by_result_type(provider):
 
 def test_search_skips_invalid_items(provider):
     """An item missing a required field should be skipped, not crash the search."""
+    songs = [
+        # No videoId â€” should be silently skipped.
+        {
+            "resultType": "song",
+            "title": "broken",
+            "artists": [{"id": "UCart", "name": "A"}],
+        },
+        {
+            "resultType": "song",
+            "videoId": "good",
+            "title": "ok",
+            "artists": [{"id": "UCart", "name": "A"}],
+        },
+    ]
     mock = MagicMock()
     mock.search = MagicMock(
-        return_value=[
-            # No videoId — should be silently skipped.
-            {
-                "resultType": "song",
-                "title": "broken",
-                "artists": [{"id": "UCart", "name": "A"}],
-            },
-            {
-                "resultType": "song",
-                "videoId": "good",
-                "title": "ok",
-                "artists": [{"id": "UCart", "name": "A"}],
-            },
-        ]
+        side_effect=lambda query, filter, limit: songs if filter == "songs" else []
     )
     provider._ytmusic = mock
     results = asyncio.run(provider.search("foo", [MediaType.TRACK]))
     assert len(results.tracks) == 1
     assert results.tracks[0].item_id == "good"
+
+
+def test_search_merges_videos_below_catalog_songs(provider):
+    """Video results surface in track search but rank below catalog songs,
+    regardless of relevance ordering within each tab (issue #77)."""
+    by_filter = {
+        "songs": [
+            {
+                "resultType": "song",
+                "videoId": "song1",
+                "title": "Catalog Song",
+                "artists": [{"id": "UCart", "name": "A"}],
+            }
+        ],
+        "videos": [
+            {
+                "resultType": "video",
+                "videoId": "vid1",
+                "title": "Live in Madrid",
+                "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                "artists": [{"id": None, "name": "Some Channel"}],
+            }
+        ],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("foo", [MediaType.TRACK]))
+    assert [t.item_id for t in results.tracks] == ["song1", "vid1"]
+
+
+def test_search_dedupes_same_video_id_across_filters(provider):
+    """The songs and videos tabs should never share an id, but the backend has
+    handed out counterpart ids before (ytmusicapi #739); a repeat must not
+    become a duplicate row."""
+    same = {
+        "resultType": "song",
+        "videoId": "dup1",
+        "title": "Song",
+        "artists": [{"id": "UCart", "name": "A"}],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(return_value=[same])
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("foo", [MediaType.TRACK]))
+    assert [t.item_id for t in results.tracks] == ["dup1"]
+
+
+def test_search_skips_podcast_episodes_from_videos_filter(provider):
+    """The videos filter forces resultType "video" onto the podcast episodes
+    it returns; only videoType tells them apart. Episodes belong to the
+    podcast domain, not in track results."""
+    by_filter = {
+        "songs": [],
+        "videos": [
+            {
+                "resultType": "video",
+                "videoId": "ep1",
+                "title": "Some Episode",
+                "videoType": "MUSIC_VIDEO_TYPE_PODCAST_EPISODE",
+                "artists": [{"id": None, "name": "Some Show"}],
+            },
+            {
+                "resultType": "video",
+                "videoId": "vid1",
+                "title": "Actual Video",
+                "videoType": "MUSIC_VIDEO_TYPE_OMV",
+                "artists": [{"id": "UCart", "name": "A"}],
+            },
+        ],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("foo", [MediaType.TRACK]))
+    assert [t.item_id for t in results.tracks] == ["vid1"]
+
+
+def test_search_parses_video_without_duration(provider):
+    """A live or ongoing upload shows no duration: ytmusicapi then returns
+    "duration": None and omits "duration_seconds" entirely. The result must
+    still parse instead of being dropped."""
+    by_filter = {
+        "songs": [],
+        "videos": [
+            {
+                "resultType": "video",
+                "videoId": "live1",
+                "title": "Concert Stream",
+                "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                "duration": None,
+                "artists": [{"id": None, "name": "Some Channel"}],
+            }
+        ],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("foo", [MediaType.TRACK]))
+    assert [t.item_id for t in results.tracks] == ["live1"]
+    assert results.tracks[0].duration == 0
+
+
+def test_search_keeps_video_without_artists(provider):
+    """A videos-tab result sometimes carries no artists key at all; those are
+    exactly the plain-YouTube uploads issue #77 surfaces, so they must fall
+    back to a placeholder artist instead of being dropped as malformed."""
+    by_filter = {
+        "songs": [],
+        "videos": [
+            {
+                "resultType": "video",
+                "videoId": "noart1",
+                "title": "Bootleg Concert",
+                "videoType": "MUSIC_VIDEO_TYPE_UGC",
+            }
+        ],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("foo", [MediaType.TRACK]))
+    assert [t.item_id for t in results.tracks] == ["noart1"]
+    assert [a.name for a in results.tracks[0].artists] == ["Unknown Artist"]
+
+
+def test_search_song_without_artists_still_skipped(provider):
+    """The artist fallback is scoped to videos-tab results; a catalog song
+    with no artists is malformed data and stays dropped."""
+    songs = [
+        {
+            "resultType": "song",
+            "videoId": "bad1",
+            "title": "Broken Catalog Row",
+        }
+    ]
+    mock = MagicMock()
+    mock.search = MagicMock(
+        side_effect=lambda query, filter, limit: songs if filter == "songs" else []
+    )
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("foo", [MediaType.TRACK]))
+    assert results.tracks == []
+
+
+def test_search_reserves_window_space_for_videos(provider):
+    """ytmusicapi treats limit as a floor, so the songs tab alone fills MA's
+    merged [:limit] window; without a reservation the appended videos would be
+    truncated away before ranking and issue #77 would silently persist. Songs
+    must be capped so at least one video survives inside the window."""
+
+    def _song(i):
+        return {
+            "resultType": "song",
+            "videoId": f"s{i}",
+            "title": f"Song {i}",
+            "artists": [{"id": "UCart", "name": "A"}],
+        }
+
+    by_filter = {
+        "songs": [_song(i) for i in range(8)],
+        "videos": [
+            {
+                "resultType": "video",
+                "videoId": "v0",
+                "title": "Live in Madrid",
+                "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                "artists": [{"id": None, "name": "Some Channel"}],
+            },
+            {
+                "resultType": "video",
+                "videoId": "v1",
+                "title": "Live in Berlin",
+                "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                "artists": [{"id": None, "name": "Some Channel"}],
+            },
+        ],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("foo", [MediaType.TRACK], limit=4))
+    # limit 4 with 2 videos available reserves one slot: three songs, then the
+    # first video, nothing beyond the window.
+    assert [t.item_id for t in results.tracks] == ["s0", "s1", "s2", "v0"]
+
+
+def _catalog_song(i, title="Song"):
+    return {
+        "resultType": "song",
+        "videoId": f"s{i}",
+        "title": f"{title} {i}",
+        "artists": [{"id": "UCart", "name": "A"}],
+    }
+
+
+def _ugc_video(video_id, title):
+    return {
+        "resultType": "video",
+        "videoId": video_id,
+        "title": title,
+        "videoType": "MUSIC_VIDEO_TYPE_UGC",
+        "artists": [{"id": None, "name": "Some Channel"}],
+    }
+
+
+def test_search_promotes_video_matching_query_better_than_songs(provider):
+    """The recording issue #77 is about, reproduced end to end.
+
+    Ranking every video behind the songs hides it: Music Assistant merges the
+    per-provider results into one capped window, so with a second provider
+    enabled only the head of this list is ever seen. A video that covers the
+    whole query while the catalog only fuzzy-matches two of its words has to
+    come first."""
+    by_filter = {
+        "songs": [
+            {
+                "resultType": "song",
+                "videoId": "s0",
+                "title": "7 Seconds",
+                "artists": [{"id": "UCart", "name": "Youssou N'Dour"}],
+            },
+            *[_catalog_song(i) for i in range(1, 8)],
+        ],
+        "videos": [
+            _ugc_video(
+                "0pquBdxfsXY",
+                "PORRIDGE RADIO - 7 SECONDS. Live in Madrid (19-3-25). Sala Copernico Live.",
+            )
+        ],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(
+        provider.search("porridge radio 7 seconds madrid", [MediaType.TRACK], limit=4)
+    )
+    ids = [t.item_id for t in results.tracks]
+    assert ids[0] == "0pquBdxfsXY"
+    # the catalog still fills the rest of the window, it is only outranked
+    assert ids == ["0pquBdxfsXY", "s0", "s1", "s2"]
+
+
+def test_search_keeps_weakly_matching_videos_below_songs(provider):
+    """Promotion is the exception. A video that matches the query no better
+    than the catalog does stays below the songs, which is where it belongs for
+    the ordinary case of the catalog holding the recording the user meant."""
+    by_filter = {
+        "songs": [_catalog_song(i, title="Catalog Song") for i in range(8)],
+        "videos": [_ugc_video("v0", "Catalog Song 0 (Live in Madrid)")],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("catalog song 0", [MediaType.TRACK], limit=4))
+    assert [t.item_id for t in results.tracks] == ["s0", "s1", "s2", "v0"]
+
+
+def test_search_promoted_videos_never_evict_every_song(provider):
+    """Promotion may only take the window slots the songs were not going to
+    use. A query where every video outranks the catalog must not turn a music
+    search into a wall of YouTube uploads."""
+    by_filter = {
+        "songs": [_catalog_song(i) for i in range(8)],
+        "videos": [_ugc_video(f"v{i}", f"Live in Madrid {i}") for i in range(5)],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("live in madrid", [MediaType.TRACK], limit=4))
+    ids = [t.item_id for t in results.tracks]
+    assert ids[0] == "v0"
+    assert ids[1:] == ["s0", "s1", "s2"]
+
+
+def test_search_does_not_reorder_videos_when_no_songs_match(provider):
+    """With no songs to outrank there is nothing to promote past, so the crude
+    token score never gets to second-guess the order YTM returned."""
+    by_filter = {
+        "songs": [],
+        "videos": [
+            _ugc_video("v0", "Something Unrelated"),
+            _ugc_video("v1", "Live in Madrid"),
+        ],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("live in madrid", [MediaType.TRACK], limit=4))
+    assert [t.item_id for t in results.tracks] == ["v0", "v1"]
+
+
+def test_split_promoted_videos_requires_a_clear_margin(provider):
+    """A video only outranks the songs when it covers the query substantially
+    better, so a video that ties the best song keeps its place behind it."""
+    songs = [provider._parse_track(_catalog_song(0, title="Live in Madrid"))]
+    tie = provider._parse_track(_ugc_video("tie", "Live in Madrid"))
+    better = provider._parse_track(_ugc_video("better", "Live in Madrid 0 Full Concert"))
+    promoted, weaker = provider._split_promoted_videos("live in madrid 0", songs, [tie, better])
+    assert [t.item_id for t in promoted] == []
+    assert [t.item_id for t in weaker] == ["tie", "better"]
+
+
+def test_query_match_score_treats_punctuation_as_separators(provider):
+    """Upload titles are full of dashes and dots; they must not stop the words
+    the user typed from matching."""
+    track = provider._parse_track(_ugc_video("v0", "7 SECONDS. Live in Madrid (19-3-25)."))
+    assert ytm._query_match_score({"madrid", "19"}, track) == 1.0
+    assert ytm._query_match_score({"madrid", "berlin"}, track) == 0.5
+    assert ytm._query_match_score(set(), track) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1541,6 +2598,1944 @@ def test_get_stream_details_no_trim_has_no_args(provider):
     assert sd.extra_input_args == []
 
 
+# ---------------------------------------------------------------------------
+# Bounded-range streaming
+#
+# googlevideo answers 403 to any fetch whose Range header is missing or
+# open-ended, while a bounded range against the same URL answers 206 (the
+# rqh=1 parameter; enforcement observed 2026-08-19, every install at once,
+# extraction still green). ffmpeg only fetches the unbounded way, so the
+# provider stopped handing it the URL: get_stream_details reports CUSTOM and
+# get_audio_stream pulls the bytes itself in bounded chunks.
+# ---------------------------------------------------------------------------
+
+
+class _RangeContent:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def iter_chunked(self, size: int):
+        async def _gen():
+            for i in range(0, len(self._body), size):
+                yield self._body[i : i + size]
+
+        return _gen()
+
+
+class _RangeResponse:
+    def __init__(self, status: int, body: bytes = b"", headers: dict | None = None):
+        self.status = status
+        self.headers = headers or {}
+        self.content = _RangeContent(body)
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise RuntimeError(f"HTTP {self.status}")
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeGoogleVideo:
+    """Serve a blob the way googlevideo now does: bounded Range or nothing.
+
+    ``requests`` records every (url, headers) pair so tests can assert what
+    was actually sent, not just what came back.
+    """
+
+    def __init__(
+        self,
+        blob: bytes,
+        *,
+        ignore_range: bool = False,
+        send_content_range: bool = True,
+        truncate_first: int | None = None,
+        max_range: int | None = None,
+        caps: dict[str, int] | None = None,
+    ):
+        self.blob = blob
+        self.ignore_range = ignore_range
+        self.send_content_range = send_content_range
+        self.truncate_first = truncate_first
+        # The size cap: ranges asking for more than this many bytes answer
+        # 403, the way googlevideo does since 2026-08 (1 MiB passed, 2 MiB
+        # did not, measured against a real ANDROID_VR URL).
+        self.max_range = max_range
+        # The position cap, per URL: any range reaching byte caps[url] or
+        # beyond answers 403, from the first request on. Since 2026-10 some
+        # googlevideo URLs serve only the first minute or so of the file.
+        self.caps = caps or {}
+        self.requests: list[tuple[str, dict]] = []
+
+    def get(self, url, headers=None, **_kwargs):
+        headers = dict(headers or {})
+        self.requests.append((url, headers))
+        if self.ignore_range:
+            return _RangeResponse(200, self.blob)
+        rng = headers.get("Range", "")
+        if not rng.startswith("bytes=") or rng.endswith("-"):
+            return _RangeResponse(403)
+        start_s, end_s = rng[len("bytes=") :].split("-")
+        start, end = int(start_s), int(end_s)
+        if self.max_range is not None and (end - start + 1) > self.max_range:
+            return _RangeResponse(403)
+        if url in self.caps and end >= self.caps[url]:
+            return _RangeResponse(403)
+        if start >= len(self.blob):
+            return _RangeResponse(416)
+        chunk = self.blob[start : end + 1]
+        if self.truncate_first is not None and len(self.requests) == 1:
+            chunk = chunk[: self.truncate_first]
+        response_headers = {}
+        if self.send_content_range:
+            response_headers["Content-Range"] = (
+                f"bytes {start}-{start + len(chunk) - 1}/{len(self.blob)}"
+            )
+        return _RangeResponse(206, chunk, response_headers)
+
+
+def _stream_all(provider, sd) -> bytes:
+    async def _collect():
+        return b"".join([part async for part in provider.get_audio_stream(sd)])
+
+    return asyncio.run(_collect())
+
+
+def _custom_stream_details(url="https://stream.example/x", headers=None, video_id=None):
+    from music_assistant_models.streamdetails import StreamDetails
+
+    data = {"url": url, "headers": headers or {}}
+    if video_id is not None:
+        data["video_id"] = video_id
+    return StreamDetails(provider="test", item_id="vid42", data=data)
+
+
+def _googlevideo_url(name, *, itag="251", clen="24", lmt="1759700000000000"):
+    """A stream URL carrying the parameters that identify the file behind it."""
+    return f"https://rr1.googlevideo.example/videoplayback?u={name}&itag={itag}&clen={clen}&lmt={lmt}"
+
+
+def _mass_with_session(session):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(http_session=session)
+
+
+def test_get_stream_details_is_custom_and_carries_url_and_headers(provider):
+    """The URL never reaches ffmpeg; it travels to get_audio_stream via data."""
+
+    async def _fmt(video_id):
+        return {
+            "url": "https://stream.example/x",
+            "ext": "m4a",
+            "http_headers": {"User-Agent": "com.google.android.apps.youtube.vr"},
+        }
+
+    provider._get_stream_format = _fmt
+    sd = asyncio.run(provider.get_stream_details("abc12345678@15-222", MediaType.TRACK))
+    assert sd.stream_type == StreamType.CUSTOM
+    assert sd.data == {
+        "url": "https://stream.example/x",
+        "headers": {"User-Agent": "com.google.android.apps.youtube.vr"},
+        # Bare, without the trim window: it is what a fresh URL is resolved
+        # from when this one stops serving partway.
+        "video_id": "abc12345678",
+    }
+    # Kept for logging and the live canary, not for playback.
+    assert sd.path == "https://stream.example/x"
+    # Seeking stays with ffmpeg: a WebM stream started at a byte offset has no
+    # container headers and cannot be parsed.
+    assert sd.can_seek is False
+    assert sd.allow_seek is True
+
+
+def test_get_audio_stream_fetches_in_bounded_ranges(provider, monkeypatch):
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 5)
+    blob = b"0123456789ab"
+    session = _FakeGoogleVideo(blob)
+    provider.mass = _mass_with_session(session)
+
+    out = _stream_all(provider, _custom_stream_details())
+
+    assert out == blob
+    ranges = [h["Range"] for _, h in session.requests]
+    # Every request bounded, contiguous, and capped to the Content-Range total.
+    assert ranges == ["bytes=0-4", "bytes=5-9", "bytes=10-11"]
+
+
+def test_get_audio_stream_sends_the_minting_clients_headers(provider, monkeypatch):
+    """Every chunk goes out with yt-dlp's per-format headers plus the range."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 5)
+    session = _FakeGoogleVideo(b"0123456789")
+    provider.mass = _mass_with_session(session)
+
+    _stream_all(
+        provider, _custom_stream_details(headers={"User-Agent": "android-vr"})
+    )
+
+    assert session.requests, "no request was made at all"
+    for _, headers in session.requests:
+        assert headers["User-Agent"] == "android-vr"
+        assert "Range" in headers
+
+
+def test_get_audio_stream_raises_unplayable_on_403(provider):
+    class _Deny:
+        def get(self, url, headers=None, **_kwargs):
+            return _RangeResponse(403)
+
+    provider.mass = _mass_with_session(_Deny())
+    with pytest.raises(UnplayableMediaError):
+        _stream_all(provider, _custom_stream_details())
+
+
+def test_get_audio_stream_handles_a_server_that_ignores_range(provider, monkeypatch):
+    """A 200 means the whole body already streamed; asking again would replay it."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 5)
+    blob = b"0123456789ab"
+    session = _FakeGoogleVideo(blob, ignore_range=True)
+    provider.mass = _mass_with_session(session)
+
+    out = _stream_all(provider, _custom_stream_details())
+
+    assert out == blob
+    assert len(session.requests) == 1
+
+
+def test_get_audio_stream_stops_without_content_range(provider, monkeypatch):
+    """No total to trust, so a short chunk is the only end-of-file signal."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 5)
+    blob = b"0123456789ab"
+    session = _FakeGoogleVideo(blob, send_content_range=False)
+    provider.mass = _mass_with_session(session)
+
+    out = _stream_all(provider, _custom_stream_details())
+
+    assert out == blob
+    assert len(session.requests) == 3  # 5 + 5 + short 2, then stop
+
+
+def test_get_audio_stream_treats_416_as_the_end(provider, monkeypatch):
+    """A blob that is an exact multiple of the chunk size never answers short.
+
+    Without a Content-Range total the loop only finds the end by asking past
+    it, and googlevideo says 416 to that, not 206-with-nothing.
+    """
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 5)
+    blob = b"0123456789"  # exactly two chunks
+    session = _FakeGoogleVideo(blob, send_content_range=False)
+    provider.mass = _mass_with_session(session)
+
+    out = _stream_all(provider, _custom_stream_details())
+
+    assert out == blob
+    assert [h["Range"] for _, h in session.requests] == [
+        "bytes=0-4",
+        "bytes=5-9",
+        "bytes=10-14",
+    ]
+
+
+def test_get_audio_stream_resumes_a_truncated_chunk(provider, monkeypatch):
+    """A connection drop mid-chunk resumes from the last byte received.
+
+    Skipping the gap would splice two distant parts of the file together,
+    which decodes as an audible glitch rather than an error.
+    """
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 5)
+    blob = b"0123456789ab"
+    session = _FakeGoogleVideo(blob, truncate_first=3)
+    provider.mass = _mass_with_session(session)
+
+    out = _stream_all(provider, _custom_stream_details())
+
+    assert out == blob
+    assert [h["Range"] for _, h in session.requests][:2] == ["bytes=0-4", "bytes=3-7"]
+
+
+def test_get_audio_stream_halves_the_chunk_when_the_size_cap_moves(provider, monkeypatch):
+    """The cap has moved once already (10 MiB worked, then 403d).
+
+    A server that refuses the configured chunk size must degrade playback to
+    smaller requests, not kill it: the provider halves down to the floor and
+    retries the same position, so nothing is skipped and nothing repeats.
+    """
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 16)
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_FLOOR", 4)
+    blob = bytes(range(24))
+    session = _FakeGoogleVideo(blob, max_range=5)  # 16 -> 8 -> 4 allowed
+    provider.mass = _mass_with_session(session)
+
+    out = _stream_all(provider, _custom_stream_details())
+
+    assert out == blob
+    ranges = [h["Range"] for _, h in session.requests]
+    # Two refused probes, then 4-byte chunks all the way from position 0.
+    assert ranges[:3] == ["bytes=0-15", "bytes=0-7", "bytes=0-3"]
+    assert all(r.startswith("bytes=") for r in ranges)
+    assert len(ranges) == 2 + len(blob) // 4
+
+
+def test_get_audio_stream_gives_up_only_below_the_floor(provider, monkeypatch):
+    """A 403 that survives the floor is a dead URL, not a size problem."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 16)
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_FLOOR", 4)
+    session = _FakeGoogleVideo(bytes(24), max_range=2)  # even the floor 403s
+    provider.mass = _mass_with_session(session)
+
+    with pytest.raises(UnplayableMediaError):
+        _stream_all(provider, _custom_stream_details())
+    assert [h["Range"] for _, h in session.requests] == [
+        "bytes=0-15",
+        "bytes=0-7",
+        "bytes=0-3",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# URLs that stop serving partway
+#
+# Since 2026-10 some googlevideo URLs serve only the first minute or so of the
+# file and refuse every range past it. The track used to stop there and Music
+# Assistant skipped to the next one. The cap belongs to the single URL, so
+# get_audio_stream resolves a fresh one for the same file and carries on from
+# the byte where the capped one stopped.
+# ---------------------------------------------------------------------------
+
+
+def _resolver(*formats):
+    """Stand-in for _get_stream_format that hands out ``formats`` in order."""
+    calls = []
+    queue = list(formats)
+
+    async def _fmt(video_id):
+        calls.append(video_id)
+        return queue.pop(0)
+
+    return _fmt, calls
+
+
+def test_get_audio_stream_resumes_on_a_fresh_url_when_the_url_stops_serving(
+    provider, monkeypatch
+):
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 8)
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_FLOOR", 4)
+    blob = bytes(range(24))
+    capped, fresh = _googlevideo_url("capped"), _googlevideo_url("fresh")
+    session = _FakeGoogleVideo(blob, caps={capped: 10})
+    provider.mass = _mass_with_session(session)
+    provider._get_stream_format, calls = _resolver(
+        {"url": fresh, "http_headers": {"User-Agent": "fresh-client"}}
+    )
+    sd = _custom_stream_details(capped, {"User-Agent": "first-client"}, video_id="abc12345678")
+
+    out = _stream_all(provider, sd)
+
+    # Seamless: every byte once, in order, across the two URLs.
+    assert out == blob
+    assert calls == ["abc12345678"]
+    sent = [(url, h["Range"]) for url, h in session.requests]
+    # bytes 0-7 from the capped URL, then 8-15 and the floor-sized 8-11 both
+    # reach the cap. The fresh URL picks up at byte 8 with full-size chunks.
+    assert sent == [
+        (capped, "bytes=0-7"),
+        (capped, "bytes=8-15"),
+        (capped, "bytes=8-11"),
+        (fresh, "bytes=8-15"),
+        (fresh, "bytes=16-23"),
+    ]
+    assert all(h["User-Agent"] == "fresh-client" for url, h in session.requests if url == fresh)
+    # A seek restarts the same StreamDetails from byte 0; it should start on
+    # the URL that works.
+    assert sd.data["url"] == fresh
+    assert sd.data["headers"] == {"User-Agent": "fresh-client"}
+
+
+def test_get_audio_stream_will_not_splice_a_different_file(provider, monkeypatch):
+    """Same track, different encode: its bytes do not line up with what played."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 8)
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_FLOOR", 8)
+    capped = _googlevideo_url("capped")
+    reencoded = _googlevideo_url("fresh", lmt="1759799999999999")
+    session = _FakeGoogleVideo(bytes(24), caps={capped: 8})
+    provider.mass = _mass_with_session(session)
+    provider._get_stream_format, _ = _resolver({"url": reencoded})
+
+    with pytest.raises(UnplayableMediaError, match="different file"):
+        _stream_all(provider, _custom_stream_details(capped, video_id="abc12345678"))
+    assert all(url == capped for url, _ in session.requests)
+
+
+def test_get_audio_stream_gives_up_when_fresh_urls_make_no_progress(provider, monkeypatch):
+    """A cap on every URL in a row is the video, not bad luck; stop resolving."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 8)
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_FLOOR", 8)
+    monkeypatch.setattr(ytm, "MAX_STREAM_URL_REFRESHES", 3)
+    urls = [_googlevideo_url(f"u{i}") for i in range(4)]
+    session = _FakeGoogleVideo(bytes(24), caps=dict.fromkeys(urls, 8))
+    provider.mass = _mass_with_session(session)
+    provider._get_stream_format, calls = _resolver(*({"url": url} for url in urls[1:]))
+
+    with pytest.raises(UnplayableMediaError, match="on 4 urls in a row"):
+        _stream_all(provider, _custom_stream_details(urls[0], video_id="abc12345678"))
+    assert len(calls) == 3
+
+
+def test_get_audio_stream_only_counts_refreshes_that_made_no_progress(provider, monkeypatch):
+    """A long track may need more fresh URLs than the limit, as long as each helps."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 4)
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_FLOOR", 4)
+    monkeypatch.setattr(ytm, "MAX_STREAM_URL_REFRESHES", 1)
+    blob = bytes(range(24))
+    # Each URL serves exactly one 4-byte chunk further than the one before.
+    urls = [_googlevideo_url(f"u{i}") for i in range(6)]
+    session = _FakeGoogleVideo(blob, caps={url: 4 * (i + 1) for i, url in enumerate(urls)})
+    provider.mass = _mass_with_session(session)
+    provider._get_stream_format, calls = _resolver(*({"url": url} for url in urls[1:]))
+
+    out = _stream_all(provider, _custom_stream_details(urls[0], video_id="abc12345678"))
+
+    assert out == blob
+    assert len(calls) == 5
+
+
+def test_get_audio_stream_waits_out_the_preroll_of_a_fresh_url(provider, monkeypatch):
+    """A fresh URL can come with its own ad window, and fetching inside it 403s."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 8)
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_FLOOR", 8)
+    events = []
+
+    async def _fake_sleep(seconds):
+        events.append(("sleep", round(seconds)))
+
+    monkeypatch.setattr(ytm.asyncio, "sleep", _fake_sleep)
+    blob = bytes(range(24))
+    capped, fresh = _googlevideo_url("capped"), _googlevideo_url("fresh")
+    session = _FakeGoogleVideo(blob, caps={capped: 8})
+    real_get = session.get
+
+    def _get(url, headers=None, **kwargs):
+        events.append(("get", url))
+        return real_get(url, headers=headers, **kwargs)
+
+    session.get = _get
+    provider.mass = _mass_with_session(session)
+    provider._get_stream_format, _ = _resolver({"url": fresh, "available_at": time.time() + 5})
+
+    out = _stream_all(provider, _custom_stream_details(capped, video_id="abc12345678"))
+
+    assert out == blob
+    assert events.index(("sleep", 5)) < events.index(("get", fresh))
+
+
+def test_stream_encode_identifies_the_file_behind_a_url():
+    url = _googlevideo_url("x", itag="140", clen="3433755", lmt="1766955883819090")
+    assert ytm._stream_encode(url) == ("140", "3433755", "1766955883819090")
+    # Anything short of all three cannot vouch for byte-identical files.
+    assert ytm._stream_encode("https://rr1.googlevideo.example/videoplayback?itag=251") is None
+    assert ytm._stream_encode("https://stream.example/x") is None
+    assert ytm._stream_encode(None) is None
+
+
+def test_content_range_total_parses_and_rejects():
+    assert ytm._content_range_total("bytes 0-1023/16492447") == 16492447
+    assert ytm._content_range_total("bytes 0-1023/*") is None
+    assert ytm._content_range_total("") is None
+    assert ytm._content_range_total(None) is None
+    assert ytm._content_range_total("garbage") is None
+
+
+# ---------------------------------------------------------------------------
+# Pre-roll ad window (issue #51)
+#
+# YouTube serves some tracks behind a pre-roll ad, and the media URL it hands
+# back is not valid until that window has passed: fetching early returns 403.
+# yt-dlp reports the window as ``available_at`` and its own downloader sleeps
+# until then. The provider hands the URL to Music Assistant instead, so it has
+# to do the waiting itself or the fetch fails and the track is skipped.
+# ---------------------------------------------------------------------------
+
+
+def test_preroll_wait_is_zero_when_the_field_is_absent():
+    """An older yt-dlp predating the field has to keep working."""
+    assert ytm._preroll_wait_seconds({"url": "https://stream.example/x"}) == 0.0
+
+
+@pytest.mark.parametrize("value", [None, 0, "", False])
+def test_preroll_wait_is_zero_for_empty_values(value):
+    assert ytm._preroll_wait_seconds({"available_at": value}) == 0.0
+
+
+def test_preroll_wait_is_zero_when_the_window_has_passed():
+    assert ytm._preroll_wait_seconds({"available_at": 990.0}, now=1000.0) == 0.0
+
+
+def test_preroll_wait_is_zero_at_the_exact_boundary():
+    assert ytm._preroll_wait_seconds({"available_at": 1000.0}, now=1000.0) == 0.0
+
+
+def test_preroll_wait_returns_the_remaining_window():
+    assert ytm._preroll_wait_seconds({"available_at": 1005.0}, now=1000.0) == 5.0
+
+
+def test_preroll_wait_is_reported_uncapped():
+    """The caller needs the real figure to tell a long wait from an absurd one."""
+    wait = ytm._preroll_wait_seconds({"available_at": 1000.0 + 500}, now=1000.0)
+    assert wait == 500.0
+    assert wait > ytm.MAX_PREROLL_WAIT
+
+
+@pytest.mark.parametrize("value", ["soon", 10**400, object(), [1], {"a": 1}])
+def test_preroll_wait_survives_an_unparseable_value(value):
+    """Never raise out of the stream path over a field we only advise on.
+
+    ``10**400`` is the interesting one: ``float()`` raises OverflowError on it,
+    which is an ArithmeticError rather than a ValueError and so needs catching
+    explicitly.
+    """
+    assert ytm._preroll_wait_seconds({"available_at": value}, now=1000.0) == 0.0
+
+
+def test_preroll_wait_takes_the_latest_of_a_merged_format():
+    """Mirrors yt-dlp's own max() over ``requested_formats``.
+
+    A merged format carries the timestamps on its parts, and the URL is only
+    good once the latest-gated part is available.
+    """
+    fmt = {
+        "requested_formats": [
+            {"available_at": 1003.0},
+            {"available_at": 1007.0},
+        ]
+    }
+    assert ytm._preroll_wait_seconds(fmt, now=1000.0) == 7.0
+
+
+def test_preroll_wait_ignores_junk_entries_in_requested_formats():
+    fmt = {"requested_formats": [None, "nonsense", {"available_at": 1004.0}]}
+    assert ytm._preroll_wait_seconds(fmt, now=1000.0) == 4.0
+
+
+def test_get_stream_details_waits_out_the_preroll_window(provider, monkeypatch):
+    """The actual issue #51 guard: without this the URL 403s on arrival."""
+    slept = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(ytm.asyncio, "sleep", _fake_sleep)
+
+    async def _fmt(video_id):
+        return {
+            "url": "https://stream.example/x",
+            "ext": "m4a",
+            "available_at": time.time() + 5,
+        }
+
+    provider._get_stream_format = _fmt
+    sd = asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
+
+    assert slept, (
+        "the provider handed over the url without waiting for the pre-roll "
+        "window, which is exactly the 403 in issue #51"
+    )
+    assert 4.0 < slept[0] <= 5.0
+    assert sd.path == "https://stream.example/x"
+
+
+def test_get_stream_details_does_not_wait_without_a_preroll(provider, monkeypatch):
+    """The common path stays instant; a wait on every track would be a regression."""
+    slept = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(ytm.asyncio, "sleep", _fake_sleep)
+
+    async def _fmt(video_id):
+        # yt-dlp reports available_at ~= now for a track with no ad in front.
+        return {
+            "url": "https://stream.example/x",
+            "ext": "m4a",
+            "available_at": time.time(),
+        }
+
+    provider._get_stream_format = _fmt
+    asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
+
+    assert slept == []
+
+
+@pytest.mark.parametrize(
+    ("version", "honours"),
+    [
+        # Field absent entirely on these, so the answer is moot: _preroll_wait_
+        # seconds returns 0.0 either way. False falls out of a plain version
+        # comparison and needs no special case.
+        ("2025.01.12", False),
+        ("2025.08.11", False),
+        # The bad range: available_at exists but is a flat +6s on every format,
+        # ad or not. Honouring it here would delay every single track.
+        ("2025.08.20", False),
+        ("2025.10.01", False),
+        ("2025.11.12", False),
+        # Ad-derived from here on, which is the behaviour the fix assumes.
+        ("2025.12.08", True),
+        ("2026.07.04", True),
+        # Unreadable versions fail towards honouring, because a modern yt-dlp
+        # only asks for a wait when there is really an ad.
+        ("", True),
+        (None, True),
+        ("2026.07", True),
+        ("nightly", True),
+        ("2026.07.04.123456", True),
+    ],
+)
+def test_ytdlp_preroll_support_by_version(version, honours):
+    assert ytm._ytdlp_honours_preroll(version) is honours
+
+
+@pytest.mark.parametrize(
+    ("version", "can_stream"),
+    [
+        # Everything at or below stable 2026.07.04 defaults to android_vr,
+        # whose URLs stop serving after ~1 MiB since 2026-08-17.
+        ("2026.07.04", False),
+        ("2025.12.08", False),
+        # The nightly that dropped android_vr from the defaults, and anything
+        # after it (nightlies carry a fourth timestamp segment).
+        ("2026.08.18.122307", True),
+        ("2026.08.18", True),
+        ("2026.09.01", True),
+        # Unreadable versions fail towards "fine": this check only gates a
+        # warning, and the 403 still surfaces on its own.
+        ("", True),
+        (None, True),
+        ("2026.08", True),
+        ("nightly", True),
+    ],
+)
+def test_ytdlp_streaming_support_by_version(version, can_stream):
+    assert ytm._ytdlp_can_stream(version) is can_stream
+
+
+def test_install_packages_requests_the_playback_floor(provider):
+    """A bare "yt-dlp[default]" is a no-op on every existing install.
+
+    pip does not upgrade an already-satisfied requirement, so the floor in
+    _install_packages is the only mechanism that moves existing installs off
+    the android_vr-era yt-dlp. See yt-dlp/yt-dlp#17461.
+    """
+    requested = []
+
+    async def _record(pkg):
+        requested.append(pkg)
+
+    original = ytm.install_package
+    ytm.install_package = _record
+    try:
+        asyncio.run(provider._install_packages())
+    finally:
+        ytm.install_package = original
+    assert requested[0] == ytm.MIN_YTDLP_REQUIREMENT
+    # The floor names a pre-release on purpose: PEP 440 only lets pip resolve
+    # pre-releases when the specifier itself contains one, and the fixed
+    # yt-dlp currently only exists as a nightly.
+    assert ">=" in ytm.MIN_YTDLP_REQUIREMENT
+    version_floor = ytm.MIN_YTDLP_REQUIREMENT.partition(">=")[2]
+    parsed_floor = tuple(int(p) for p in version_floor.split(".")[:3])
+    assert parsed_floor >= ytm.MIN_YTDLP_VERSION_FOR_PLAYBACK
+
+
+def _yt_dlp_stub_reporting(version):
+    """A fake yt_dlp module that reports ``version`` and resolves one format."""
+    import types
+
+    import yt_dlp as real_yt_dlp
+
+    module = types.ModuleType("yt_dlp")
+    module.utils = real_yt_dlp.utils
+    if version is not None:
+        module.version = types.SimpleNamespace(__version__=version)
+
+    class _FakeYoutubeDL:
+        def __init__(self, opts):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {
+                "formats": [
+                    {
+                        "url": "https://stream.example/x",
+                        "vcodec": "none",
+                        "acodec": "opus",
+                        "ext": "webm",
+                        "abr": 130,
+                        "format_id": "251",
+                    }
+                ]
+            }
+
+        def build_format_selector(self, spec):
+            return real_yt_dlp.YoutubeDL(
+                {"quiet": True, "no_warnings": True, "simulate": True}
+            ).build_format_selector(spec)
+
+    module.YoutubeDL = _FakeYoutubeDL
+    return module
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [("2025.10.01", False), ("2026.07.04", True), (None, True)],
+)
+def test_get_stream_format_sets_the_preroll_gate_from_the_ytdlp_version(
+    provider, version, expected
+):
+    """Binds the wiring, not just the pure predicate.
+
+    ``_preroll_supported`` defaults to True, so deleting the assignment inside
+    ``_extract`` left every other test green while the gate silently stopped
+    working. Driving the real ``_get_stream_format`` is the only way to catch
+    that.
+    """
+    provider._yt_dlp_module = _yt_dlp_stub_reporting(version)
+    provider._preroll_supported = not expected  # must be actively overwritten
+
+    asyncio.run(provider._get_stream_format("dQw4w9WgXcQ"))
+
+    assert provider._preroll_supported is expected
+
+
+def test_installed_ytdlp_is_new_enough_for_the_preroll_fix():
+    """The version this repo tests against must be one where the fix applies.
+
+    If CI ever pins a yt-dlp inside the flat-+6s range, the wait switches off
+    and the live canary stops covering issue #51 without anything going red.
+    """
+    yt_dlp = pytest.importorskip("yt_dlp")
+    version = yt_dlp.version.__version__
+    assert ytm._ytdlp_honours_preroll(version), (
+        f"installed yt-dlp {version} predates ad-derived available_at; the "
+        "pre-roll wait is disabled and the live canary cannot see issue #51"
+    )
+
+
+def test_preroll_wait_is_skipped_on_a_yt_dlp_that_gets_it_wrong(provider, monkeypatch):
+    """The +6s-on-everything releases must not delay every track."""
+    slept = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(ytm.asyncio, "sleep", _fake_sleep)
+
+    async def _fmt(video_id):
+        return {
+            "url": "https://stream.example/x",
+            "ext": "m4a",
+            "available_at": time.time() + 6,
+        }
+
+    provider._get_stream_format = _fmt
+    provider._preroll_supported = False
+    asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
+
+    assert slept == []
+
+
+def test_get_stream_details_waits_before_reading_the_url(provider, monkeypatch):
+    """Ordering matters: the wait has to be over before the URL is handed on.
+
+    Recording an ordered event log rather than a set of flags. Asserting only
+    that both happened would pass just as happily if the sleep ran *after* the
+    StreamDetails was built, which would fix nothing.
+    """
+    events = []
+
+    async def _fake_sleep(seconds):
+        events.append("slept")
+
+    monkeypatch.setattr(ytm.asyncio, "sleep", _fake_sleep)
+
+    async def _fmt(video_id):
+        events.append("resolved")
+        return {
+            "url": "https://stream.example/x",
+            "ext": "m4a",
+            "available_at": time.time() + 3,
+        }
+
+    original_init = ytm.StreamDetails.__init__
+
+    def _spy_init(self, *args, **kwargs):
+        events.append("built")
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(ytm.StreamDetails, "__init__", _spy_init)
+
+    provider._get_stream_format = _fmt
+    sd = asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
+
+    assert events == ["resolved", "slept", "built"], (
+        "the pre-roll wait has to complete before the StreamDetails carrying "
+        "the url is built, or Music Assistant gets a url that is not valid yet"
+    )
+    assert sd.path == "https://stream.example/x"
+
+
+def test_get_stream_details_refuses_an_absurd_preroll_instead_of_stalling(
+    provider, monkeypatch
+):
+    """Past the cap, fail fast rather than sleep the cap and 403 anyway.
+
+    Sleeping the maximum and then handing over a url we already know is still
+    gated gives the user the silence *and* the failure.
+    """
+    slept = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(ytm.asyncio, "sleep", _fake_sleep)
+
+    async def _fmt(video_id):
+        return {
+            "url": "https://stream.example/x",
+            "ext": "m4a",
+            "available_at": time.time() + ytm.MAX_PREROLL_WAIT + 60,
+        }
+
+    provider._get_stream_format = _fmt
+    sd = asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
+
+    assert slept == []
+    assert sd.path == "https://stream.example/x"
+
+
+def test_get_stream_details_still_waits_right_up_to_the_cap(provider, monkeypatch):
+    """The boundary: a long-but-plausible pod is served, not refused."""
+    slept = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(ytm.asyncio, "sleep", _fake_sleep)
+
+    async def _fmt(video_id):
+        return {
+            "url": "https://stream.example/x",
+            "ext": "m4a",
+            "available_at": time.time() + ytm.MAX_PREROLL_WAIT - 5,
+        }
+
+    provider._get_stream_format = _fmt
+    asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
+
+    assert slept and slept[0] <= ytm.MAX_PREROLL_WAIT
+
+
+# ---------------------------------------------------------------------------
+# AI-music filter (issue #53)
+#
+# Applies to auto-generated lists only: radio, mixes, similar tracks and the
+# home feed. Search, library and hand-picked playlists are deliberately left
+# alone, so a deliberate lookup still finds what the user asked for.
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, body):
+        self._body = body
+
+    def raise_for_status(self):
+        return None
+
+    async def text(self):
+        return self._body
+
+
+class _FakeGet:
+    """Stands in for ``session.get(...)`` used as an async context manager."""
+
+    def __init__(self, body=None, error=None):
+        self._body = body
+        self._error = error
+
+    async def __aenter__(self):
+        if self._error is not None:
+            raise self._error
+        return _FakeResponse(self._body)
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+def _http_session_returning(body):
+    mass = MagicMock()
+    mass.http_session.get = lambda url, timeout=None: _FakeGet(body=body)
+    return mass
+
+
+def _http_session_raising(error):
+    mass = MagicMock()
+    mass.http_session.get = lambda url, timeout=None: _FakeGet(error=error)
+    return mass
+
+
+def _blocklist_track(artist_name="Some Artist", artist_id="UC000000000000000000000a"):
+    """A Track carrying one artist, shaped the way _parse_track builds them."""
+    track = ytm.Track(
+        item_id="vid00000001",
+        provider="ytmusic_free",
+        name="A Song",
+    )
+    track.artists = [
+        ytm.ItemMapping(
+            media_type=MediaType.ARTIST,
+            item_id=artist_id,
+            provider="ytmusic_free",
+            name=artist_name,
+        )
+    ]
+    return track
+
+
+def test_parse_blocklist_reads_plain_text():
+    ids, names = ytm._parse_blocklist(
+        "# a comment\nSloppy Bot\nUC000000000000000000000a\n\n  Spaced   Name  \n"
+    )
+    assert ids == frozenset({"UC000000000000000000000a"})
+    assert names == frozenset({"sloppy bot", "spaced name"})
+
+
+def test_parse_blocklist_only_treats_a_leading_hash_as_a_comment():
+    """The config field and README both promise "lines starting with #".
+
+    Splitting on any "#" truncated names that legitimately contain one, so
+    "Panic! At The # Disco" became a rule matching "panic! at the".
+    """
+    ids, names = ytm._parse_blocklist("# real comment\nPanic! At The # Disco\n")
+    assert names == frozenset({"panic! at the # disco"})
+    assert ids == frozenset()
+
+
+def test_parse_blocklist_rejects_an_html_body():
+    """Some hosts answer a missing file with a 200 and an error page.
+
+    Without this guard every line of that page became a blocked artist name.
+    """
+    assert ytm._parse_blocklist(
+        "<html>\n<body>\nNot Found\n</body>\n</html>"
+    ) == (frozenset(), frozenset())
+
+
+def test_parse_blocklist_reads_a_json_array():
+    ids, names = ytm._parse_blocklist('["Sloppy Bot", "UC000000000000000000000a"]')
+    assert ids == frozenset({"UC000000000000000000000a"})
+    assert names == frozenset({"sloppy bot"})
+
+
+def test_parse_blocklist_reads_a_json_object_with_an_artists_key():
+    ids, names = ytm._parse_blocklist('{"artists": ["Sloppy Bot"], "note": "ignored"}')
+    assert names == frozenset({"sloppy bot"})
+    assert ids == frozenset()
+
+
+def test_parse_blocklist_reads_json_objects_per_entry():
+    raw = '[{"name": "Sloppy Bot"}, {"channel_id": "UC000000000000000000000a"}]'
+    ids, names = ytm._parse_blocklist(raw)
+    assert ids == frozenset({"UC000000000000000000000a"})
+    assert names == frozenset({"sloppy bot"})
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "   ",
+        "\n\n",
+        "# only comments\n",
+        "[1, 2, 3]",
+        '{"unexpected": {"shape": true}}',
+        '{\n  "totally": "different"\n}',
+        "[]",
+        "{}",
+    ],
+)
+def test_parse_blocklist_yields_nothing_for_unusable_input(raw):
+    """A list that changes shape must filter nothing, not break playback.
+
+    The JSON cases matter most: valid JSON we do not understand must produce
+    an empty list rather than falling through to the line parser, which would
+    otherwise register every line of the document as an artist name.
+    """
+    assert ytm._parse_blocklist(raw) == (frozenset(), frozenset())
+
+
+def test_parse_blocklist_treats_unparseable_text_as_plain_lines():
+    """Not-quite-JSON is still a plain-text list as far as we are concerned."""
+    ids, names = ytm._parse_blocklist("not json {\nReal Bot")
+    assert "real bot" in names
+    assert ids == frozenset()
+
+
+def test_parse_blocklist_never_yields_an_empty_name():
+    """An empty entry would match every track with a nameless artist."""
+    _, names = ytm._parse_blocklist("Real Name\n   \n#\n")
+    assert "" not in names
+
+
+def test_ai_filter_is_a_no_op_when_disabled(provider):
+    provider._ai_filter_enabled = False
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    tracks = [_blocklist_track("Sloppy Bot")]
+    assert provider._drop_ai_tracks(tracks, "test") == tracks
+
+
+def test_ai_filter_is_a_no_op_with_an_empty_blocklist(provider):
+    """Enabling the toggle without a list must not silently filter anything."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset()
+    provider._ai_blocked_channel_ids = frozenset()
+    tracks = [_blocklist_track("Sloppy Bot")]
+    assert provider._drop_ai_tracks(tracks, "test") == tracks
+
+
+def test_ai_filter_drops_a_blocked_name(provider):
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    kept = provider._drop_ai_tracks(
+        [_blocklist_track("Sloppy Bot"), _blocklist_track("Real Band")], "test"
+    )
+    assert [t.artists[0].name for t in kept] == ["Real Band"]
+
+
+def test_ai_filter_matches_names_case_and_space_insensitively(provider):
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    assert provider._drop_ai_tracks([_blocklist_track("  SLOPPY   Bot ")], "test") == []
+
+
+def test_ai_filter_drops_a_blocked_channel_id(provider):
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_channel_ids = frozenset({"UC000000000000000000000a"})
+    kept = provider._drop_ai_tracks(
+        [
+            _blocklist_track("Innocent", artist_id="UC000000000000000000000a"),
+            _blocklist_track("Innocent", artist_id="UC000000000000000000000b"),
+        ],
+        "test",
+    )
+    assert [t.artists[0].item_id for t in kept] == ["UC000000000000000000000b"]
+
+
+def test_ai_filter_keeps_a_track_with_no_artists(provider):
+    """Never drop something just because we could not read who made it."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    track = _blocklist_track()
+    track.artists = []
+    assert provider._drop_ai_tracks([track], "test") == [track]
+
+
+def _configure_filter(provider, blocklist="", url="", enabled=True):
+    provider.config = MagicMock()
+    provider.config.get_value = lambda key: {
+        ytm.CONF_FILTER_AI_MUSIC: enabled,
+        ytm.CONF_AI_BLOCKLIST: blocklist,
+        ytm.CONF_AI_BLOCKLIST_URL: url,
+    }.get(key)
+    provider._load_ai_filter_config()
+
+
+def test_load_ai_filter_config_splits_semicolons_and_newlines(provider):
+    _configure_filter(
+        provider,
+        blocklist="Sloppy Bot; Other Bot\nUC000000000000000000000a",
+        url="  ",
+    )
+
+    assert provider._ai_filter_enabled is True
+    assert provider._ai_blocked_names == frozenset({"sloppy bot", "other bot"})
+    assert provider._ai_blocked_channel_ids == frozenset({"UC000000000000000000000a"})
+    assert provider._ai_blocklist_url == ""
+
+
+def test_load_ai_filter_config_keeps_commas_inside_an_artist_name(provider):
+    """Splitting on commas turned one band into a rule blocking "Earth".
+
+    That is the dangerous direction for this feature: a filter that removes
+    more than the user asked for is deleting music they like.
+    """
+    _configure_filter(provider, blocklist="Earth, Wind & Fire")
+
+    assert provider._ai_blocked_names == frozenset({"earth, wind & fire"})
+    assert "earth" not in provider._ai_blocked_names
+
+
+def test_remote_blocklist_merges_over_local_entries(provider):
+    """A refresh must add to the user's own list, never replace it."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocklist_url = "https://lists.example/ai.json"
+    provider._ai_local_names = frozenset({"my own entry"})
+    provider._ai_local_channel_ids = frozenset()
+    provider.mass = _http_session_returning('["Remote Bot"]')
+
+    asyncio.run(provider._refresh_remote_blocklist())
+
+    assert provider._ai_blocked_names == frozenset({"my own entry", "remote bot"})
+    assert provider._ai_blocklist_fetched_at > 0
+
+
+def test_remote_blocklist_failure_keeps_the_previous_list(provider):
+    """An unreachable list must not silently switch the filter off."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocklist_url = "https://lists.example/ai.json"
+    provider._ai_local_names = frozenset({"my own entry"})
+    provider._ai_blocked_names = frozenset({"my own entry", "previously fetched"})
+    provider.mass = _http_session_raising(OSError("connection refused"))
+
+    asyncio.run(provider._refresh_remote_blocklist())
+
+    assert provider._ai_blocked_names == frozenset({"my own entry", "previously fetched"})
+    assert provider._ai_blocklist_refreshing is False
+
+
+def test_remote_blocklist_refresh_clears_its_in_flight_flag_on_success(provider):
+    provider._ai_blocklist_url = "https://lists.example/ai.json"
+    provider._ai_local_names = frozenset()
+    provider._ai_local_channel_ids = frozenset()
+    provider.mass = _http_session_returning("Remote Bot")
+
+    asyncio.run(provider._refresh_remote_blocklist())
+
+    assert provider._ai_blocklist_refreshing is False
+    # Proves the fetch actually ran. Without this the assertion above passes on
+    # any early return, including aiohttp being absent, because False is the
+    # attribute's default.
+    assert provider._ai_blocked_names == frozenset({"remote bot"})
+
+
+def test_remote_blocklist_refresh_does_not_reenter_while_one_is_in_flight(provider):
+    """Two stale reads arriving together must not fire two fetches."""
+    provider._ai_blocklist_url = "https://lists.example/ai.json"
+    provider._ai_local_names = frozenset()
+    provider._ai_local_channel_ids = frozenset()
+    provider.mass = _http_session_returning("Remote Bot")
+    provider._ai_blocklist_refreshing = True
+
+    asyncio.run(provider._refresh_remote_blocklist())
+
+    assert provider._ai_blocked_names == frozenset()
+    assert provider._ai_blocklist_refreshing is True
+
+
+def test_a_url_only_blocklist_retries_after_a_failed_first_fetch(provider):
+    """The recovery path for a config with a URL and no local entries.
+
+    The stale check used to sit behind the empty-blocklist early return, so if
+    the one fetch at startup failed there was nothing to filter, nothing to
+    schedule, and the feature stayed off for the life of the process.
+    """
+    _configure_filter(provider, blocklist="", url="https://lists.example/ai.json")
+    provider.mass = _http_session_raising(OSError("connection refused"))
+    asyncio.run(provider._refresh_remote_blocklist())
+    assert provider._ai_blocked_names == frozenset()
+
+    scheduled = []
+    provider._schedule_blocklist_refresh_if_stale = lambda: scheduled.append(1)
+    provider._drop_ai_tracks([_blocklist_track()], "radio")
+
+    assert scheduled, (
+        "a URL-only blocklist whose first fetch failed never retried, so the "
+        "filter was off for the rest of the process"
+    )
+
+
+def test_a_failed_fetch_backs_off_instead_of_retrying_every_call(provider):
+    """Without a backoff a dead URL fired a request per queue build."""
+    _configure_filter(
+        provider, blocklist="Local Bot", url="https://lists.example/ai.json"
+    )
+    provider.mass = _http_session_raising(OSError("connection refused"))
+    asyncio.run(provider._refresh_remote_blocklist())
+
+    attempts = []
+    original = provider._refresh_remote_blocklist
+
+    async def _counting_refresh():
+        attempts.append(1)
+        await original()
+
+    provider._refresh_remote_blocklist = _counting_refresh
+    for _ in range(20):
+        provider._drop_ai_tracks([_blocklist_track()], "radio")
+
+    assert attempts == [], (
+        "a failed fetch re-armed immediately, so every filtered call refetched "
+        "a dead URL and logged a warning"
+    )
+
+
+def test_the_backoff_expires_so_a_dead_url_is_eventually_retried(provider):
+    _configure_filter(
+        provider, blocklist="Local Bot", url="https://lists.example/ai.json"
+    )
+    provider.mass = _http_session_raising(OSError("connection refused"))
+    asyncio.run(provider._refresh_remote_blocklist())
+
+    # Wind the last attempt back past the retry window.
+    provider._ai_blocklist_attempted_at = time.time() - ytm.AI_BLOCKLIST_RETRY_AFTER - 1
+
+    scheduled = []
+    provider._schedule_blocklist_refresh_if_stale = lambda: scheduled.append(1)
+    provider._drop_ai_tracks([_blocklist_track()], "radio")
+    assert scheduled
+
+
+def test_similar_tracks_are_filtered(provider):
+    """The path Music Assistant's own radio mode pulls from."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    mock = MagicMock()
+    mock.get_watch_playlist.return_value = {
+        "tracks": [
+            {"videoId": "vid00000001", "title": "Good", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
+            {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+        ]
+    }
+    provider._ytmusic = mock
+
+    tracks = asyncio.run(provider.get_similar_tracks("vid00000001"))
+
+    assert [t.name for t in tracks] == ["Good"]
+
+
+def test_similar_tracks_are_untouched_when_the_filter_is_off(provider):
+    provider._ai_filter_enabled = False
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    mock = MagicMock()
+    mock.get_watch_playlist.return_value = {
+        "tracks": [
+            {"videoId": "vid00000001", "title": "Good", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
+            {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+        ]
+    }
+    provider._ytmusic = mock
+
+    tracks = asyncio.run(provider.get_similar_tracks("vid00000001"))
+
+    assert [t.name for t in tracks] == ["Good", "Slop"]
+
+
+def test_recommendations_are_filtered(provider):
+    """The home feed is auto-generated too, so it is in scope for the filter."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    provider._authenticated = True
+    mock = MagicMock()
+    mock.get_home.return_value = [
+        {
+            "title": "Listen again",
+            "contents": [
+                {"videoId": "vid00000001", "title": "Good", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
+                {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+            ],
+        }
+    ]
+    provider._ytmusic = mock
+
+    folders = asyncio.run(provider.recommendations())
+
+    assert [i.name for f in folders for i in f.items] == ["Good"]
+
+
+def test_recommendations_drop_a_folder_left_empty_by_the_filter(provider):
+    """An all-slop shelf should disappear rather than render empty."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    provider._authenticated = True
+    mock = MagicMock()
+    mock.get_home.return_value = [
+        {
+            "title": "All slop",
+            "contents": [
+                {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+            ],
+        }
+    ]
+    provider._ytmusic = mock
+
+    assert asyncio.run(provider.recommendations()) == []
+
+
+def test_radio_playlist_tracks_are_filtered(provider):
+    """Mixes and song radio are the main way slop reaches a queue."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    mock = MagicMock()
+    mock.get_watch_playlist.return_value = {
+        "tracks": [
+            {"videoId": "vid00000001", "title": "Good", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
+            {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+        ]
+    }
+    provider._ytmusic = mock
+
+    tracks = asyncio.run(provider._get_radio_playlist_tracks("RDdQw4w9WgXcQ"))
+
+    assert [t.name for t in tracks] == ["Good"]
+
+
+def test_search_results_are_never_filtered(provider):
+    """A deliberate lookup must still find what the user asked for.
+
+    This is the scope boundary of the feature: filtering search would make a
+    blocked artist unfindable, which is a different and more surprising
+    behaviour than keeping them out of auto-generated queues.
+    """
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    mock = MagicMock()
+    mock.search.return_value = [
+        {
+            "videoId": "vid00000002",
+            "title": "Slop",
+            "resultType": "song",
+            "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}],
+        }
+    ]
+    provider._ytmusic = mock
+
+    results = asyncio.run(provider.search("sloppy bot", [MediaType.TRACK]))
+
+    assert [t.name for t in results.tracks] == ["Slop"]
+
+
+# ---------------------------------------------------------------------------
+# Playlist track caching (issue #56)
+#
+# Auto-generated mixes come from the watch endpoint, which regenerates the list
+# on every call: two consecutive requests for the same song radio returned 147
+# tracks each with no overlap. Uncached, that meant a playlist whose contents
+# changed every time it was rendered, and a request to YouTube per render.
+# ---------------------------------------------------------------------------
+
+
+def test_playlist_tracks_are_cached_with_a_short_lifetime():
+    """Binds the decorator, not just that the method still runs.
+
+    Without an assertion on the recorded arguments, removing the decorator
+    entirely would leave every other test green, because the stub in
+    conftest.py is a pass-through by design.
+    """
+    from ytmusic_free import YoutubeMusicFreeProvider
+
+    cache_args = getattr(YoutubeMusicFreeProvider.get_playlist_tracks, "__ma_cache__", None)
+    assert cache_args is not None, (
+        "get_playlist_tracks is no longer cached; browsing a mix will re-roll "
+        "it on every render again (issue #56)"
+    )
+    assert cache_args["expiration"] == ytm.PLAYLIST_TRACKS_CACHE_TTL
+    assert cache_args.get("allow_expired_cache") is True, (
+        "without stale-while-revalidate an expiry blocks the browse on a "
+        "fresh fetch instead of serving the previous list"
+    )
+
+
+def test_playlist_cache_ttl_is_short_enough_to_still_turn_over():
+    """A mix that refreshes once a week is not a dynamic playlist.
+
+    Long enough that browsing twice shows the same thing, short enough that
+    the list still changes over a day.
+    """
+    assert 600 <= ytm.PLAYLIST_TRACKS_CACHE_TTL <= 6 * 3600
+
+
+def test_cached_playlist_tracks_still_reach_the_caller(provider):
+    """The decorator must not swallow or reshape the result."""
+    mock = MagicMock()
+    mock.get_watch_playlist.return_value = {
+        "tracks": [
+            {
+                "videoId": "vid00000001",
+                "title": "Good",
+                "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}],
+            }
+        ]
+    }
+    provider._ytmusic = mock
+
+    tracks = asyncio.run(provider.get_playlist_tracks("RDdQw4w9WgXcQ"))
+
+    assert [t.name for t in tracks] == ["Good"]
+
+
+# ---------------------------------------------------------------------------
+# Podcasts (issue #52)
+#
+# Anonymous throughout: search, show detail and episode detail all answer
+# without an account, and an episode is an ordinary YouTube video id so the
+# existing stream path carries it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("3 hr 46 min", 3 * 3600 + 46 * 60),
+        ("2 hr 3 min", 2 * 3600 + 3 * 60),
+        ("31 min", 31 * 60),
+        ("1 hr", 3600),
+        ("45 sec", 45),
+        ("1 hour 2 minutes 3 seconds", 3723),
+        ("1h 2m", 3720),
+        # Tracks report a clock string; the same helper has to read both, since
+        # which spelling arrives depends on the endpoint rather than the item.
+        ("3:46", 226),
+        ("1:02:03", 3723),
+    ],
+)
+def test_parse_duration_words(raw, expected):
+    assert ytm._parse_duration_words(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [None, "", "   ", "unknown", "views"])
+def test_parse_duration_words_returns_none_when_unreadable(raw):
+    """None, not 0. An unset duration is not the same as a zero-length episode."""
+    assert ytm._parse_duration_words(raw) is None
+
+
+def test_episode_id_round_trips():
+    item_id = ytm._episode_item_id("PLabc123", "vid00000001")
+    assert item_id == "PLabc123|vid00000001"
+    assert ytm._split_episode_id(item_id) == ("PLabc123", "vid00000001")
+
+
+def test_split_episode_id_treats_a_bare_id_as_the_video():
+    assert ytm._split_episode_id("vid00000001") == ("", "vid00000001")
+
+
+def test_strip_podcast_browse_prefix():
+    assert ytm._strip_podcast_browse_prefix("MPSPPLabc123") == "PLabc123"
+    assert ytm._strip_podcast_browse_prefix("PLabc123") == "PLabc123"
+    assert ytm._strip_podcast_browse_prefix("") == ""
+
+
+def test_description_text_handles_both_shapes():
+    """get_podcast returns a str; get_episode returns a Description object."""
+
+    class _Description:
+        text = "from the object"
+
+        def __str__(self):  # pragma: no cover - would be the bug
+            return "Description()"
+
+    assert ytm._description_text("plain") == "plain"
+    assert ytm._description_text(_Description()) == "from the object"
+    assert ytm._description_text(None) is None
+    assert ytm._description_text("") is None
+
+
+def test_parse_podcast_strips_the_browse_prefix(provider):
+    podcast = provider._parse_podcast(
+        {"browseId": "MPSPPLabc123", "title": "A Show", "author": {"name": "A Publisher"}}
+    )
+    assert podcast.item_id == "PLabc123"
+    assert podcast.name == "A Show"
+    assert podcast.publisher == "A Publisher"
+
+
+def test_parse_podcast_accepts_a_string_author(provider):
+    podcast = provider._parse_podcast({"title": "S", "author": "Someone"}, "PLabc123")
+    assert podcast.publisher == "Someone"
+
+
+def test_parse_podcast_raises_without_an_id(provider):
+    with pytest.raises(InvalidDataError):
+        provider._parse_podcast({"title": "No id"})
+
+
+def _podcast(provider):
+    return provider._parse_podcast({"title": "A Show"}, "PLabc123")
+
+
+def test_parse_podcast_episode_builds_a_composite_id(provider):
+    episode = provider._parse_podcast_episode(
+        {"videoId": "vid00000001", "title": "Ep 1", "duration": "31 min"},
+        _podcast(provider),
+        position=7,
+    )
+    assert episode.item_id == "PLabc123|vid00000001"
+    assert episode.position == 7
+    assert episode.duration == 31 * 60
+    assert episode.podcast.item_id == "PLabc123"
+    assert all("watch?v=vid00000001" in m.url for m in episode.provider_mappings)
+
+
+def test_parse_podcast_episode_leaves_resume_state_unset(provider):
+    """None tells Music Assistant to use its own resume point.
+
+    YouTube's anonymous responses carry no playback position, so asserting one
+    would be inventing it.
+    """
+    episode = provider._parse_podcast_episode(
+        {"videoId": "vid00000001", "title": "Ep"}, _podcast(provider)
+    )
+    assert episode.fully_played is None
+    assert episode.resume_position_ms is None
+
+
+def test_parse_podcast_episode_ignores_the_date_field(provider):
+    """"date" holds a view count on anonymous responses, not a date.
+
+    Measured as "591K views" on every episode of every show checked. Parsing it
+    as a release date would either raise or land a nonsense date on the item.
+    """
+    episode = provider._parse_podcast_episode(
+        {"videoId": "vid00000001", "title": "Ep", "date": "591K views"},
+        _podcast(provider),
+    )
+    assert getattr(episode.metadata, "release_date", None) is None
+
+
+def test_parse_podcast_episode_raises_without_a_video_id(provider):
+    with pytest.raises(InvalidDataError):
+        provider._parse_podcast_episode({"title": "No id"}, _podcast(provider))
+
+
+def test_get_podcast_episodes_numbers_them_when_index_is_absent(provider):
+    """"index" is None on every anonymous response, so enumeration is all we have."""
+    mock = MagicMock()
+    mock.get_podcast.return_value = {
+        "title": "A Show",
+        "episodes": [
+            {"videoId": "v1", "title": "One", "duration": "31 min"},
+            {"videoId": "v2", "title": "Two", "duration": "1 hr"},
+        ],
+    }
+    provider._ytmusic = mock
+
+    async def _collect():
+        return [e async for e in provider.get_podcast_episodes("PLabc123")]
+
+    episodes = asyncio.run(_collect())
+    assert [e.position for e in episodes] == [1, 2]
+    assert [e.duration for e in episodes] == [31 * 60, 3600]
+
+
+def test_get_podcast_episodes_skips_an_unparseable_entry(provider):
+    """One malformed episode must not sink the whole show."""
+    mock = MagicMock()
+    mock.get_podcast.return_value = {
+        "title": "A Show",
+        "episodes": [{"title": "no video id"}, {"videoId": "v2", "title": "Two"}],
+    }
+    provider._ytmusic = mock
+
+    async def _collect():
+        return [e async for e in provider.get_podcast_episodes("PLabc123")]
+
+    assert [e.name for e in asyncio.run(_collect())] == ["Two"]
+
+
+def test_get_podcast_raises_media_not_found(provider):
+    mock = MagicMock()
+    mock.get_podcast.side_effect = KeyError("nope")
+    provider._ytmusic = mock
+    with pytest.raises(MediaNotFoundError):
+        asyncio.run(provider.get_podcast("PLmissing"))
+
+
+def test_get_podcast_episode_falls_back_to_a_stub_show(provider):
+    """A failed show lookup must not make the episode unplayable."""
+    mock = MagicMock()
+    mock.get_episode.return_value = {
+        "title": "Ep",
+        "duration": "31 min",
+        "author": {"name": "The Show", "id": "MPSPPLabc123"},
+    }
+    mock.get_podcast.side_effect = RuntimeError("show lookup failed")
+    provider._ytmusic = mock
+
+    episode = asyncio.run(provider.get_podcast_episode("PLabc123|vid00000001"))
+
+    assert episode.item_id == "PLabc123|vid00000001"
+    assert episode.podcast.name == "The Show"
+
+
+def test_get_stream_details_resolves_a_podcast_episode_id(provider):
+    """The show has to be stripped before yt-dlp sees the id."""
+    seen = {}
+
+    async def _fmt(video_id):
+        seen["video_id"] = video_id
+        return {"url": "https://stream.example/x", "ext": "m4a"}
+
+    provider._get_stream_format = _fmt
+    sd = asyncio.run(
+        provider.get_stream_details("PLabc123|vid00000001", MediaType.PODCAST_EPISODE)
+    )
+
+    assert seen["video_id"] == "vid00000001"
+    assert sd.item_id == "PLabc123|vid00000001"
+
+
+def test_search_returns_podcasts(provider):
+    mock = MagicMock()
+    mock.search.return_value = [
+        {
+            "resultType": "podcast",
+            "browseId": "MPSPPLabc123",
+            "title": "A Show",
+            "category": "Podcasts",
+        }
+    ]
+    provider._ytmusic = mock
+
+    results = asyncio.run(provider.search("a show", [MediaType.PODCAST]))
+
+    assert [p.item_id for p in results.podcasts] == ["PLabc123"]
+
+
+def test_podcast_lookups_are_cached():
+    from ytmusic_free import YoutubeMusicFreeProvider
+
+    for name in ("get_podcast", "get_podcast_episode"):
+        args = getattr(getattr(YoutubeMusicFreeProvider, name), "__ma_cache__", None)
+        assert args is not None, f"{name} is not cached"
+        assert args["expiration"] == ytm.PODCAST_CACHE_TTL
+
+
+def test_library_podcasts_is_an_authenticated_feature_only():
+    """Subscribed shows need a cookie, so the feature belongs with the others.
+
+    Declaring it was unsafe while there was no implementation behind it: Music
+    Assistant deletes anything a completed sync did not return, so an empty
+    answer is an instruction to unsubscribe from everything. It is safe now
+    only because get_library_podcasts goes through the same guard as every
+    other library method, which the next test pins.
+    """
+    feature = ytm.ProviderFeature.LIBRARY_PODCASTS
+    assert feature in ytm.AUTHENTICATED_FEATURES
+    assert feature not in ytm.BASE_FEATURES
+
+
+def test_library_podcasts_fails_rather_than_reporting_no_subscriptions(provider):
+    """The issue #55 guard, applied to the new media type."""
+    provider._authenticated = False
+    provider._auth_lapse_warned = False
+    _cookie_configured(provider)
+
+    with pytest.raises(RuntimeError, match="not active"):
+        _consume(provider.get_library_podcasts())
+
+
+def test_library_podcasts_skips_the_auto_generated_playlists(provider):
+    """"New Episodes" and "Saved episodes" are not shows.
+
+    YouTube returns them alongside real subscriptions. Syncing them would put
+    two permanent pseudo-subscriptions in the library that cannot be removed.
+    """
+    provider._authenticated = True
+    mock = MagicMock()
+    mock.get_library_podcasts.return_value = [
+        {"title": "New Episodes", "podcastId": "RDPN", "channel": {"id": None, "name": "Auto playlist"}},
+        {"title": "Saved episodes", "podcastId": "SE", "channel": {"id": None, "name": "Auto playlist"}},
+        {
+            "title": "A Real Show",
+            "podcastId": "PLabc123",
+            "browseId": "MPSPPLabc123",
+            "channel": {"id": "UCxyz", "name": "A Publisher"},
+        },
+    ]
+    provider._ytmusic = mock
+
+    shows = _consume(provider.get_library_podcasts())
+
+    assert [s.item_id for s in shows] == ["PLabc123"]
+    assert shows[0].publisher == "A Publisher"
+
+
+def test_library_podcasts_counts_real_shows_for_the_empty_guard(provider):
+    """The auto-playlists must not make a lapsed session look populated.
+
+    YouTube returns them whether or not you subscribe to anything, so counting
+    before filtering would mask exactly the empty sync the guard exists to
+    catch.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_podcasts.return_value = [
+        {"title": "New Episodes", "podcastId": "RDPN"},
+        {"title": "Saved episodes", "podcastId": "SE"},
+    ]
+    mock.get_account_info = MagicMock(return_value={})  # logged-out shape
+    provider._ytmusic = mock
+
+    with pytest.raises(RuntimeError, match="cookie lapse"):
+        _consume(provider.get_library_podcasts())
+
+
+# ---------------------------------------------------------------------------
+# Metadata cache and album year (issue #53)
+#
+# A track parsed from a playlist or search carries only {"id", "name"} for its
+# album, so the release year has to be looked up. That is only affordable
+# because the album lookup is cached for a month.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("method", "ttl_attr"),
+    [
+        ("get_album", "CATALOG_CACHE_TTL"),
+        ("get_album_tracks", "CATALOG_CACHE_TTL"),
+        ("get_track", "CATALOG_CACHE_TTL"),
+        ("get_artist", "ARTIST_CACHE_TTL"),
+        ("get_artist_albums", "ARTIST_CACHE_TTL"),
+        ("get_artist_toptracks", "ARTIST_CACHE_TTL"),
+        ("get_similar_tracks", "SIMILAR_TRACKS_CACHE_TTL"),
+        ("get_playlist", "PLAYLIST_TRACKS_CACHE_TTL"),
+    ],
+)
+def test_metadata_lookups_are_cached(method, ttl_attr):
+    """Every repeated catalogue lookup is cached.
+
+    Without this the provider made a request per render, which is the
+    bot-detection exposure raised in issue #53 and what made the album-year
+    lookup unaffordable.
+    """
+    from ytmusic_free import YoutubeMusicFreeProvider
+
+    args = getattr(getattr(YoutubeMusicFreeProvider, method), "__ma_cache__", None)
+    assert args is not None, f"{method} is not cached"
+    assert args["expiration"] == getattr(ytm, ttl_attr)
+    assert args.get("allow_expired_cache") is True
+
+
+@pytest.mark.parametrize("method", ["get_track", "get_album_tracks", "get_artist_toptracks"])
+def test_track_caches_carry_the_parser_version(method):
+    """Tracks written by an older parser become misses after an update.
+
+    These entries last up to 30 days and Music Assistant serves expired ones
+    once more before refreshing, so a parser fix such as the THUMB fallback
+    for video uploads (issue #90) took a month to arrive without a checksum.
+    """
+    from ytmusic_free import YoutubeMusicFreeProvider
+
+    args = getattr(YoutubeMusicFreeProvider, method).__ma_cache__
+    assert args.get("cache_checksum") == ytm.TRACK_CACHE_VERSION
+
+
+@pytest.mark.parametrize("method", ["get_album", "get_artist", "get_artist_albums"])
+def test_album_and_artist_caches_survive_a_track_parser_bump(method):
+    """The album-year lookup runs get_album up to 40 times per page (#53).
+
+    A checksum there would send every user's lookups to YouTube cold after
+    each release that only changed how tracks are parsed.
+    """
+    from ytmusic_free import YoutubeMusicFreeProvider
+
+    args = getattr(YoutubeMusicFreeProvider, method).__ma_cache__
+    assert "cache_checksum" not in args
+
+
+def test_similar_tracks_cache_is_shorter_than_the_catalog_one():
+    """Song radio is meant to differ each time; an album's year is not."""
+    assert ytm.SIMILAR_TRACKS_CACHE_TTL < ytm.CATALOG_CACHE_TTL
+
+
+def _track_with_album(provider, album_id="MPREb_x", year=None):
+    track = ytm.Track(item_id="v1", provider="ytmusic_free", name="A Song")
+    track.album = provider._get_item_mapping(MediaType.ALBUM, album_id, "An Album", year)
+    return track
+
+
+def test_item_mapping_carries_a_year_when_given_one(provider):
+    mapping = provider._get_item_mapping(MediaType.ALBUM, "MPREb_x", "An Album", 1998)
+    assert mapping.year == 1998
+
+
+def test_item_mapping_year_defaults_to_none(provider):
+    """Unknown must stay distinguishable from a real year."""
+    mapping = provider._get_item_mapping(MediaType.ALBUM, "MPREb_x", "An Album")
+    assert mapping.year is None
+
+
+def test_album_tracks_carry_the_album_year_without_a_lookup(provider):
+    """The album is already in hand here, so the year is free."""
+    mock = MagicMock()
+    mock.get_album.return_value = {
+        "title": "An Album",
+        "year": "1998",
+        "tracks": [{"videoId": "v1", "title": "One", "artists": [{"name": "A", "id": "UCa"}]}],
+    }
+    provider._ytmusic = mock
+
+    tracks = asyncio.run(provider.get_album_tracks("MPREb_x"))
+
+    assert [t.album.year for t in tracks] == [1998]
+    assert mock.get_album.call_count == 1
+
+
+def test_attach_album_years_fills_the_year_from_one_lookup_per_album(provider):
+    tracks = [_track_with_album(provider), _track_with_album(provider)]
+    calls = []
+
+    async def _get_album(album_id):
+        calls.append(album_id)
+        album = ytm.Album(item_id=album_id, provider="ytmusic_free", name="An Album")
+        album.year = 1998
+        return album
+
+    provider.get_album = _get_album
+    asyncio.run(provider._attach_album_years(tracks))
+
+    assert [t.album.year for t in tracks] == [1998, 1998]
+    assert calls == ["MPREb_x"], "two tracks on one album must cost one lookup"
+
+
+def test_attach_album_years_skips_albums_that_already_have_one(provider):
+    tracks = [_track_with_album(provider, year=1998)]
+    provider.get_album = MagicMock(side_effect=AssertionError("must not be called"))
+    asyncio.run(provider._attach_album_years(tracks))
+    assert tracks[0].album.year == 1998
+
+
+def test_attach_album_years_ignores_tracks_with_no_album(provider):
+    """Radio tracks arrive with album=None, so there is nothing to look up."""
+    track = ytm.Track(item_id="v1", provider="ytmusic_free", name="A Song")
+    track.album = None
+    provider.get_album = MagicMock(side_effect=AssertionError("must not be called"))
+    asyncio.run(provider._attach_album_years([track]))
+
+
+def test_attach_album_years_survives_a_failed_lookup(provider):
+    """A missing year must never fail the playlist it came from."""
+    tracks = [_track_with_album(provider)]
+
+    async def _boom(album_id):
+        raise RuntimeError("album lookup failed")
+
+    provider.get_album = _boom
+    asyncio.run(provider._attach_album_years(tracks))
+
+    assert tracks[0].album.year is None
+
+
+def test_attach_album_years_is_capped(provider):
+    """One pathological playlist must not become hundreds of requests."""
+    tracks = [
+        _track_with_album(provider, album_id=f"MPREb_{i}")
+        for i in range(ytm.ALBUM_YEAR_LOOKUP_LIMIT + 15)
+    ]
+    calls = []
+
+    async def _get_album(album_id):
+        calls.append(album_id)
+        album = ytm.Album(item_id=album_id, provider="ytmusic_free", name="An Album")
+        album.year = 2001
+        return album
+
+    provider.get_album = _get_album
+    asyncio.run(provider._attach_album_years(tracks))
+
+    assert len(calls) == ytm.ALBUM_YEAR_LOOKUP_LIMIT
+    filled = [t for t in tracks if t.album.year is not None]
+    assert len(filled) == ytm.ALBUM_YEAR_LOOKUP_LIMIT
+
+
+def test_attach_album_years_bounds_concurrency(provider):
+    """A cold cache must not arrive as a burst of parallel requests."""
+    in_flight = 0
+    peak = 0
+
+    async def _get_album(album_id):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0)
+        in_flight -= 1
+        album = ytm.Album(item_id=album_id, provider="ytmusic_free", name="An Album")
+        album.year = 2001
+        return album
+
+    provider.get_album = _get_album
+    tracks = [_track_with_album(provider, album_id=f"MPREb_{i}") for i in range(20)]
+    asyncio.run(provider._attach_album_years(tracks))
+
+    assert peak <= ytm.ALBUM_YEAR_LOOKUP_CONCURRENCY
+
+
+def test_playlist_tracks_get_their_album_year(provider):
+    """The path da-anda's queue filter actually reads from (issue #53)."""
+    mock = MagicMock()
+    mock.get_playlist.return_value = {
+        "id": "PLabc123",
+        "title": "A Playlist",
+        "tracks": [
+            {
+                "videoId": "v1",
+                "title": "One",
+                "artists": [{"name": "A", "id": "UCa"}],
+                "album": {"id": "MPREb_x", "name": "An Album"},
+            }
+        ],
+    }
+    provider._ytmusic = mock
+
+    async def _get_album(album_id):
+        album = ytm.Album(item_id=album_id, provider="ytmusic_free", name="An Album")
+        album.year = 1998
+        return album
+
+    provider.get_album = _get_album
+
+    tracks = asyncio.run(provider.get_playlist_tracks("PLabc123"))
+
+    assert [t.album.year for t in tracks] == [1998], (
+        "playlist tracks reached Music Assistant without a release year, which "
+        "is the gap issue #53 reported"
+    )
+
+
+def test_search_tracks_get_their_album_year(provider):
+    mock = MagicMock()
+    mock.search.return_value = [
+        {
+            "resultType": "song",
+            "videoId": "v1",
+            "title": "One",
+            "artists": [{"name": "A", "id": "UCa"}],
+            "album": {"id": "MPREb_x", "name": "An Album"},
+        }
+    ]
+    provider._ytmusic = mock
+
+    async def _get_album(album_id):
+        album = ytm.Album(item_id=album_id, provider="ytmusic_free", name="An Album")
+        album.year = 2004
+        return album
+
+    provider.get_album = _get_album
+
+    results = asyncio.run(provider.search("one", [MediaType.TRACK]))
+
+    assert [t.album.year for t in results.tracks] == [2004]
+
+
 def test_get_album_raises_when_not_found(provider):
     mock = MagicMock()
     mock.get_album = MagicMock(return_value=None)
@@ -1707,15 +4702,122 @@ def test_get_playlist_tracks_skips_unavailable_tracks(provider):
     assert [track.item_id for track in tracks] == ["available"]
 
 
+# ---------------------------------------------------------------------------
+# Private playlists (issue #82): the yt-dlp fallback can never read them
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("playlist_id", ["LM", "VLLM", "SE", "RDPN"])
+def test_is_private_playlist_id_true(playlist_id):
+    assert ytm._is_private_playlist_id(playlist_id)
+
+
+@pytest.mark.parametrize("playlist_id", ["PLxxx123", "VLPLxxx123", "RDdQw4w9WgXcQ", "OLAK5uy_abc"])
+def test_is_private_playlist_id_false(playlist_id):
+    assert not ytm._is_private_playlist_id(playlist_id)
+
+
+def test_get_playlist_tracks_lm_undercount_never_runs_ytdlp(provider):
+    """YouTube's reported count for LM includes unavailable entries, so the
+    undercount test is chronically true there. The fill-the-gap fallback must
+    not run: unauthenticated yt-dlp cannot see a private playlist and only
+    logs a misleading "playlist does not exist" (issue #82)."""
+    mock = MagicMock()
+    mock.get_playlist = MagicMock(
+        return_value={
+            "trackCount": 5,
+            "tracks": [
+                {
+                    "videoId": "liked_1",
+                    "title": "First",
+                    "artists": [{"id": "UC1", "name": "A"}],
+                },
+                {
+                    "videoId": "liked_2",
+                    "title": "Second",
+                    "artists": [{"id": "UC1", "name": "A"}],
+                },
+            ],
+        }
+    )
+    provider._ytmusic = mock
+    fallback = MagicMock(side_effect=AssertionError("yt-dlp fallback should not run"))
+    provider._get_playlist_tracks_via_ytdlp = fallback
+
+    tracks = asyncio.run(provider.get_playlist_tracks("LM"))
+
+    assert [track.item_id for track in tracks] == ["liked_1", "liked_2"]
+
+
+def test_get_playlist_tracks_lm_failure_raises_instead_of_going_empty(provider):
+    """When the authenticated read of a private playlist fails there is no
+    working fallback. Raising keeps the cache decorator from storing an empty
+    listing over the last good one; returning [] here is what made a removed
+    like look like a wiped playlist (issue #82)."""
+    mock = MagicMock()
+    mock.get_playlist = MagicMock(side_effect=RuntimeError("HTTP 401: Unauthorized"))
+    provider._ytmusic = mock
+    fallback = MagicMock(side_effect=AssertionError("yt-dlp fallback should not run"))
+    provider._get_playlist_tracks_via_ytdlp = fallback
+
+    with pytest.raises(RuntimeError, match="401"):
+        asyncio.run(provider.get_playlist_tracks("LM"))
+
+
+def test_get_playlist_tracks_non_private_failure_still_falls_back(provider):
+    """The yt-dlp degradation stays in place for ordinary playlist ids."""
+    mock = MagicMock()
+    mock.get_playlist = MagicMock(side_effect=RuntimeError("boom"))
+    provider._ytmusic = mock
+
+    async def _fallback(playlist_id, seed_video_id=None):
+        return [provider._minimal_track("dlp_1")]
+
+    provider._get_playlist_tracks_via_ytdlp = _fallback
+
+    tracks = asyncio.run(provider.get_playlist_tracks("PLbroken"))
+
+    assert [track.item_id for track in tracks] == ["dlp_1"]
+
+
+def test_get_playlist_lm_failure_raises_media_not_found(provider):
+    mock = MagicMock()
+    mock.get_playlist = MagicMock(side_effect=RuntimeError("HTTP 401: Unauthorized"))
+    provider._ytmusic = mock
+    fallback = MagicMock(side_effect=AssertionError("yt-dlp fallback should not run"))
+    provider._get_playlist_via_ytdlp = fallback
+
+    with pytest.raises(MediaNotFoundError):
+        asyncio.run(provider.get_playlist("LM"))
+
+
 def test_get_artist_unknown_prefix_returns_stub(provider):
     artist = asyncio.run(provider.get_artist("unknown_Foo Bar"))
     assert artist.name == "Foo Bar"
     assert artist.item_id == "unknown_Foo Bar"
 
 
+def test_get_artist_bare_unknown_returns_stub_without_ytm_call(provider):
+    """The artist-less placeholder id resolves to a stub instead of raising.
+
+    Music Assistant resolves a track's artist mappings through get_artist when
+    the artist page opens and when a track is added to the library, and treats
+    MediaNotFoundError as "drop the artist" — which errored the artist page and
+    made adding a track whose only artist is the placeholder fail with
+    "Track is missing artist(s)"."""
+    mock = MagicMock()
+    mock.get_artist = MagicMock(side_effect=AssertionError("must not be called"))
+    provider._ytmusic = mock
+    artist = asyncio.run(provider.get_artist("unknown"))
+    assert artist.item_id == "unknown"
+    assert artist.name == "Unknown Artist"
+    assert artist.provider_mappings
+    mock.get_artist.assert_not_called()
+
+
 def test_get_artist_non_channel_id_not_found_without_ytm_call(provider):
     """A non-channel id (e.g. one pulled from track metadata) must not be
-    handed to YTM — it would return HTTP 400. We raise MediaNotFoundError
+    handed to YTM â€” it would return HTTP 400. We raise MediaNotFoundError
     without ever calling get_artist (issue #18)."""
     from music_assistant_models.errors import MediaNotFoundError
 
@@ -1787,7 +4889,7 @@ def test_get_similar_tracks_parses_returned_tracks(provider):
                     "title": "Song One",
                     "artists": [{"id": "UCart", "name": "An Artist"}],
                 },
-                # Missing videoId — must be skipped, not crash the radio fill.
+                # Missing videoId â€” must be skipped, not crash the radio fill.
                 {"title": "broken", "artists": [{"id": "UCart", "name": "A"}]},
             ]
         }
@@ -1827,7 +4929,7 @@ def test_recommendations_empty_when_not_authenticated(provider):
 
 
 # ---------------------------------------------------------------------------
-# library_add / library_remove — 403 no-op for user-owned items
+# library_add / library_remove â€” 403 no-op for user-owned items
 # ---------------------------------------------------------------------------
 
 
@@ -1879,7 +4981,7 @@ def test_library_add_non_403_error_returns_false(provider):
 
 
 def test_library_add_403_on_artist_is_not_swallowed(provider):
-    """The 403 no-op only applies to ALBUM/PLAYLIST — artist subscription failure is real."""
+    """The 403 no-op only applies to ALBUM/PLAYLIST â€” artist subscription failure is real."""
     _make_authed_provider_with_rate_failure(
         provider, RuntimeError("Server returned HTTP 403: Forbidden.")
     )
@@ -1916,6 +5018,58 @@ def test_library_remove_403_on_artist_is_not_swallowed(provider):
         provider, RuntimeError("Server returned HTTP 403: Forbidden.")
     )
     assert asyncio.run(provider.library_remove("UCsome", MediaType.ARTIST)) is False
+
+
+# ---------------------------------------------------------------------------
+# library_add / library_remove for tracks — like / un-like the song (issue #82)
+# ---------------------------------------------------------------------------
+
+
+def test_library_tracks_edit_feature_declared():
+    assert ProviderFeature.LIBRARY_TRACKS_EDIT in ytm.AUTHENTICATED_FEATURES
+
+
+def _make_authed_provider_with_rate_song(provider):
+    provider._authenticated = True
+    mock = MagicMock()
+    mock.rate_song = MagicMock(return_value=None)
+    provider._ytmusic = mock
+    return mock
+
+
+def test_library_add_track_likes_the_song(provider):
+    mock = _make_authed_provider_with_rate_song(provider)
+    item = _make_item(MediaType.TRACK, "vid12345678")
+    assert asyncio.run(provider.library_add(item)) is True
+    mock.rate_song.assert_called_once_with("vid12345678", "LIKE")
+
+
+def test_library_remove_track_unlikes_the_song(provider):
+    """Deleting a liked track has to remove the like on YouTube too, or the
+    next sync imports it right back (issue #82)."""
+    mock = _make_authed_provider_with_rate_song(provider)
+    assert asyncio.run(provider.library_remove("vid12345678", MediaType.TRACK)) is True
+    mock.rate_song.assert_called_once_with("vid12345678", "INDIFFERENT")
+
+
+def test_library_track_edit_strips_trim_window(provider):
+    """Only the bare video id means anything to the rating endpoint."""
+    mock = _make_authed_provider_with_rate_song(provider)
+    assert (
+        asyncio.run(provider.library_remove("vid12345678@30-90", MediaType.TRACK))
+        is True
+    )
+    mock.rate_song.assert_called_once_with("vid12345678", "INDIFFERENT")
+
+
+def test_library_remove_track_error_returns_false(provider):
+    provider._authenticated = True
+    mock = MagicMock()
+    mock.rate_song = MagicMock(
+        side_effect=RuntimeError("Server returned HTTP 500: Internal Server Error.")
+    )
+    provider._ytmusic = mock
+    assert asyncio.run(provider.library_remove("vid12345678", MediaType.TRACK)) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1981,7 +5135,7 @@ def test_build_auth_headers_substring_only_does_not_satisfy_recommendation(provi
     """A bare mention like '__Secure-1PSID-other=v' must not count as having that cookie."""
     _forbid_open(monkeypatch)
     handler = _attach_capture(provider)
-    # The cookie names parsed are the bit before '=' — make sure we match exactly.
+    # The cookie names parsed are the bit before '=' â€” make sure we match exactly.
     cookie = "__Secure-3PAPISID=a; __Secure-1PSID-typo=oops; SAPISID=b"
     provider._build_auth_headers(cookie)
     joined = " ".join(handler.messages())
@@ -2004,9 +5158,43 @@ def test_is_auth_lapse_detects_unauthorized_text(provider):
 def test_is_auth_lapse_ignores_non_auth_errors(provider):
     assert provider._is_auth_lapse(RuntimeError("Connection reset by peer")) is False
     assert provider._is_auth_lapse(RuntimeError("HTTP 500")) is False
-    # 403 alone is intentionally not treated as auth lapse here — it has the
+    # 403 alone is intentionally not treated as auth lapse here â€” it has the
     # separate owned-playlist no-op path. Auth lapses surface as 401.
     assert provider._is_auth_lapse(RuntimeError("HTTP 403: Forbidden")) is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Video ids and track titles pass through these messages routinely, and
+        # "401" as a bare substring matched any of them. Telling someone their
+        # cookie expired because a video id contained three digits sends them
+        # to re-capture a cookie that was fine.
+        "No formats found for abc401xyz",
+        "get_song failed for 4012abcdefg",
+        "Timeout after 401 seconds",
+        "HTTP 500 while fetching 401k Podcast",
+        "Playlist 'Top 401 of 2026' is unviewable",
+    ],
+)
+def test_is_auth_lapse_does_not_fire_on_an_incidental_401(provider, message):
+    assert provider._is_auth_lapse(RuntimeError(message)) is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Server returned HTTP 401: Unauthorized",
+        "401 Client Error: Unauthorized for url: https://music.youtube.com/...",
+        "status_code=401",
+        "status code: 401",
+        "Unauthorized",
+        "Please provide authentication before using this function",
+        "authentication failed",
+    ],
+)
+def test_is_auth_lapse_still_recognises_real_auth_errors(provider, message):
+    assert provider._is_auth_lapse(RuntimeError(message)) is True
 
 
 def test_library_error_warning_includes_refresh_hint_on_auth_lapse(provider):
@@ -2046,6 +5234,11 @@ def test_library_error_warning_uses_generic_message_for_non_auth_errors(provider
 
 
 def test_get_library_playlists_propagates_auth_lapse_hint(provider):
+    """The hint is logged, and the sync fails rather than reporting no playlists.
+
+    It used to return an empty list here, which Music Assistant reads as an
+    instruction to delete every playlist it holds for this provider (#64).
+    """
     provider._authenticated = True
     provider._auth_lapse_warned = False
     handler = _attach_capture(provider)
@@ -2055,15 +5248,15 @@ def test_get_library_playlists_propagates_auth_lapse_hint(provider):
     )
     provider._ytmusic = mock
 
-    async def _consume():
-        return [item async for item in provider.get_library_playlists()]
+    with pytest.raises(RuntimeError, match="Unauthorized"):
+        _consume(provider.get_library_playlists())
 
-    assert asyncio.run(_consume()) == []
     joined = " ".join(handler.messages())
     assert "cookie" in joined.lower()
 
 
 def test_get_library_albums_propagates_auth_lapse_hint(provider):
+    """As above, for albums: the hint survives and the sync still fails."""
     provider._authenticated = True
     provider._auth_lapse_warned = False
     handler = _attach_capture(provider)
@@ -2073,10 +5266,9 @@ def test_get_library_albums_propagates_auth_lapse_hint(provider):
     )
     provider._ytmusic = mock
 
-    async def _consume():
-        return [item async for item in provider.get_library_albums()]
+    with pytest.raises(RuntimeError, match="Unauthorized"):
+        _consume(provider.get_library_albums())
 
-    assert asyncio.run(_consume()) == []
     joined = " ".join(handler.messages())
     assert "cookie" in joined.lower()
 
@@ -2134,7 +5326,7 @@ def test_probe_session_alive_none_on_transient_error(provider):
 
 
 def test_probe_session_alive_none_when_method_unavailable(provider):
-    """Older ytmusicapi without get_account_info — undetermined, never False."""
+    """Older ytmusicapi without get_account_info â€” undetermined, never False."""
     provider._ytmusic = object()  # bare object, no methods
     assert provider._probe_session_alive() is None
 
@@ -2159,29 +5351,52 @@ def _track_dict(video_id: str, title: str = "x") -> dict:
     }
 
 
-def test_first_empty_library_sync_does_not_warn_or_raise(provider):
-    """A brand-new account with no liked songs should sync to empty silently."""
+def test_first_empty_library_sync_is_verified_then_accepted(provider):
+    """A brand-new account with no liked songs still syncs to empty silently.
+
+    It is now *verified* empty rather than assumed empty. The guard used to
+    skip the probe unless the category had been seen populated earlier in this
+    process, and that state resets on every init, so after a restart a lapsed
+    cookie was indistinguishable from a new account and Music Assistant deleted
+    the library to match. Issue #55.
+    """
     provider._authenticated = True
     provider._auth_lapse_warned = False
     handler = _attach_capture(provider)
     mock = MagicMock()
     mock.get_library_songs = MagicMock(return_value=[])
-    mock.get_account_info = MagicMock(
-        return_value={"accountName": "Should Not Be Called"}
-    )
+    mock.get_account_info = MagicMock(return_value={"accountName": "Real User"})
     provider._ytmusic = mock
 
     result = _consume(provider.get_library_tracks())
 
     assert result == []
-    # Probe must not be invoked on first-ever empty result.
-    assert mock.get_account_info.call_count == 0
+    assert mock.get_account_info.call_count == 1, (
+        "an empty library must be verified against the session, not assumed"
+    )
     warnings = [r for r in handler.records if r.levelname == "WARNING"]
     assert warnings == []
 
 
-def test_repeated_empty_library_sync_does_not_warn_or_probe(provider):
-    """Empty → empty (never populated) must stay silent and never probe."""
+def test_empty_library_sync_raises_on_the_very_first_sync_after_a_lapse(provider):
+    """The exact issue #55 shape: restart, then a first sync that is empty.
+
+    No prior populated state exists in memory, so this is the case the old
+    guard let through.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_songs = MagicMock(return_value=[])
+    mock.get_account_info = MagicMock(return_value={})  # logged-out shape
+    provider._ytmusic = mock
+
+    with pytest.raises(RuntimeError, match="cookie lapse"):
+        _consume(provider.get_library_tracks())
+
+
+def test_repeated_empty_library_sync_stays_silent_while_the_session_is_alive(provider):
+    """Empty â†’ empty on a live session must stay silent."""
     provider._authenticated = True
     handler = _attach_capture(provider)
     mock = MagicMock()
@@ -2192,7 +5407,9 @@ def test_repeated_empty_library_sync_does_not_warn_or_probe(provider):
     _consume(provider.get_library_tracks())
     _consume(provider.get_library_tracks())
 
-    assert mock.get_account_info.call_count == 0
+    # Probed each time. One request per empty sync is a trivial cost next to
+    # the alternative, which is deleting someone's library on a bad guess.
+    assert mock.get_account_info.call_count == 2
     assert [r for r in handler.records if r.levelname == "WARNING"] == []
 
 
@@ -2210,7 +5427,7 @@ def test_populated_then_empty_triggers_probe_and_raises_on_lapse(provider):
     first = _consume(provider.get_library_tracks())
     assert len(first) == 1
 
-    with pytest.raises(RuntimeError, match="partial-auth"):
+    with pytest.raises(RuntimeError, match="cookie lapse"):
         _consume(provider.get_library_tracks())
 
     assert mock.get_account_info.call_count == 1
@@ -2219,7 +5436,7 @@ def test_populated_then_empty_triggers_probe_and_raises_on_lapse(provider):
 
 
 def test_populated_then_empty_does_not_raise_when_probe_alive(provider):
-    """Probe confirms session — treat empty as a real empty library, no raise."""
+    """Probe confirms session â€” treat empty as a real empty library, no raise."""
     provider._authenticated = True
     provider._auth_lapse_warned = False
     handler = _attach_capture(provider)
@@ -2229,7 +5446,7 @@ def test_populated_then_empty_does_not_raise_when_probe_alive(provider):
     provider._ytmusic = mock
 
     _consume(provider.get_library_tracks())
-    # Probe says alive — generator returns empty without raising.
+    # Probe says alive â€” generator returns empty without raising.
     result = _consume(provider.get_library_tracks())
     assert result == []
     assert mock.get_account_info.call_count == 1
@@ -2237,7 +5454,11 @@ def test_populated_then_empty_does_not_raise_when_probe_alive(provider):
 
 
 def test_populated_then_empty_does_not_raise_on_undetermined_probe(provider):
-    """Transient probe error must not raise — that would invent a false alarm."""
+    """Transient probe error must not raise â€” that would invent a false alarm.
+
+    It does warn, though. This is the one remaining path that can still let a
+    library be deleted, so it should not pass in silence.
+    """
     provider._authenticated = True
     provider._auth_lapse_warned = False
     handler = _attach_capture(provider)
@@ -2249,7 +5470,10 @@ def test_populated_then_empty_does_not_raise_on_undetermined_probe(provider):
     _consume(provider.get_library_tracks())
     result = _consume(provider.get_library_tracks())
     assert result == []
-    assert [r for r in handler.records if r.levelname == "WARNING"] == []
+    warnings = " ".join(
+        r.getMessage() for r in handler.records if r.levelname == "WARNING"
+    ).lower()
+    assert "inconclusive" in warnings
 
 
 def test_partial_auth_guard_covers_get_library_albums(provider):
@@ -2264,7 +5488,7 @@ def test_partial_auth_guard_covers_get_library_albums(provider):
     provider._ytmusic = mock
 
     _consume(provider.get_library_albums())
-    with pytest.raises(RuntimeError, match="partial-auth"):
+    with pytest.raises(RuntimeError, match="cookie lapse"):
         _consume(provider.get_library_albums())
     joined = " ".join(handler.messages()).lower()
     assert "cookie" in joined
@@ -2281,7 +5505,7 @@ def test_partial_auth_guard_covers_get_library_playlists(provider):
     provider._ytmusic = mock
 
     _consume(provider.get_library_playlists())
-    with pytest.raises(RuntimeError, match="partial-auth"):
+    with pytest.raises(RuntimeError, match="cookie lapse"):
         _consume(provider.get_library_playlists())
 
 
@@ -2299,7 +5523,7 @@ def test_partial_auth_guard_covers_get_library_artists(provider):
 
     first = _consume(provider.get_library_artists())
     assert len(first) == 1
-    with pytest.raises(RuntimeError, match="partial-auth"):
+    with pytest.raises(RuntimeError, match="cookie lapse"):
         _consume(provider.get_library_artists())
 
 
@@ -2324,21 +5548,1282 @@ def test_get_library_artists_parses_browse_id_and_artist_keys(provider):
     }
 
 
-def test_partial_auth_guard_per_category_state_isolated(provider):
-    """Having seen tracks must not arm the guard for playlists."""
+def _cookie_configured(provider, auth_type=None):
+    """Point provider.config at a cookie-auth configuration."""
+    from ytmusic_free import AUTH_TYPE_COOKIE
+
+    cfg = MagicMock()
+    cfg.get_value = lambda key, *a, **k: (
+        (auth_type or AUTH_TYPE_COOKIE) if key == ytm.CONF_AUTH_TYPE else None
+    )
+    provider.config = cfg
+
+
+@pytest.mark.parametrize(
+    ("method", "category"),
+    [
+        ("get_library_tracks", "tracks"),
+        ("get_library_albums", "albums"),
+        ("get_library_artists", "artists"),
+        ("get_library_playlists", "playlists"),
+        ("get_library_podcasts", "podcasts"),
+    ],
+)
+def test_unauthenticated_library_sync_fails_instead_of_reporting_empty(
+    provider, method, category
+):
+    """Issue #55, the larger half: an unauthenticated sync must not report empty.
+
+    Music Assistant treats a completed sync as authoritative and deletes
+    anything it held that the provider did not return, unfavouriting whatever
+    is left unclaimed. The provider declares its library features
+    unconditionally at setup, so a failed cookie does not stop MA asking. The
+    old silent early return therefore answered "you have nothing", and MA
+    obediently emptied the library.
+    """
+    provider._authenticated = False
+    provider._auth_lapse_warned = False
+    _cookie_configured(provider)
+
+    with pytest.raises(RuntimeError, match="not active"):
+        _consume(getattr(provider, method)())
+
+
+def test_anonymous_instance_still_syncs_empty_without_raising(provider):
+    """A deliberately anonymous instance has no library and never had one.
+
+    Raising there would put a permanent error in the log of every anonymous
+    install, for a deletion that cannot happen.
+    """
+    provider._authenticated = False
+    _cookie_configured(provider, auth_type=ytm.AUTH_TYPE_NONE)
+
+    assert _consume(provider.get_library_tracks()) == []
+
+
+def test_unauthenticated_guard_warns_with_a_cookie_hint(provider):
+    provider._authenticated = False
+    provider._auth_lapse_warned = False
+    handler = _attach_capture(provider)
+    _cookie_configured(provider)
+
+    with pytest.raises(RuntimeError):
+        _consume(provider.get_library_tracks())
+
+    joined = " ".join(handler.messages()).lower()
+    assert "cookie" in joined
+
+
+def test_guard_checks_every_empty_category_regardless_of_history(provider):
+    """A category never seen populated is still checked when it comes back empty.
+
+    This inverts the old behaviour deliberately. Gating on per-category history
+    meant an account whose playlists happened to be empty on the sync before a
+    lapse would have its playlists deleted without a single check. The state it
+    gated on lived only in memory, so a restart put *every* category in that
+    position, which is issue #55.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_songs = MagicMock(return_value=[_track_dict("v1")])
+    mock.get_library_playlists = MagicMock(return_value=[])
+    mock.get_account_info = MagicMock(return_value={})  # logged-out shape
+    provider._ytmusic = mock
+
+    # Tracks came back populated, so no probe for that category.
+    _consume(provider.get_library_tracks())
+    assert mock.get_account_info.call_count == 0
+
+    # Playlists came back empty. Never populated in this process, and checked
+    # anyway.
+    with pytest.raises(RuntimeError, match="cookie lapse"):
+        _consume(provider.get_library_playlists())
+    assert mock.get_account_info.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# A failed library fetch fails the sync (issue #64)
+#
+# The #55 work closed two of the three routes to a completed-but-empty sync:
+# an unauthenticated run, and an empty result the session probe blames on a
+# lapsed cookie. The third stayed open. When the fetch itself raised, the
+# generator logged and returned, which is a *successful* sync of zero items,
+# and Music Assistant deletes everything a successful sync did not return.
+# A rate limit therefore emptied the library exactly the way an expired cookie
+# used to.
+# ---------------------------------------------------------------------------
+
+
+def _consume_until_error(generator):
+    """Drain a generator, returning (items yielded, error raised or None).
+
+    Needed because the point of several tests below is that *nothing* is
+    yielded before the raise: pytest.raises alone cannot tell "raised without
+    yielding" apart from "yielded half a library and then raised".
+    """
+    collected = []
+
+    async def _drain():
+        try:
+            async for item in generator:
+                collected.append(item)
+        except Exception as err:  # noqa: BLE001 - the error is the assertion
+            return err
+        return None
+
+    return collected, asyncio.run(_drain())
+
+
+# (provider method, the ytmusicapi method it fetches through)
+_LIBRARY_FETCHES = [
+    ("get_library_tracks", "get_library_songs"),
+    ("get_library_albums", "get_library_albums"),
+    ("get_library_playlists", "get_library_playlists"),
+    ("get_library_podcasts", "get_library_podcasts"),
+    ("get_library_artists", "get_library_subscriptions"),
+]
+
+
+@pytest.mark.parametrize(("method", "client_method"), _LIBRARY_FETCHES)
+def test_a_failed_library_fetch_fails_the_sync_instead_of_reporting_empty(
+    provider, method, client_method
+):
+    """Every library category, one rule: a fetch we could not complete raises."""
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    setattr(
+        mock,
+        client_method,
+        MagicMock(side_effect=RuntimeError("Server returned HTTP 503: Service Unavailable")),
+    )
+    provider._ytmusic = mock
+
+    with pytest.raises(RuntimeError, match="503"):
+        _consume(getattr(provider, method)())
+
+
+@pytest.mark.parametrize(("method", "client_method"), _LIBRARY_FETCHES)
+def test_a_failed_library_fetch_yields_nothing_before_it_raises(
+    provider, method, client_method
+):
+    """Fail before the first yield, not halfway through.
+
+    Music Assistant commits each item as it arrives, so a half-drained sync
+    leaves writes behind for items it is about to disown. Fetching everything
+    up front and raising before the loop keeps that from happening.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    setattr(mock, client_method, MagicMock(side_effect=RuntimeError("boom")))
+    provider._ytmusic = mock
+
+    items, err = _consume_until_error(getattr(provider, method)())
+
+    assert items == []
+    assert isinstance(err, RuntimeError)
+
+
+def test_a_failed_library_fetch_logs_the_underlying_error_before_raising(provider):
+    """Raising must not cost the diagnostic that says what actually broke."""
     provider._authenticated = True
     provider._auth_lapse_warned = False
     handler = _attach_capture(provider)
     mock = MagicMock()
-    mock.get_library_songs = MagicMock(return_value=[_track_dict("v1")])
-    mock.get_library_playlists = MagicMock(return_value=[])
-    mock.get_account_info = MagicMock(return_value={})  # would say lapsed if called
+    mock.get_library_songs = MagicMock(side_effect=RuntimeError("Connection timeout"))
     provider._ytmusic = mock
 
-    # Populate tracks state.
-    _consume(provider.get_library_tracks())
-    # Playlists has never been populated — empty result must not probe.
-    result = _consume(provider.get_library_playlists())
-    assert result == []
+    with pytest.raises(RuntimeError, match="Connection timeout"):
+        _consume(provider.get_library_tracks())
+
+    joined = " ".join(handler.messages())
+    assert "get_library_songs" in joined
+    assert "Connection timeout" in joined
+    # Not an auth error, so it must not be reported as an expired cookie.
+    assert "cookie" not in joined.lower()
+    assert provider._auth_lapse_warned is False
+
+
+def test_a_failed_library_fetch_does_not_probe_the_session(provider):
+    """A failed fetch is not an empty library, so the cookie is not the suspect.
+
+    The probe exists to explain an empty result. Running it here would spend a
+    request and could pin a network failure on the user's cookie.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_albums = MagicMock(side_effect=RuntimeError("boom"))
+    provider._ytmusic = mock
+
+    with pytest.raises(RuntimeError):
+        _consume(provider.get_library_albums())
+
     assert mock.get_account_info.call_count == 0
-    assert [r for r in handler.records if r.levelname == "WARNING"] == []
+
+
+def test_a_failed_library_fetch_does_not_mark_the_category_as_populated(provider):
+    """A library we failed to read tells us nothing about whether it has items."""
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    provider._library_seen_nonempty = {}
+    mock = MagicMock()
+    mock.get_library_albums = MagicMock(side_effect=RuntimeError("boom"))
+    provider._ytmusic = mock
+
+    with pytest.raises(RuntimeError):
+        _consume(provider.get_library_albums())
+
+    assert provider._library_seen_nonempty == {}
+
+
+def test_get_library_artists_fails_when_the_subscriptions_fetch_fails(provider):
+    """Half a result is not a library.
+
+    Artists come from two calls. The empty-library guard used to run on their
+    combined length, so a failed subscriptions call sitting next to one
+    successful library artist produced a non-zero count, a clean sync, and the
+    deletion of every subscribed artist.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_subscriptions = MagicMock(
+        side_effect=RuntimeError("Server returned HTTP 429: Too Many Requests")
+    )
+    mock.get_library_artists = MagicMock(
+        return_value=[{"browseId": "UC1", "artist": "Still Here"}]
+    )
+    provider._ytmusic = mock
+
+    items, err = _consume_until_error(provider.get_library_artists())
+
+    assert items == []
+    assert isinstance(err, RuntimeError)
+    assert "429" in str(err)
+
+
+def test_get_library_artists_fails_when_the_library_artists_fetch_fails(provider):
+    """The mirror case, so neither half of the artist sync is privileged."""
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_subscriptions = MagicMock(
+        return_value=[{"browseId": "UC1", "artist": "Still Here"}]
+    )
+    mock.get_library_artists = MagicMock(
+        side_effect=RuntimeError("Server returned HTTP 500: Internal Server Error")
+    )
+    provider._ytmusic = mock
+
+    items, err = _consume_until_error(provider.get_library_artists())
+
+    assert items == []
+    assert isinstance(err, RuntimeError)
+    assert "500" in str(err)
+
+
+def test_get_library_artists_skips_the_second_fetch_once_the_first_has_failed(provider):
+    """Whatever took out one call is about to take out the other.
+
+    Its result would be discarded by the raise anyway, and retrying into a rate
+    limit is how a short one becomes a long one.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_subscriptions = MagicMock(side_effect=RuntimeError("boom"))
+    mock.get_library_artists = MagicMock(return_value=[])
+    provider._ytmusic = mock
+
+    with pytest.raises(RuntimeError):
+        _consume(provider.get_library_artists())
+
+    assert mock.get_library_artists.call_count == 0
+
+
+def test_a_missing_ytmusicapi_library_method_fails_with_an_upgrade_hint(provider):
+    """An ytmusicapi too old for podcasts must not read as "no subscriptions".
+
+    The provider asks pip for `ytmusicapi` with no version, so an install that
+    already had an older copy keeps it and never reaches the manifest floor.
+
+    The hint has to name the restart as well as the upgrade. The module is
+    resolved through ``importlib.import_module``, which hands back whatever is
+    already in ``sys.modules``, so an in-place pip upgrade is invisible to the
+    running process and a provider reload does not replace it either. A hint
+    that stops at "upgrade" sends the user round the loop a second time.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    handler = _attach_capture(provider)
+    provider._ytmusic = MagicMock(spec=["get_library_songs"])
+
+    with pytest.raises(RuntimeError, match="ytmusicapi"):
+        _consume(provider.get_library_podcasts())
+
+    joined = " ".join(handler.messages()).lower()
+    assert "upgrade" in joined
+    assert "restart" in joined
+
+
+def test_a_library_fetch_of_an_unexpected_shape_fails_rather_than_being_counted(provider):
+    """A shape we cannot count is a shape we cannot vouch for.
+
+    len() of a dict counts its keys, so a changed response would clear the
+    empty-library guard on a non-zero count and then yield nothing, which is
+    precisely the deletion this all exists to prevent.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_albums = MagicMock(return_value={"contents": [], "continuation": "x"})
+    provider._ytmusic = mock
+
+    with pytest.raises(TypeError, match="expected a list"):
+        _consume(provider.get_library_albums())
+
+
+def test_a_library_fetch_returning_none_is_still_an_empty_library(provider):
+    """None is how ytmusicapi spells "nothing here", not a failure.
+
+    Regression guard for the `or []` that moved into the fetch helper: an
+    account with no saved albums must still sync cleanly rather than raise.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_albums = MagicMock(return_value=None)
+    mock.get_account_info = MagicMock(return_value={"accountName": "Someone"})
+    provider._ytmusic = mock
+
+    assert _consume(provider.get_library_albums()) == []
+
+
+def test_a_cancelled_library_sync_is_not_logged_as_a_library_failure(provider):
+    """Shutdown is not a library failure.
+
+    Music Assistant cancels the sync task when it stops. CancelledError is a
+    BaseException, so `except Exception` in the fetch helper lets it through
+    untouched. This pins that: widening the catch would fill the log with
+    library errors on every restart and would swallow the cancellation.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    handler = _attach_capture(provider)
+    mock = MagicMock()
+    mock.get_library_songs = MagicMock(side_effect=asyncio.CancelledError())
+    provider._ytmusic = mock
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(provider._fetch_library("get_library_songs", limit=1))
+
+    assert handler.messages() == []
+
+
+def test_one_unparseable_library_item_does_not_fail_the_whole_sync(provider):
+    """Per-item tolerance is deliberate and must survive this change.
+
+    The fix is about a fetch that could not answer. An item the parser cannot
+    read is a different thing: the rest of the library is still good, and
+    failing the sync over one bad row would be the more destructive choice.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_songs = MagicMock(return_value=[_track_dict("v1"), {"title": "no id"}])
+    provider._ytmusic = mock
+
+    tracks = _consume(provider.get_library_tracks())
+
+    assert [t.item_id for t in tracks] == ["v1"]
+
+
+# ---------------------------------------------------------------------------
+# Home feed recommendations on Music Assistant 2.9 and 2.10 (issue #96)
+#
+# 2.10 replaced recommendations() with get_recommendations() (rows only) and
+# get_recommendation_items(item_id), and its base versions raise once
+# RECOMMENDATIONS is declared. The feed also lost every playlist, mix, album
+# and podcast card to a dispatch that never matched their shapes.
+# ---------------------------------------------------------------------------
+
+
+def _home_thumbs(key, sizes=(226, 544)):
+    """Square googleusercontent covers, the shape home feed cards carry."""
+    return [
+        {
+            "url": f"https://yt3.googleusercontent.com/{key}=w{size}-h{size}-l90-rj",
+            "width": size,
+            "height": size,
+        }
+        for size in sizes
+    ]
+
+
+# Trimmed from a real unauthenticated get_home(limit=20) taken with ytmusicapi
+# 1.12.1: every row title in payload order, one or two cards each, keys exactly
+# as ytmusicapi emits them.
+_HOME_FEED = [
+    {
+        "title": "Quick picks",
+        "contents": [
+            {
+                "title": "Patient Zero",
+                "videoId": "V-uIp-WuD60",
+                "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                "thumbnails": _home_thumbs("DNFuGZeu", (60, 120)),
+                "isExplicit": False,
+                "artists": [{"name": "Taylor Swift", "id": "UCPC0L1d253x-KuMNwa05TpA"}],
+                "views": "39M",
+                "album": {"name": "The Life of a Showgirl", "id": "MPREb_L64BnYDQpHZ"},
+            },
+            {
+                "title": "Nur ein Lied",
+                "videoId": "jc4A-1KJAZU",
+                "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                "thumbnails": _home_thumbs("GaKpiRac", (60, 120)),
+                "isExplicit": False,
+                "artists": [{"name": "Kerstin Ott", "id": "UCVAvAvPCnScF3XoFPzvep7g"}],
+                "views": "480K",
+                "album": {"name": "Nur ein Lied", "id": "MPREb_03kJUBdSY8D"},
+            },
+        ],
+    },
+    {
+        "title": "Sunday breakfast",
+        "contents": [
+            {
+                "title": "Feel-Good Pop & Rock",
+                "playlistId": "RDCLAK5uy_m0wlRoNn5iCTTgBedfoOQ19Jq9P3XTLIA",
+                "thumbnails": _home_thumbs("CTtOLB0z"),
+                "description": "Ed Sheeran, Imagine Dragons, HAIM, Taylor Swift",
+            }
+        ],
+    },
+    {
+        "title": "Today's biggest hits",
+        "contents": [
+            {
+                "title": "phonk",
+                "playlistId": "RDCLAK5uy_ljm2pVSIkXSIKp1im9yxV0XgLmkBbGR-E",
+                "thumbnails": _home_thumbs("IbSKJjPQ"),
+                "description": "Eternxlkz, Kordhell, MXZI, Sayfalse",
+            }
+        ],
+    },
+    {
+        "title": "New releases",
+        "contents": [
+            {
+                "title": "Nashville",
+                "artists": [
+                    {"id": "UC2fL1mkImUx_l_YELcZjoJw", "name": "Peter Maffay"},
+                    {"id": "UC_d8ngsw0fyDErICrkgNqAQ", "name": "Johannes Oerding"},
+                ],
+                "browseId": "MPREb_RFyWgIEomZB",
+                "audioPlaylistId": "OLAK5uy_lVgDz3DvGnVAat22sKrb7Ujlatnzhwd6w",
+                "thumbnails": _home_thumbs("igyaHYdd"),
+                "isExplicit": False,
+                "type": "Album",
+            }
+        ],
+    },
+    {
+        "title": "100% Hits",
+        "contents": [
+            {
+                "title": "Pop Gold",
+                "playlistId": "RDCLAK5uy_nHSqCJjDrW9HBhCNdF6tWPdnOMngOv0wA",
+                "thumbnails": _home_thumbs("rAUuEbLF"),
+                "description": "Alicia Keys, Ed Sheeran, Adele, Lewis Capaldi",
+            }
+        ],
+    },
+    {
+        "title": "Throwback",
+        "contents": [
+            {
+                "title": "'80s Pop",
+                "playlistId": "RDCLAK5uy_k1Wu8QbZASiGVqr1wmie9NIYo38aBqscQ",
+                "thumbnails": _home_thumbs("zcEHBRn_"),
+                "description": "George Michael, Michael Jackson, Madonna, Prince",
+            }
+        ],
+    },
+    {
+        "title": "Featured playlists for you",
+        "contents": [
+            {
+                "title": "Trending 20 Germany",
+                "playlistId": "OLAK5uy_nPQBmQpOIYYxuvYW4gIHsjgDqX9kc--Dg",
+                "thumbnails": [
+                    {"url": "https://yt3.googleusercontent.com/byh7J_ct=s192", "width": 192, "height": 192},
+                    {"url": "https://yt3.googleusercontent.com/byh7J_ct=s576", "width": 576, "height": 576},
+                ],
+                "description": "Chart - YouTube Charts",
+            }
+        ],
+    },
+]
+
+_BLOCKED_ID = "UC000000000000000000000a"
+
+
+def _home_song(video_id="vid00000001", title="Good", artist="Real Band", artist_id="UC000000000000000000000b"):
+    return {
+        "title": title,
+        "videoId": video_id,
+        "playlistId": "RDAMVM" + video_id,
+        "thumbnails": _home_thumbs("song", (60, 120)),
+        "artists": [{"name": artist, "id": artist_id}],
+    }
+
+
+def _home_album(browse_id="MPREb_bot", artist="Sloppy Bot", artist_id=_BLOCKED_ID, album_type="Album"):
+    return {
+        "title": "Generated Album",
+        "artists": [{"id": artist_id, "name": artist}],
+        "browseId": browse_id,
+        "audioPlaylistId": "OLAK5uy_bot",
+        "thumbnails": _home_thumbs("album"),
+        "isExplicit": False,
+        "type": album_type,
+    }
+
+
+def _home_community_playlist(playlist_id="PLbot", author="Sloppy Bot", author_id=_BLOCKED_ID):
+    """parse_playlist output for a playlist whose subtitle names its author."""
+    return {
+        "title": "Bot Picks",
+        "playlistId": playlist_id,
+        "thumbnails": _home_thumbs("playlist"),
+        "description": f"{author} \u2022 50 songs",
+        "count": "50",
+        "author": [{"name": author, "id": author_id}],
+    }
+
+
+def _home_mix(playlist_id="RDTMAK5uy_mix", title="My Supermix"):
+    """parse_watch_playlist output: playlistId, title and thumbnails only."""
+    return {"title": title, "playlistId": playlist_id, "thumbnails": _home_thumbs("mix")}
+
+
+def _home_artist_card(browse_id=_BLOCKED_ID, title="Sloppy Bot"):
+    return {
+        "title": title,
+        "browseId": browse_id,
+        "subscribers": "1.2M",
+        "thumbnails": _home_thumbs("artist"),
+    }
+
+
+def _home_provider(provider, home=None, *, authenticated=True):
+    """Point the provider at a scripted get_home and mark it signed in."""
+    provider._authenticated = authenticated
+    mock = MagicMock()
+    mock.get_home = MagicMock(return_value=json.loads(json.dumps(home if home is not None else _HOME_FEED)))
+    provider._ytmusic = mock
+    return mock
+
+
+def _row_items(provider, row_id):
+    return asyncio.run(provider.get_recommendation_items(row_id))
+
+
+# Hook wiring ----------------------------------------------------------------
+
+
+def test_210_hooks_are_overridden_under_the_declared_features():
+    """Built the way setup() builds every instance, anonymous ones included.
+
+    The stub base raises here exactly like 2.10 does, which is the failure the
+    issue reported: 1.2.1 never overrode either hook.
+    """
+    instance = ytm.YoutubeMusicFreeProvider(
+        mass=None, manifest=None, config=None,
+        supported_features=ytm.BASE_FEATURES | ytm.AUTHENTICATED_FEATURES,
+    )
+    instance._ytmusic = None
+    instance._authenticated = False
+    base = sys.modules["music_assistant.models.music_provider"].MusicProvider
+    with pytest.raises(NotImplementedError):
+        asyncio.run(base.get_recommendations(instance))
+
+    assert asyncio.run(instance.get_recommendations()) == []
+    assert list(asyncio.run(instance.get_recommendation_items("ytm_rec_quick_picks"))) == []
+
+
+def test_29_hook_is_kept(provider):
+    """Music Assistant 2.9 and 2.10.0b0 to b7 call only this one."""
+    assert "recommendations" in vars(ytm.YoutubeMusicFreeProvider)
+    _home_provider(provider)
+
+    rows = asyncio.run(provider.recommendations())
+
+    assert rows and all(row.items for row in rows)
+
+
+# Rows and items -------------------------------------------------------------
+
+
+def test_rows_come_back_without_items(provider):
+    _home_provider(provider)
+
+    rows = asyncio.run(provider.get_recommendations())
+
+    assert [row.name for row in rows] == [section["title"] for section in _HOME_FEED]
+    assert all(list(row.items) == [] for row in rows)
+    assert all(row.provider == provider.instance_id for row in rows)
+
+
+def test_row_items_are_that_rows_items(provider):
+    _home_provider(provider)
+    full = asyncio.run(provider.recommendations())
+    rows = asyncio.run(provider.get_recommendations())
+
+    # Guards the loop below, which would pass vacuously on zero rows.
+    assert len(rows) == len(_HOME_FEED)
+    for row in rows:
+        expected = next(folder for folder in full if folder.item_id == row.item_id)
+        assert list(_row_items(provider, row.item_id)) == list(expected.items)
+
+
+def test_unknown_row_id_returns_an_empty_unique_list(provider):
+    _home_provider(provider)
+
+    items = _row_items(provider, "ytm_rec_no_such_row")
+
+    assert isinstance(items, ytm.UniqueList)
+    assert len(items) == 0
+
+
+def test_29_and_210_hooks_agree(provider):
+    _home_provider(provider)
+
+    old = asyncio.run(provider.recommendations())
+    new_rows = asyncio.run(provider.get_recommendations())
+
+    assert [(r.item_id, r.name) for r in old] == [(r.item_id, r.name) for r in new_rows]
+    assert [list(r.items) for r in old] == [list(_row_items(provider, r.item_id)) for r in new_rows]
+
+
+def test_new_hooks_empty_when_not_authenticated(provider):
+    mock = _home_provider(provider, authenticated=False)
+
+    assert asyncio.run(provider.get_recommendations()) == []
+    assert list(_row_items(provider, "ytm_rec_quick_picks")) == []
+    mock.get_home.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda p: p.recommendations(),
+        lambda p: p.get_recommendations(),
+        lambda p: p.get_recommendation_items("ytm_rec_quick_picks"),
+    ],
+    ids=["recommendations", "get_recommendations", "get_recommendation_items"],
+)
+def test_new_hooks_swallow_a_lapsed_cookie(provider, call):
+    """A raise here reaches the 2.10 browse page as error 999."""
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    handler = _attach_capture(provider)
+    mock = MagicMock()
+    mock.get_home = MagicMock(side_effect=RuntimeError("Server returned HTTP 401: Unauthorized"))
+    provider._ytmusic = mock
+
+    assert list(asyncio.run(call(provider))) == []
+    assert "cookie" in " ".join(handler.messages()).lower()
+
+
+def test_home_feed_lapse_raises_the_auth_notice(provider):
+    provider._authenticated = True
+    provider._auth_notice = None
+    _attach_capture(provider)
+    mock = MagicMock()
+    mock.get_home = MagicMock(side_effect=RuntimeError("Server returned HTTP 401: Unauthorized"))
+    provider._ytmusic = mock
+
+    asyncio.run(provider.get_recommendations())
+
+    assert provider._auth_notice is not None
+
+
+# Caching --------------------------------------------------------------------
+
+
+def test_home_feed_is_cached():
+    """Only parameters Music Assistant 2.9's use_cache also has.
+
+    No cache_none in particular: it exists only on 2.10, and passing it would
+    stop the provider importing on 2.9. cache_checksum is safe, it has been
+    there since 2.7.
+    """
+    cache = ytm.YoutubeMusicFreeProvider._get_home_feed.__ma_cache__
+    assert cache == {
+        "expiration": ytm.HOME_FEED_CACHE_TTL,
+        "allow_expired_cache": True,
+        "cache_checksum": str(ytm.HOME_FEED_ROW_LIMIT),
+    }
+
+
+def test_home_feed_checksum_retires_a_feed_fetched_with_another_limit():
+    """The checksum is the row limit, so changing the limit retires old entries.
+
+    Music Assistant only compares a checksum it was given a truthy value for
+    (``not checksum or row["checksum"] == checksum``), and 1.2.2 stored its
+    six-shelf feed without one. A non-empty checksum is what turns that entry
+    into a miss on the first read after updating, instead of it being served
+    until its hour runs out. Issue #96.
+    """
+    checksum = ytm.YoutubeMusicFreeProvider._get_home_feed.__ma_cache__["cache_checksum"]
+    assert checksum == str(ytm.HOME_FEED_ROW_LIMIT)
+    assert checksum, "a falsy checksum is never compared, so it would retire nothing"
+
+
+def test_home_feed_limit_reaches_the_shelves_logged_in_feeds_put_low():
+    """A floor, so the limit cannot slide back to where 1.2.2 had it.
+
+    In the logged-in feed shared on issue #96, "Albums for you", "New
+    releases" and "Mixed for you" came 12th to 14th. ytmusicapi stops asking
+    for more shelves once it holds the limit, so six never reached them.
+    """
+    assert ytm.HOME_FEED_ROW_LIMIT >= 14
+
+
+def test_home_feed_raises_instead_of_returning_empty(provider):
+    """Every server line caches [] like any other value; a failure must not be."""
+    provider._authenticated = True
+    _attach_capture(provider)
+    mock = MagicMock()
+    mock.get_home = MagicMock(side_effect=RuntimeError("boom"))
+    provider._ytmusic = mock
+
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(provider._get_home_feed(""))
+
+
+def test_home_feed_is_fetched_with_the_row_limit(provider):
+    mock = _home_provider(provider)
+
+    asyncio.run(provider.get_recommendations())
+
+    mock.get_home.assert_called_once_with(limit=ytm.HOME_FEED_ROW_LIMIT)
+
+
+def test_home_feed_cache_key_carries_the_account(provider):
+    _home_provider(provider)
+    provider._home_feed_account = "123:1"
+    seen = []
+
+    async def _fake_feed(account):
+        seen.append(account)
+        return []
+
+    provider._get_home_feed = _fake_feed
+    asyncio.run(provider.get_recommendations())
+
+    assert seen == ["123:1"]
+
+
+def test_cookie_init_records_the_home_feed_account(monkeypatch):
+    instance, _ = _setup_cookie_instance(
+        monkeypatch,
+        "inst_home_account",
+        library=[{"videoId": "v1", "title": "x"}],
+        account_info={"accountName": "Real"},
+        extra_config={ytm.CONF_BRAND_ACCOUNT: "123", ytm.CONF_AUTH_USER: 1},
+    )
+
+    assert instance._authenticated is True
+    assert instance._home_feed_account == "123:1"
+
+
+def test_filter_applies_on_top_of_the_cached_payload(provider):
+    """The cache holds the raw feed, so a blocklist edit applies on the next read."""
+    home = [
+        {
+            "title": "Listen again",
+            "contents": [_home_song(), _home_song("vid00000002", "Slop", "Sloppy Bot", _BLOCKED_ID)],
+        }
+    ]
+    mock = _home_provider(provider, home)
+
+    provider._ai_filter_enabled = False
+    assert len(_row_items(provider, "ytm_rec_listen_again")) == 2
+
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    assert [t.name for t in _row_items(provider, "ytm_rec_listen_again")] == ["Good"]
+
+    raw = asyncio.run(provider._get_home_feed(""))
+    assert raw == mock.get_home.return_value
+    assert len(raw[0]["contents"]) == 2
+
+
+# Row ids --------------------------------------------------------------------
+
+
+def test_row_ids_have_no_slash_and_survive_browse_split():
+    """2.10's base browse keeps only the second path segment."""
+    (row_id,) = ytm._home_row_ids(["Rock/Pop"])
+
+    assert row_id == "ytm_rec_rock_pop"
+    path = f"ytmusic_free--x://recommendations/{row_id}"
+    assert path.split("://", 1)[1].split("/")[1] == row_id
+
+
+def test_duplicate_titles_get_distinct_ids(provider):
+    home = [
+        {"title": "Mix", "contents": [_home_song("vid00000001", "First")]},
+        {"title": "Mix", "contents": [_home_song("vid00000002", "Second")]},
+    ]
+    _home_provider(provider, home)
+
+    rows = asyncio.run(provider.get_recommendations())
+
+    assert [row.item_id for row in rows] == ["ytm_rec_mix", "ytm_rec_mix_2"]
+    assert [t.name for t in _row_items(provider, "ytm_rec_mix")] == ["First"]
+    assert [t.name for t in _row_items(provider, "ytm_rec_mix_2")] == ["Second"]
+
+
+def test_a_suffixed_title_cannot_collide_with_a_numbered_duplicate():
+    assert ytm._home_row_ids(["Mix", "Mix", "Mix 2"]) == [
+        "ytm_rec_mix",
+        "ytm_rec_mix_2",
+        "ytm_rec_mix_2_2",
+    ]
+
+
+def test_simple_titles_keep_their_121_id():
+    assert ytm._home_row_ids(["Quick picks"]) == ["ytm_rec_quick_picks"]
+
+
+def test_row_ids_ignore_the_filter(provider):
+    """An emptied first row must not hand its id to the second."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    home = [
+        {"title": "Mix", "contents": [_home_song("vid00000002", "Slop", "Sloppy Bot", _BLOCKED_ID)]},
+        {"title": "Mix", "contents": [_home_song("vid00000001", "Good")]},
+    ]
+    _home_provider(provider, home)
+
+    rows = asyncio.run(provider.get_recommendations())
+
+    assert [row.item_id for row in rows] == ["ytm_rec_mix_2"]
+
+
+def test_non_ascii_title_slug():
+    assert ytm._home_row_ids(["F\u00fcr dich", "\U0001f525\U0001f525"]) == [
+        "ytm_rec_f\u00fcr_dich",
+        "ytm_rec_row",
+    ]
+
+
+# Item shapes ----------------------------------------------------------------
+
+
+def test_home_playlist_without_browse_id_is_kept(provider):
+    item = provider._parse_home_item(_HOME_FEED[1]["contents"][0])
+
+    assert isinstance(item, ytm.Playlist)
+    assert item.item_id == "RDCLAK5uy_m0wlRoNn5iCTTgBedfoOQ19Jq9P3XTLIA"
+    assert item.name == "Feel-Good Pop & Rock"
+
+
+@pytest.mark.parametrize("playlist_id", ["RDTMAK5uy_abcdef", "RDAMVMjc4A-1KJAZU"])
+def test_home_mix_is_kept(provider, playlist_id):
+    item = provider._parse_home_item(_home_mix(playlist_id))
+
+    assert isinstance(item, ytm.Playlist)
+    assert item.item_id == playlist_id
+
+
+def test_home_song_with_playlist_id_stays_a_track(provider):
+    item = provider._parse_home_item(_home_song())
+
+    assert isinstance(item, ytm.Track)
+    assert item.item_id == "vid00000001"
+
+
+@pytest.mark.parametrize(
+    ("type_text", "expected"),
+    [
+        ("Album", AlbumType.ALBUM),
+        ("Single", AlbumType.SINGLE),
+        ("EP", AlbumType.EP),
+        (None, AlbumType.UNKNOWN),
+        ("Peter Maffay", AlbumType.UNKNOWN),
+    ],
+)
+def test_home_album_is_kept_whatever_its_type_text(provider, type_text, expected):
+    """1.2.1 compared the display text against lowercase values and kept none."""
+    content = _home_album(artist="Peter Maffay", artist_id="UC2fL1mkImUx_l_YELcZjoJw")
+    content["type"] = type_text
+
+    item = provider._parse_home_item(content)
+
+    assert isinstance(item, ytm.Album)
+    assert item.item_id == "MPREb_bot"
+    assert item.album_type == expected
+
+
+def test_home_artist_card_is_an_artist_named_by_title(provider):
+    item = provider._parse_home_item(_home_artist_card("UCrealartist000000000000", "Real Band"))
+
+    assert isinstance(item, ytm.Artist)
+    assert item.item_id == "UCrealartist000000000000"
+    assert item.name == "Real Band"
+
+
+def test_home_podcast_is_kept(provider):
+    content = {
+        "title": "Some Show",
+        "channel": {"name": "Host", "id": "UChost"},
+        "browseId": "MPSPPLx",
+        "podcastId": "PLx",
+        "thumbnails": _home_thumbs("show"),
+    }
+
+    item = provider._parse_home_item(content)
+
+    assert isinstance(item, ytm.Podcast)
+    assert item.item_id == "PLx"
+
+
+def test_home_podcast_episode_is_skipped(provider):
+    content = {
+        "title": "Episode 1",
+        "videoId": "ep00000001",
+        "videoType": ytm.VIDEO_TYPE_PODCAST_EPISODE,
+        "browseId": "MPEDep",
+        "thumbnails": _home_thumbs("episode"),
+    }
+
+    assert provider._parse_home_item(content) is None
+
+
+def test_description_shelf_does_not_sink_the_feed(provider):
+    """1.2.1 raised AttributeError on a string "contents" and lost every row."""
+    home = [
+        {"title": "About this mix", "contents": "A few words about the shelf."},
+        {"title": "Quick picks", "contents": [_home_song()]},
+    ]
+    _home_provider(provider, home)
+
+    rows = asyncio.run(provider.recommendations())
+
+    assert [row.name for row in rows] == ["Quick picks"]
+
+
+def test_missing_thumbnails_do_not_drop_an_item(provider):
+    """ytmusicapi 1.12.2 and later can send thumbnails as None."""
+    content = _home_album(artist="Peter Maffay", artist_id="UC2fL1mkImUx_l_YELcZjoJw")
+    content["thumbnails"] = None
+
+    item = provider._parse_home_item(content)
+
+    assert isinstance(item, ytm.Album)
+
+
+def test_unknown_shape_is_skipped(provider):
+    assert provider._parse_home_item({"title": "Something new", "browseId": "FEmusic_x"}) is None
+    assert provider._parse_home_item("not a dict") is None
+
+
+def test_captured_feed_keeps_every_row(provider):
+    """1.2.1 kept only the song row of this payload."""
+    _home_provider(provider)
+
+    rows = asyncio.run(provider.recommendations())
+
+    assert len(rows) == len(_HOME_FEED) == 7
+    assert sum(len(row.items) for row in rows) == sum(len(s["contents"]) for s in _HOME_FEED)
+
+
+# Images ---------------------------------------------------------------------
+
+
+def test_home_cards_carry_a_thumb(provider):
+    _home_provider(provider)
+
+    for row in asyncio.run(provider.recommendations()):
+        for item in row.items:
+            thumbs = [img for img in item.metadata.images if img.type == ImageType.THUMB]
+            assert thumbs, f"{item.name} has no THUMB"
+    album = provider._parse_home_item(_HOME_FEED[3]["contents"][0])
+    assert any(img.path.endswith("=w600-h600-p") for img in album.metadata.images)
+
+
+def test_frame_only_playlist_cover_is_kept_for_cards(provider):
+    """A card gets no collage, so a video frame beats no artwork."""
+    content = {
+        "title": "Uploads",
+        "playlistId": "PLframes",
+        "thumbnails": [{"url": "https://i.ytimg.com/vi/abc/hqdefault.jpg", "width": 480, "height": 360}],
+    }
+
+    card = provider._parse_home_item(content)
+
+    assert [img.type for img in card.metadata.images] == [ImageType.THUMB]
+    assert provider._parse_playlist(content).metadata.images == []
+
+
+# AI filter ------------------------------------------------------------------
+
+
+def _filtered_home_provider(provider, contents, *, title="For you"):
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset()
+    provider._ai_blocked_channel_ids = frozenset()
+    _home_provider(provider, [{"title": title, "contents": contents}])
+
+
+def test_new_hooks_apply_the_ai_filter(provider):
+    _filtered_home_provider(
+        provider, [_home_song(), _home_song("vid00000002", "Slop", "Sloppy Bot", _BLOCKED_ID)]
+    )
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+
+    assert [t.name for t in _row_items(provider, "ytm_rec_for_you")] == ["Good"]
+
+
+def test_rows_listing_omits_a_row_emptied_by_the_filter(provider):
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    home = [
+        {"title": "All slop", "contents": [_home_song("vid00000002", "Slop", "Sloppy Bot", _BLOCKED_ID)]},
+        {"title": "Quick picks", "contents": [_home_song()]},
+    ]
+    _home_provider(provider, home)
+
+    rows = asyncio.run(provider.get_recommendations())
+
+    assert [row.name for row in rows] == ["Quick picks"]
+    assert list(_row_items(provider, "ytm_rec_all_slop")) == []
+
+
+def test_an_album_by_a_blocked_artist_is_dropped_from_a_home_row(provider):
+    _filtered_home_provider(
+        provider,
+        [
+            _home_album(),
+            _home_album("MPREb_real", "Peter Maffay", "UC2fL1mkImUx_l_YELcZjoJw"),
+        ],
+    )
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+
+    assert [a.item_id for a in _row_items(provider, "ytm_rec_for_you")] == ["MPREb_real"]
+
+
+def test_an_album_matches_a_blocked_name_too(provider):
+    # The control album proves the row was found and parsed, so an empty
+    # result cannot pass for the right reason by accident.
+    _filtered_home_provider(
+        provider,
+        [
+            _home_album(artist_id="UCsomeotherid00000000000"),
+            _home_album("MPREb_real", "Peter Maffay", "UC2fL1mkImUx_l_YELcZjoJw"),
+        ],
+    )
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+
+    assert [a.item_id for a in _row_items(provider, "ytm_rec_for_you")] == ["MPREb_real"]
+
+
+def test_a_playlist_by_a_blocked_author_id_is_dropped(provider):
+    _filtered_home_provider(
+        provider,
+        [
+            _home_community_playlist(author="Innocent Name"),
+            _home_community_playlist("PLreal", "Real Curator", "UC000000000000000000000b"),
+        ],
+    )
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+
+    assert [p.item_id for p in _row_items(provider, "ytm_rec_for_you")] == ["PLreal"]
+
+
+def test_a_playlist_by_a_blocked_author_name_is_dropped(provider):
+    _filtered_home_provider(
+        provider,
+        [
+            _home_community_playlist(author="  SLOPPY  bot ", author_id=None),
+            _home_community_playlist("PLreal", "Real Curator", None),
+        ],
+    )
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+
+    assert [p.item_id for p in _row_items(provider, "ytm_rec_for_you")] == ["PLreal"]
+
+
+def test_an_authorless_mix_is_kept(provider):
+    """Editorial lists, mixes and radio have no author, so nothing to blame.
+
+    The Playlist model falls back to the provider's own name as the owner;
+    blocking that name must still not touch them.
+    """
+    _filtered_home_provider(
+        provider, [_home_mix(), _home_mix("RDCLAK5uy_editorial", "Feel-Good Pop & Rock")]
+    )
+    provider._ai_blocked_names = frozenset(
+        {"sloppy bot", ytm._normalize_artist_name(provider.name), "my supermix"}
+    )
+
+    assert len(_row_items(provider, "ytm_rec_for_you")) == 2
+
+
+def test_a_blocked_artist_card_is_dropped(provider):
+    _filtered_home_provider(
+        provider,
+        [_home_artist_card(), _home_artist_card("UCrealartist000000000000", "Real Band")],
+    )
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+
+    assert [a.item_id for a in _row_items(provider, "ytm_rec_for_you")] == [
+        "UCrealartist000000000000"
+    ]
+
+
+def test_an_artist_card_matches_a_blocked_name_too(provider):
+    _filtered_home_provider(
+        provider,
+        [
+            _home_artist_card("UCsomeotherid00000000000"),
+            _home_artist_card("UCrealartist000000000000", "Real Band"),
+        ],
+    )
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+
+    assert [a.item_id for a in _row_items(provider, "ytm_rec_for_you")] == [
+        "UCrealartist000000000000"
+    ]
+
+
+def test_a_row_emptied_only_by_non_track_drops_is_omitted(provider):
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+    home = [
+        {
+            "title": "Slop shelf",
+            "contents": [_home_album(), _home_community_playlist(), _home_artist_card()],
+        },
+        {"title": "Quick picks", "contents": [_home_song()]},
+    ]
+    _home_provider(provider, home)
+
+    assert [row.name for row in asyncio.run(provider.get_recommendations())] == ["Quick picks"]
+    assert [row.name for row in asyncio.run(provider.recommendations())] == ["Quick picks"]
+
+
+def test_the_filter_off_keeps_every_home_item(provider):
+    contents = [
+        _home_song("vid00000002", "Slop", "Sloppy Bot", _BLOCKED_ID),
+        _home_album(),
+        _home_community_playlist(),
+        _home_artist_card(),
+    ]
+    _filtered_home_provider(provider, contents)
+    provider._ai_filter_enabled = False
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+
+    assert len(_row_items(provider, "ytm_rec_for_you")) == 4
+
+
+def test_the_home_feed_logs_one_filter_line_per_row(provider):
+    _filtered_home_provider(
+        provider, [_home_song("vid00000002", "Slop", "Sloppy Bot", _BLOCKED_ID), _home_album(), _home_song()]
+    )
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+    handler = _attach_capture(provider)
+
+    asyncio.run(provider.get_recommendations())
+
+    lines = [m for m in handler.messages() if m.startswith("AI filter removed")]
+    assert lines == ["AI filter removed 2 of 3 items from home feed 'For you'"]
+
+
+def test_a_full_210_page_load_logs_each_row_once_per_call(provider):
+    """One rows call plus one items call per row, as the 2.10 frontend does.
+
+    An items call parses only its own row. Before that, every items call
+    parsed the whole feed and repeated every row's filter and skip lines, so
+    seven rows logged each line eight times per page view.
+    """
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset()
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+    mystery = {"title": "Mystery", "thumbnails": []}
+    home = [
+        {"title": f"Row {i}", "contents": [_home_song(), _home_album(), mystery]}
+        for i in range(3)
+    ]
+    _home_provider(provider, home)
+    handler = _attach_capture(provider)
+
+    rows = asyncio.run(provider.get_recommendations())
+    assert len(rows) == 3
+    for row in rows:
+        _row_items(provider, row.item_id)
+
+    filter_lines = [m for m in handler.messages() if m.startswith("AI filter removed")]
+    skip_lines = [m for m in handler.messages() if "of unknown shape" in m]
+    for i in range(3):
+        # Once from the rows call, once from that row's own items call.
+        assert filter_lines.count(f"AI filter removed 1 of 2 items from home feed 'Row {i}'") == 2
+    assert len(filter_lines) == 6
+    assert len(skip_lines) == 6
+
+
+def test_track_only_callers_behave_as_before(provider):
+    """Radio keeps its exact semantics now that the helper is shared."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    provider._ai_blocked_channel_ids = frozenset({"UC000000000000000000000c"})
+    mock = MagicMock()
+    mock.get_watch_playlist.return_value = {
+        "tracks": [
+            {"videoId": "vid00000001", "title": "Good", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
+            {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+            {"videoId": "vid00000003", "title": "By id", "artists": [{"name": "Innocent", "id": "UC000000000000000000000c"}]},
+            {"videoId": "vid00000004", "title": "Feat", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}, {"name": "SLOPPY BOT", "id": "UC000000000000000000000d"}]},
+        ]
+    }
+    provider._ytmusic = mock
+    handler = _attach_capture(provider)
+
+    tracks = asyncio.run(provider.get_similar_tracks("vid00000001"))
+
+    assert [t.name for t in tracks] == ["Good"]
+    assert [m for m in handler.messages() if m.startswith("AI filter removed")] == [
+        "AI filter removed 3 of 4 items from song radio for vid00000001"
+    ]
+    bare = _blocklist_track()
+    bare.artists = []
+    assert provider._drop_ai_tracks([bare], "test") == [bare]
+
+
+def test_ai_filter_scope_stays_out_of_artist_pages(provider):
+    """Artist pages are a deliberate lookup, same as search."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    mock = MagicMock()
+    mock.get_artist.return_value = {
+        "name": "Sloppy Bot",
+        "channelId": _BLOCKED_ID,
+        "albums": {"results": [_home_album()], "browseId": None},
+        "singles": {"results": []},
+    }
+    mock.get_artist_albums.return_value = []
+    provider._ytmusic = mock
+
+    albums = asyncio.run(provider.get_artist_albums(_BLOCKED_ID))
+
+    assert [a.item_id for a in albums] == ["MPREb_bot"]
